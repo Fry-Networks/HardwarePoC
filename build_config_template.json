@@ -1,9 +1,0 @@
-{
-  "_comment": "1Password-only build config template - api_token MUST be op:// reference",
-  "api_base_url": "https://hardwareapi.frynetworks.com",
-  "api_token": "op://VPS/Hardware_API/API_BEARER_TOKEN",
-  "interval_seconds": 600,
-  "lease_seconds": 900,
-  "api_timeout": 10.0,
-  "local_signing_key_hex": "REDACTED_ROTATE_ME"
-}

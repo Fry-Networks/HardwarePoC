@@ -51,7 +51,7 @@ def main():
         print("  python build_with_embedded_config.py production_config.json ./dist/ ISM-ABC123DEFG456HIJK789LMNOP012QRST")
         print("")
         print("If miner_key is provided, it will be encrypted and embedded in the executable.")
-        print("If not provided, the service will look for minerkey.txt at runtime.")
+        print("If not provided, the service will read from encrypted miner config at runtime.")
         print("")
         print("The config.json MUST contain:")
         print("  - api_base_url")
@@ -82,7 +82,7 @@ def main():
             sys.exit(1)
         print(f"✅ Miner key will be encrypted and embedded: {miner_key}")
     else:
-        print("ℹ️  No miner key provided - service will read from minerkey.txt at runtime")
+        print("ℹ️  No miner key provided - service will read from encrypted miner config at runtime")
     
     if not os.path.exists(config_file):
         print(f"Error: Config file {config_file} not found")
@@ -207,7 +207,7 @@ def main():
         print("Next steps:")
         print("1. Use PyInstaller or similar to create executable")
         print("2. The installer only needs to provide:")
-        print("   - minerkey.txt (with the miner key)")
+        print("   - miner_config.enc (encrypted miner configuration)")
         print("   - No config.json needed!")
         print("")
         print("Example PyInstaller command:")
@@ -220,8 +220,8 @@ def main():
         print("  Example: python create_miner_config.py create ISM-ABC123DEFG456HIJK789LMNOP012QRST")
         print("")
         print("Build executable with proper ISM branding and version:")
-        print(f"  pyinstaller --onefile --name FRY_BM_v{get_version()} miner_online_simple.py")
-        print(f"  Creates: FRY_BM_v{get_version()}.exe (ISM Branded Miner)")
+        print(f"  pyinstaller --onefile --name FRY_PoC_BM_v{get_version()} miner_online_simple.py")
+        print(f"  Creates: FRY_PoC_BM_v{get_version()}.exe (ISM Branded Miner)")
         
     finally:
         # Clean up temp file

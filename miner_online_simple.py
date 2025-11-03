@@ -314,21 +314,13 @@ def read_encrypted_miner_config() -> Optional[str]:
         return None
 
 def read_miner_key() -> str:
-    """Read miner key from encrypted config, fallback to minerkey.txt"""
-    # First try to read from encrypted config file
+    """Read miner key from encrypted config file."""
+    # Read from encrypted config file
     miner_key = read_encrypted_miner_config()
     if miner_key:
         return miner_key
     
-    # Fallback to minerkey.txt file
-    path = os.path.join(app_dir(), "minerkey.txt")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return "".join(f.read().splitlines()).strip()
-    except FileNotFoundError:
-        raise RuntimeError("Miner key not found in miner_config.enc or minerkey.txt file")
-    except Exception as e:
-        raise RuntimeError(f"Failed to read miner key: {e}")
+    raise RuntimeError("Miner key not found in miner_config.enc file")
 
 def owen_decrypt(key: bytes, ciphertext: bytes) -> bytes:
     nonce, ct = ciphertext[:16], ciphertext[16:]
