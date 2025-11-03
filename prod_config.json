@@ -1,0 +1,4 @@
+{
+  "api_base_url": "https://hardwareapi.frynetworks.com",
+  "api_token": "op://VPS/Hardware_API/API_BEARER_TOKEN"
+}

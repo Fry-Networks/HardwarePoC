@@ -183,6 +183,22 @@ class ExternalApiClient:
             return False
         return holder.strip() != install_id
 
+    def verify_lease_ownership(self, miner_key: str, install_id: str) -> bool:
+        """Verify that this install_id currently holds the active lease for miner_key.
+        
+        This is the inverse of has_other_active_installation() and provides a clearer
+        semantic meaning when checking ownership rather than conflicts.
+        """
+        status = self.lease_status(miner_key)
+        if not isinstance(status, dict):
+            return False
+        if not status.get("active"):
+            return False
+        holder = status.get("holder_install_id")
+        if not isinstance(holder, str) or not holder.strip():
+            return False
+        return holder.strip() == install_id
+
 
 # ============================================================================
 # Configuration Management & Factory Functions
@@ -253,13 +269,7 @@ def _load_build_config() -> Dict[str, Any]:
                     return config
                 elif 'external_api' in config:
                     if debug:
-                        print(f"[DEBUG] Config exists but no bearer token in external_api")
-                    # Config exists but no bearer token - fall back to 1Password for development
-                    if not getattr(sys, 'frozen', False):
-                        bearer_token = _get_1password_secret('op://VPS/Hardware_API/API_BEARER_TOKEN')
-                        if bearer_token:
-                            config['external_api']['bearer_token'] = bearer_token
-                            return config
+                        print(f"[DEBUG] Config exists but no bearer token - build must embed 1Password credentials")
         else:
             if debug:
                 print(f"[DEBUG] Config file NOT found at: {config_file}")
@@ -269,19 +279,9 @@ def _load_build_config() -> Dict[str, Any]:
             print(f"[DEBUG] Exception loading config: {e}")
         pass  # Silently fall through to fallbacks
     
-    # For development (running from source), allow 1Password fallback
-    if not getattr(sys, 'frozen', False):
-        bearer_token = _get_1password_secret('op://VPS/Hardware_API/API_BEARER_TOKEN')
-        if bearer_token:
-            return {
-                'external_api': {
-                    'base_url': 'https://hardwareapi.frynetworks.com',
-                    'bearer_token': bearer_token,
-                    'timeout': 10.0
-                },
-                'status': 'development',
-                'source': '1password'
-            }
+    # No runtime 1Password fallback - credentials must be embedded at build time
+    if debug:
+        print(f"[DEBUG] No embedded credentials found - build with 1Password integration required")
     
     # Final fallback - return config without bearer token (will fail on API calls)
     # This is acceptable for packaged builds that should have embedded token

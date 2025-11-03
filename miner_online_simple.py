@@ -273,10 +273,62 @@ def read_text_optional(path: str) -> str:
     except Exception:
         return ""
 
+def read_encrypted_miner_config() -> Optional[str]:
+    """Read miner key from encrypted config file if present."""
+    try:
+        config_path = os.path.join(app_dir(), "miner_config.enc")
+        if not os.path.exists(config_path):
+            return None
+        
+        with open(config_path, 'r') as f:
+            encrypted_data = json.load(f)
+        
+        # Decrypt using the same method as the API config
+        # We'll use a simple key derivation for the miner config
+        from cryptography.fernet import Fernet
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        import base64
+        
+        # Use a fixed salt for miner config (this is acceptable since it's just obfuscation)
+        salt = b'miner_config_salt_v1'
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+        )
+        
+        # Derive key from a known string (this is obfuscation, not true security)
+        password = "miner_config_encryption_key_v1".encode()
+        key = base64.urlsafe_b64encode(kdf.derive(password))
+        
+        # Decrypt
+        f = Fernet(key)
+        decrypted_data = f.decrypt(encrypted_data['data'].encode())
+        config_data = json.loads(decrypted_data)
+        
+        return config_data.get('miner_key')
+    
+    except Exception:
+        return None
+
 def read_miner_key() -> str:
+    """Read miner key from encrypted config, fallback to minerkey.txt"""
+    # First try to read from encrypted config file
+    miner_key = read_encrypted_miner_config()
+    if miner_key:
+        return miner_key
+    
+    # Fallback to minerkey.txt file
     path = os.path.join(app_dir(), "minerkey.txt")
-    with open(path, "r", encoding="utf-8") as f:
-        return "".join(f.read().splitlines()).strip()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return "".join(f.read().splitlines()).strip()
+    except FileNotFoundError:
+        raise RuntimeError("Miner key not found in miner_config.enc or minerkey.txt file")
+    except Exception as e:
+        raise RuntimeError(f"Failed to read miner key: {e}")
 
 def owen_decrypt(key: bytes, ciphertext: bytes) -> bytes:
     nonce, ct = ciphertext[:16], ciphertext[16:]
@@ -294,18 +346,16 @@ def decrypt_config() -> Dict[str, Any]:
     return json.loads(Fernet(kas).decrypt(ec))
 
 def load_config() -> Dict[str, Any]:
-    path = os.path.join(app_dir(), "config.json")
+    # Use embedded encrypted config (credentials from 1Password at build time)
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        if isinstance(cfg, dict) and (cfg.get("api_base_url") or cfg.get("api_url")):
-            return cfg
+        embedded_cfg = decrypt_config()
+        if isinstance(embedded_cfg, dict) and (embedded_cfg.get("api_base_url") or embedded_cfg.get("api_url")):
+            return embedded_cfg
     except Exception:
         pass
-    try:
-        return decrypt_config()
-    except Exception:
-        return {}
+    
+    # No fallback - production builds must have embedded config from 1Password
+    return {}
 
 def required_version_from_db(client) -> Optional[str]:
     """Return software_version_needed for this miner code from PoC.versions.
@@ -402,12 +452,14 @@ def connect_mongo(uri: str, tlsCAFile: Optional[str] = None, cfg: Optional[Dict[
         base_url = uri
 
     if not base_url:
-
-        raise RuntimeError("api_base_url missing in config.json")
+        raise RuntimeError("api_base_url missing - executable not built with embedded 1Password credentials")
 
     token_val = cfg.get("api_token") or cfg.get("api_key")
 
     token = token_val.strip() if isinstance(token_val, str) and token_val.strip() else None
+    
+    if not token:
+        raise RuntimeError("api_token missing - executable not built with embedded 1Password credentials")
 
     timeout_val = cfg.get("api_timeout") or cfg.get("api_timeout_seconds") or cfg.get("timeout_seconds")
 
@@ -540,6 +592,8 @@ def other_active_installation_exists(client: MongoProxyClient, miner_key: str, i
         return doc is not None
     except Exception:
         return False
+
+# Removed: verify_lease_ownership() now handled directly by ExternalApiClient.verify_lease_ownership()
 
 def acquire_installation_lease(client: MongoProxyClient, miner_key: str, install_id: str, lease_seconds: int = 900) -> bool:
     """Best-effort global single-instance lease per miner_key.
@@ -772,23 +826,17 @@ def read_local_cache(path: str) -> dict:
         return {}
 
 def require_api_base(cfg: Dict[str, Any]) -> str:
-    # Enforce the single canonical API base URL. Ignore config entries.
-    return "https://hardwareapi.frynetworks.com"
+    """Extract API base URL from config. Use embedded config in production builds."""
     cfg = cfg or load_config()
-
-    # Always use the canonical hardware API base URL regardless of configuration.
-    base_url = "https://hardwareapi.frynetworks.com"
-
-    token_val = cfg.get("api_token") or cfg.get("api_key")
-    token = token_val.strip() if isinstance(token_val, str) and token_val.strip() else None
-
-    timeout_val = cfg.get("api_timeout") or cfg.get("api_timeout_seconds") or cfg.get("timeout_seconds")
-    try:
-        timeout = float(timeout_val) if timeout_val is not None else 10.0
-    except Exception:
-        timeout = 10.0
-
-    api = ExternalApiClient(base_url, token=token, timeout=timeout)
+    
+    # Get base URL from config (embedded or file)
+    base_url = cfg.get("api_base_url") or cfg.get("api_url")
+    
+    if not base_url:
+        # Fallback to canonical URL if no config available
+        base_url = "https://hardwareapi.frynetworks.com"
+    
+    return base_url
 
 def atomic_write_json(path: str, payload: dict):
     d = os.path.dirname(path)
@@ -1419,131 +1467,7 @@ def _release_service_lock() -> None:
         _LOCK_FH = None
 
 def main():
-    # Optional check-only mode: verify miner_key exists in main.devices and exit
-    ap = argparse.ArgumentParser(add_help=False)
-    ap.add_argument("--check-key", dest="check_key", default=None)
-    ap.add_argument("--check-version", dest="check_version", default=None,
-                    help="Verify miner_key exists and software_version_needed <= this binary's VERSION; prints JSON and exits 0 if OK, 7 if outdated")
-    ap.add_argument("--check-concurrency", dest="check_concurrency", default=None,
-                    help="Verify no other active installation with this miner_key is running. Exits 0 if clear, 8 if conflict.")
-    ap.add_argument("--lease-dump", dest="lease_dump", default=None,
-                    help="Dump current installation lease document(s) for this miner_key (debug).")
-    try:
-        args, _ = ap.parse_known_args()
-    except SystemExit:
-        args = argparse.Namespace(check_key=None)
-
-    if args.check_key:
-        try:
-            mk = args.check_key.strip()
-            if not re.match(rf"^{MINER_CODE}-[A-Z0-9]{{32}}$", mk or ""):
-                sys.exit(2)
-            cfg = load_config()
-            api_base = require_api_base(cfg)
-            tlsCAFile = cfg.get("tlsCAFile")
-            client = connect_mongo(api_base, tlsCAFile, cfg)
-            ok = bool(client["main"]["devices"].find_one({"miner_key": mk}, {"_id":1}))
-            sys.exit(0 if ok else 3)
-        except Exception:
-            sys.exit(4)
-
-    if args.check_version:
-        try:
-            mk = args.check_version.strip()
-            if not re.match(rf"^{MINER_CODE}-[A-Z0-9]{{32}}$", mk or ""):
-                print(json.dumps({"ok": False, "err": "bad_format"}))
-                sys.exit(2)
-            cfg = load_config()
-            api_base = require_api_base(cfg)
-            tlsCAFile = cfg.get("tlsCAFile")
-            client = connect_mongo(api_base, tlsCAFile, cfg)
-            needed = required_version_from_db(client)
-            installed = VERSION
-            up_to_date = True
-            if isinstance(needed, str) and needed:
-                up_to_date = (cmp_ver(installed, needed) >= 0)
-            payload = {"ok": up_to_date, "needed": needed, "installed": installed}
-            # Human-friendly warning for interactive users; keep JSON for tooling
-            if not up_to_date and isinstance(needed, str) and needed:
-                try:
-                    print(f"Warning: Software version {installed} is below required {needed}", file=sys.stderr)
-                except Exception:
-                    pass
-            print(json.dumps(payload))
-            sys.exit(0 if up_to_date else 7)
-        except Exception:
-            print(json.dumps({"ok": False, "err": "error"}))
-            sys.exit(4)
-
-    if args.lease_dump:
-        try:
-            mk = args.lease_dump.strip()
-            if not re.match(rf"^{MINER_CODE}-[A-Z0-9]{32}$", mk or ""):
-                print(json.dumps({"ok": False, "err": "bad_format"}))
-                sys.exit(2)
-            cfg = load_config()
-            api_base = require_api_base(cfg)
-            tlsCAFile = cfg.get("tlsCAFile")
-            client = connect_mongo(api_base, tlsCAFile, cfg)
-            coll = client["PoC"]["installations"]
-            docs = list(coll.find({"miner_key": mk}, {"_id":0}))
-            out = []
-            for d in docs:
-                dd = dict(d)
-                for k in ("last_seen_at", "lease_expires_at", "first_installed_at"):
-                    v = dd.get(k)
-                    try:
-                        dd[k] = v.isoformat()  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
-                out.append(dd)
-            print(json.dumps({"ok": True, "docs": out}))
-            sys.exit(0)
-        except Exception:
-            print(json.dumps({"ok": False, "err": "error"}))
-            sys.exit(4)
-
-    if args.check_concurrency:
-        def _iso(dtobj):
-            try:
-                return (dtobj.replace(tzinfo=UTC) if dtobj.tzinfo is None else dtobj).isoformat()
-            except Exception:
-                try:
-                    return dtobj.isoformat()
-                except Exception:
-                    return None
-        try:
-            mk = args.check_concurrency.strip()
-            if not re.match(rf"^{MINER_CODE}-[A-Z0-9]{{32}}$", mk or ""):
-                print(json.dumps({"ok": False, "err": "bad_format"}))
-                sys.exit(2)
-            cfg = load_config()
-            api_base = require_api_base(cfg)
-            tlsCAFile = cfg.get("tlsCAFile")
-            client = connect_mongo(api_base, tlsCAFile, cfg)
-            iid = get_or_create_install_id()
-            conflict = other_active_installation_exists(client, mk, iid)
-            payload: Dict[str, Any] = {"ok": not conflict}
-            if conflict:
-                try:
-                    coll = client["PoC"]["installations"]
-                    doc = coll.find_one({
-                        "_id": _lease_doc_id(mk),
-                        "lease_expires_at": {"$gt": now_utc()},
-                    }, {"_id":0, "hostname":1, "os":1, "lease_install_id":1, "lease_expires_at":1, "last_seen_at":1})
-                    if doc:
-                        if isinstance(doc.get("last_seen_at"), dt.datetime):
-                            doc["last_seen_at"] = _iso(doc.get("last_seen_at"))
-                        if isinstance(doc.get("lease_expires_at"), dt.datetime):
-                            doc["lease_expires_at"] = _iso(doc.get("lease_expires_at"))
-                        payload.update({"conflict": doc})
-                except Exception:
-                    pass
-            print(json.dumps(payload))
-            sys.exit(8 if conflict else 0)
-        except Exception:
-            print(json.dumps({"ok": False, "err": "error"}))
-            sys.exit(4)
+    # Remove check-only modes since installer handles miner key validation and initial lease acquisition
 
     try:
         acquire_service_lock()
@@ -1556,12 +1480,17 @@ def main():
         pass
 
     miner_key = read_miner_key()
-    if not re.match(rf"^{MINER_CODE}-[A-Z0-9]{{32}}$", miner_key or ""):
-        raise RuntimeError(f"miner_key must start with {MINER_CODE}- and 32 A-Z0-9 chars")
 
     cfg = load_config()
 
     api_base = require_api_base(cfg)
+    
+    # Validate that we have embedded credentials from 1Password build process
+    if not cfg.get("api_token") and not cfg.get("api_key"):
+        log.error("No API token found. This executable was not built with embedded credentials.")
+        log.error("Build process required: python build_with_embedded_config.py <1password_config> <output_dir>")
+        log.error("The config must use 1Password reference: op://VPS/Hardware_API/API_BEARER_TOKEN")
+        sys.exit(5)
 
     tlsCAFile = cfg.get("tlsCAFile")
 
@@ -1573,22 +1502,14 @@ def main():
         cfg_path = os.path.join(app_dir(), "config.json")
         cfg_src = cfg_path if os.path.exists(cfg_path) else "(embedded/default)"
         log.info(
-            "Starting service v%s | ProgramData=%s | config=%s | api_base=%s | tlsCAFile=%s | interval=%s | lease_seconds=%s",
-
+            "Starting monitoring service v%s | miner_key=%s | ProgramData=%s | config=%s | api_base=%s | interval=%s | lease_seconds=%s",
             VERSION,
-
+            miner_key,
             data_dir(),
-
             cfg_src,
-
             (api_base or "-"),
-
-            (tlsCAFile or "-"),
-
             interval,
-
             lease_seconds,
-
         )
     except Exception:
         pass
@@ -1604,44 +1525,18 @@ def main():
         try:
             client = connect_mongo(api_base, tlsCAFile, cfg)
             coll = client["PoC"]["hardware"]
-            # Validate miner_key exists in main.devices; exit if not found
+            # Verify that we hold the lease for this miner_key (installer should have acquired it)
             try:
-                exists = bool(client["main"]["devices"].find_one({"miner_key": miner_key}, {"_id": 1}))
-            except Exception:
-                exists = False
-            if not exists:
-                log.error("miner_key %s not found in main.devices; exiting.", miner_key)
-                time.sleep(2)
-                sys.exit(6)
-            # Enforce global single active installation per miner_key across machines.
-            # Try to acquire the lease with a few retries; if it fails, exit with code 8.
-            acquired = False
-            try:
-                for _ in range(6):  # ~60s total with sleeps
-                    if acquire_installation_lease(client, miner_key, install_id, lease_seconds=lease_seconds):
-                        acquired = True
-                        break
-                    try:
-                        log.error("Another active installation holds the lease for %s; retrying...", miner_key)
-                    except Exception:
-                        pass
-                    time.sleep(10)
-            except Exception:
-                pass
-            if not acquired:
-                try:
-                    if other_active_installation_exists(client, miner_key, install_id):
-                        log.error("Exiting: another computer is actively running this miner_key %s.", miner_key)
-                    else:
-                        log.error("Exiting: could not acquire global lease for %s.", miner_key)
-                except Exception:
-                    pass
+                if not client._api.verify_lease_ownership(miner_key, install_id):
+                    log.error("This installation does not hold the lease for %s; exiting.", miner_key)
+                    time.sleep(2)
+                    sys.exit(8)
+            except Exception as e:
+                log.error("Failed to verify lease ownership for %s: %s; exiting.", miner_key, e)
                 time.sleep(2)
                 sys.exit(8)
-            # Avoid writing to main.devices; installation/version tracked via main.installations heartbeat
-            # Record/update this installation (per-machine)
+            # Update this installation record (per-machine)
             upsert_installation_record(client, miner_key, install_id)
-            # Lease acquired; if another active installation appears, we will detect it during renewal below
             # Check required version and warn (do not exit; backend can enforce rewards policy)
             try:
                 required_version = required_version_from_db(client)
@@ -1818,27 +1713,16 @@ def main():
                 )
             except Exception:
                 pass
-            # Enforce exclusivity during runtime: renew our lease; if we lost it and someone else is active, exit.
+            # Renew our lease; if we lost it, exit (installer will need to reacquire)
             try:
                 if not renew_installation_lease(client, miner_key, install_id, lease_seconds=lease_seconds):
-                    # Lost the lease; check if another active host is present
-                    try:
-                        if other_active_installation_exists(client, miner_key, install_id):
-                            log.error("Lost global lease for %s to another host; exiting.", miner_key)
-                            time.sleep(2)
-                            sys.exit(8)
-                    except Exception:
-                        pass
-                    # Attempt to reacquire once
-                    try:
-                        if not acquire_installation_lease(client, miner_key, install_id, lease_seconds=lease_seconds):
-                            log.error("Could not reacquire lease for %s; exiting.", miner_key)
-                            time.sleep(2)
-                            sys.exit(8)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                    log.error("Lost global lease for %s; exiting for installer to reacquire.", miner_key)
+                    time.sleep(2)
+                    sys.exit(8)
+            except Exception as e:
+                log.error("Failed to renew lease for %s: %s; exiting.", miner_key, e)
+                time.sleep(2)
+                sys.exit(8)
 
             # Record daily location once per day (res4 via IP) with hexId(res7) containment check
             try:
