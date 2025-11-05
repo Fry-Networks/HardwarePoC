@@ -313,6 +313,44 @@ def read_encrypted_miner_config() -> Optional[str]:
     except Exception:
         return None
 
+def read_encrypted_install_config() -> Optional[str]:
+    """Read install_id from encrypted install config file created by installer."""
+    try:
+        config_path = os.path.join(app_dir(), "install_config.enc")
+        if not os.path.exists(config_path):
+            return None
+        
+        with open(config_path, 'r') as f:
+            encrypted_data = json.load(f)
+        
+        # Use same encryption scheme as miner_config
+        from cryptography.fernet import Fernet
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        import base64
+        
+        # Use fixed salt for install config
+        salt = b'install_config_salt_v1'
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+        )
+        
+        password = "install_config_encryption_key_v1".encode()
+        key = base64.urlsafe_b64encode(kdf.derive(password))
+        
+        # Decrypt
+        f = Fernet(key)
+        decrypted_data = f.decrypt(encrypted_data['data'].encode())
+        config_data = json.loads(decrypted_data)
+        
+        return config_data.get('install_id')
+    
+    except Exception:
+        return None
+
 def read_miner_key() -> str:
     """Read miner key from encrypted config file."""
     # Read from encrypted config file
@@ -341,8 +379,18 @@ def load_config() -> Dict[str, Any]:
     # Use embedded encrypted config (credentials from 1Password at build time)
     try:
         embedded_cfg = decrypt_config()
-        if isinstance(embedded_cfg, dict) and (embedded_cfg.get("api_base_url") or embedded_cfg.get("api_url")):
-            return embedded_cfg
+        if isinstance(embedded_cfg, dict):
+            # Flatten nested external_api structure for backward compatibility
+            if "external_api" in embedded_cfg:
+                ext_api = embedded_cfg.get("external_api", {})
+                if ext_api.get("base_url"):
+                    embedded_cfg["api_base_url"] = ext_api["base_url"]
+                if ext_api.get("bearer_token"):
+                    embedded_cfg["api_token"] = ext_api["bearer_token"]
+            
+            # Return if we have valid config
+            if embedded_cfg.get("api_base_url") or embedded_cfg.get("api_url"):
+                return embedded_cfg
     except Exception:
         pass
     
@@ -654,6 +702,23 @@ def renew_installation_lease(client: MongoProxyClient, miner_key: str, install_i
         return bool(res.matched_count)
     except Exception:
         return True  # don't fail hard on transient DB errors
+
+def verify_installation_lease(client: MongoProxyClient, miner_key: str, install_id: str) -> bool:
+    """Verify that a valid lease exists for this (miner_key, install_id) pair.
+    Used at startup to confirm the installer properly acquired the lease.
+    Returns True if lease exists and is valid, False otherwise.
+    
+    Uses External API's lease_status endpoint.
+    """
+    try:
+        api_client = client._api
+        return api_client.verify_lease_ownership(miner_key, install_id)
+    except Exception as e:
+        try:
+            log.error("Lease verification error: %s", e)
+        except Exception:
+            pass
+        return False
 
 
 
@@ -1508,7 +1573,15 @@ def main():
 
     client: Optional[MongoProxyClient] = None
     coll = None
-    install_id = get_or_create_install_id()
+    
+    # Read install_id from installer-created config (REQUIRED)
+    install_id = read_encrypted_install_config()
+    if not install_id:
+        log.error("install_config.enc not found or invalid")
+        log.error("The installer must create install_config.enc before starting the service")
+        time.sleep(2)
+        sys.exit(3)  # Exit code 3: not found
+    
     required_version: Optional[str] = None
     # miner_mac selected in GUI (persisted to shared data dir)
     miner_mac_local: Optional[str] = read_selected_miner_mac() or None
@@ -1517,16 +1590,25 @@ def main():
         try:
             client = connect_mongo(api_base, tlsCAFile, cfg)
             coll = client["PoC"]["hardware"]
+            
             # Verify that we hold the lease for this miner_key (installer should have acquired it)
-            try:
-                if not client._api.verify_lease_ownership(miner_key, install_id):
-                    log.error("This installation does not hold the lease for %s; exiting.", miner_key)
-                    time.sleep(2)
-                    sys.exit(8)
-            except Exception as e:
-                log.error("Failed to verify lease ownership for %s: %s; exiting.", miner_key, e)
+            if not verify_installation_lease(client, miner_key, install_id):
+                log.error("Installation lease verification failed for %s (install_id: %s)", miner_key, install_id)
+                try:
+                    # Get lease details for debugging
+                    status = client._api.lease_status(miner_key)
+                    holder = status.get("holder_install_id")
+                    if holder and holder != install_id:
+                        log.error("Lease is held by different installation: %s", holder)
+                        log.error("Only one instance per miner_key can run at a time.")
+                    elif not (status.get("granted") or status.get("active")):
+                        log.error("No active lease found. The installer must acquire the lease first.")
+                    else:
+                        log.error("Lease exists but verification failed. Check logs for details.")
+                except Exception:
+                    log.error("The installer must acquire the lease before starting the service.")
                 time.sleep(2)
-                sys.exit(8)
+                sys.exit(9)  # Exit code 9: lease verification failed
             # Update this installation record (per-machine)
             upsert_installation_record(client, miner_key, install_id)
             # Check required version and warn (do not exit; backend can enforce rewards policy)
