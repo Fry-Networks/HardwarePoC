@@ -15,6 +15,7 @@ import uuid
 import platform
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Optional
 
 # Add tools directory to path
 tools_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools')
@@ -74,10 +75,10 @@ def decrypt_install_config(encrypted_data: dict) -> dict:
     return config_data
 
 def create_install_config(
-    install_id: str = None,
-    output_path: str = None,
-    installer_version: str = None,
-    lease_acquired_at: str = None
+    install_id: Optional[str] = None,
+    output_path: Optional[str] = None,
+    installer_version: Optional[str] = None,
+    lease_acquired_at: Optional[str] = None
 ) -> str:
     """Create encrypted installation configuration file.
     

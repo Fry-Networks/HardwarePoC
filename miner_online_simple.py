@@ -549,26 +549,6 @@ def cmp_ver(a: str, b: str) -> int:
     A += [0]*(L-len(A)); B += [0]*(L-len(B))
     return (A > B) - (A < B)
 
-def install_id_path() -> str:
-    return os.path.join(data_dir(), "install_id.txt")
-
-def get_or_create_install_id() -> str:
-    p = install_id_path()
-    try:
-        if os.path.exists(p):
-            with open(p, "r", encoding="utf-8") as f:
-                v = f.read().strip()
-                if v:
-                    return v
-        v = str(uuid.uuid4())
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(v + "\n")
-        return v
-    except Exception:
-        # As a last resort, use a volatile UUID that won't persist
-        return str(uuid.uuid4())
-
 def _lease_doc_id(miner_key: str) -> str:
     """Return a deterministic _id for the global lease record of a miner_key.
     Using a singleton document per miner_key allows atomic upsert semantics without races.
@@ -703,22 +683,71 @@ def renew_installation_lease(client: MongoProxyClient, miner_key: str, install_i
     except Exception:
         return True  # don't fail hard on transient DB errors
 
-def verify_installation_lease(client: MongoProxyClient, miner_key: str, install_id: str) -> bool:
-    """Verify that a valid lease exists for this (miner_key, install_id) pair.
-    Used at startup to confirm the installer properly acquired the lease.
-    Returns True if lease exists and is valid, False otherwise.
+def verify_or_acquire_installation_lease(client: MongoProxyClient, miner_key: str, install_id: str, lease_seconds: int = 900, max_retries: int = 10) -> bool:
+    """Verify that a valid lease exists, or acquire it if the API was unreachable during install.
     
-    Uses External API's lease_status endpoint.
+    This handles the case where:
+    1. Installer acquired lease, but API went down before service started
+    2. Service tries to verify lease, gets 502/timeout
+    3. Service should wait for API to recover, then verify or reacquire
+    
+    Args:
+        client: MongoDB proxy client with API access
+        miner_key: The miner key to verify/acquire lease for
+        install_id: This installation's unique ID
+        lease_seconds: Lease duration if we need to acquire
+        max_retries: Maximum retry attempts with exponential backoff
+    
+    Returns:
+        True if lease is verified or successfully acquired, False otherwise
     """
-    try:
-        api_client = client._api
-        return api_client.verify_lease_ownership(miner_key, install_id)
-    except Exception as e:
+    api_client = client._api
+    
+    for attempt in range(max_retries):
         try:
-            log.error("Lease verification error: %s", e)
-        except Exception:
-            pass
-        return False
+            # First, try to verify existing lease
+            if api_client.verify_lease_ownership(miner_key, install_id):
+                if attempt > 0:
+                    log.info("Lease verified after %d retries", attempt)
+                return True
+            
+            # Lease doesn't exist or is held by someone else - try to acquire it
+            log.info("No valid lease found, attempting to acquire...")
+            if api_client.acquire_installation_lease(miner_key, install_id, lease_seconds):
+                log.info("Successfully acquired installation lease")
+                return True
+            
+            # Someone else holds it - this is a real conflict
+            try:
+                status = api_client.lease_status(miner_key)
+                holder = status.get("holder_install_id")
+                if holder and holder != install_id:
+                    log.error("Lease is held by different installation: %s", holder)
+                    log.error("Only one instance per miner_key can run at a time.")
+                    return False
+            except Exception:
+                pass
+            
+            return False
+            
+        except Exception as e:
+            error_msg = str(e)
+            is_api_down = any(x in error_msg.lower() for x in ["502", "503", "504", "bad gateway", "timeout", "connection"])
+            
+            if is_api_down and attempt < max_retries - 1:
+                # API is down - wait with exponential backoff before retry
+                wait_seconds = min(60, 2 ** attempt)  # 1, 2, 4, 8, 16, 32, 60, 60...
+                log.warning("External API unreachable (attempt %d/%d): %s", attempt + 1, max_retries, error_msg)
+                log.info("Waiting %d seconds for API to recover...", wait_seconds)
+                time.sleep(wait_seconds)
+                continue
+            else:
+                # Non-recoverable error or max retries reached
+                log.error("Lease verification/acquisition failed: %s", e)
+                return False
+    
+    log.error("Failed to verify or acquire lease after %d attempts", max_retries)
+    return False
 
 
 
@@ -1591,22 +1620,12 @@ def main():
             client = connect_mongo(api_base, tlsCAFile, cfg)
             coll = client["PoC"]["hardware"]
             
-            # Verify that we hold the lease for this miner_key (installer should have acquired it)
-            if not verify_installation_lease(client, miner_key, install_id):
-                log.error("Installation lease verification failed for %s (install_id: %s)", miner_key, install_id)
-                try:
-                    # Get lease details for debugging
-                    status = client._api.lease_status(miner_key)
-                    holder = status.get("holder_install_id")
-                    if holder and holder != install_id:
-                        log.error("Lease is held by different installation: %s", holder)
-                        log.error("Only one instance per miner_key can run at a time.")
-                    elif not (status.get("granted") or status.get("active")):
-                        log.error("No active lease found. The installer must acquire the lease first.")
-                    else:
-                        log.error("Lease exists but verification failed. Check logs for details.")
-                except Exception:
-                    log.error("The installer must acquire the lease before starting the service.")
+            # Verify that we hold the lease for this miner_key (or acquire if API was down during install)
+            if not verify_or_acquire_installation_lease(client, miner_key, install_id, lease_seconds=lease_seconds):
+                log.error("Installation lease verification/acquisition failed for %s (install_id: %s)", miner_key, install_id)
+                log.error("Cannot start service without valid lease. Check that:")
+                log.error("  1. The External API is reachable")
+                log.error("  2. No other instance is running for this miner_key")
                 time.sleep(2)
                 sys.exit(9)  # Exit code 9: lease verification failed
             # Update this installation record (per-machine)
@@ -1787,16 +1806,36 @@ def main():
                 )
             except Exception:
                 pass
-            # Renew our lease; if we lost it, exit (installer will need to reacquire)
+            # Renew our lease; if renewal fails, try to reacquire (API may have been down)
             try:
-                if not renew_installation_lease(client, miner_key, install_id, lease_seconds=lease_seconds):
-                    log.error("Lost global lease for %s; exiting for installer to reacquire.", miner_key)
+                renewed = renew_installation_lease(client, miner_key, install_id, lease_seconds=lease_seconds)
+                if not renewed:
+                    log.warning("Lease renewal failed, attempting to reacquire...")
+                    # Try to reacquire the lease (handles case where API was down and lease expired)
+                    if not verify_or_acquire_installation_lease(client, miner_key, install_id, lease_seconds=lease_seconds, max_retries=5):
+                        log.error("Lost global lease for %s and failed to reacquire; exiting.", miner_key)
+                        time.sleep(2)
+                        sys.exit(8)
+                    else:
+                        log.info("Successfully reacquired lease for %s", miner_key)
+            except Exception as e:
+                # API error during renewal - try to reacquire
+                error_msg = str(e)
+                is_api_down = any(x in error_msg.lower() for x in ["502", "503", "504", "bad gateway", "timeout", "connection"])
+                
+                if is_api_down:
+                    log.warning("External API unreachable during lease renewal: %s", error_msg)
+                    log.info("Will retry lease acquisition...")
+                    if not verify_or_acquire_installation_lease(client, miner_key, install_id, lease_seconds=lease_seconds, max_retries=5):
+                        log.error("Failed to reacquire lease for %s; exiting.", miner_key)
+                        time.sleep(2)
+                        sys.exit(8)
+                    else:
+                        log.info("Successfully reacquired lease for %s after API recovery", miner_key)
+                else:
+                    log.error("Failed to renew lease for %s: %s; exiting.", miner_key, e)
                     time.sleep(2)
                     sys.exit(8)
-            except Exception as e:
-                log.error("Failed to renew lease for %s: %s; exiting.", miner_key, e)
-                time.sleep(2)
-                sys.exit(8)
 
             # Record daily location once per day (res4 via IP) with hexId(res7) containment check
             try:
