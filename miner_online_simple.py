@@ -2,6 +2,7 @@
 from __future__ import annotations
 import datetime as dt
 import json, os, sys, time, tempfile, logging, re, hashlib, argparse, uuid, platform, pathlib
+from poi_monitor_aem import monitor_poi_for_aem
 from typing import Dict, Any, Optional, Tuple, List, Callable, Iterable, cast
 
 # Use timezone-aware UTC. `datetime.UTC` exists on Python 3.11+; fall back otherwise.
@@ -204,6 +205,7 @@ def _compose_hardware_doc(
     poc: dict[str, float],
     pol: dict[str, dict[str, Any]],
     last_updated: dt.datetime,
+    poi: Optional[dict] = None,
 ) -> dict[str, Any]:
     doc: dict[str, Any] = {}
     doc["miner_key"] = miner_key
@@ -245,6 +247,9 @@ def _compose_hardware_doc(
         }
     doc["PoL"] = pol_compact
     doc["lastUpdated"] = last_updated.isoformat()
+    # Add PoI only for AEM miners
+    if (doc.get("miner_type") == "AEM" or (miner_type == "AEM")) and poi:
+        doc["PoI"] = poi
     return doc
 
 
@@ -276,20 +281,17 @@ def read_text_optional(path: str) -> str:
 def read_encrypted_miner_config() -> Optional[str]:
     """Read miner key from encrypted config file if present."""
     try:
-        config_path = os.path.join(app_dir(), "miner_config.enc")
+        config_path = os.path.join(app_dir(), "config", "miner_config.enc")
         if not os.path.exists(config_path):
             return None
-        
         with open(config_path, 'r') as f:
             encrypted_data = json.load(f)
-        
         # Decrypt using the same method as the API config
         # We'll use a simple key derivation for the miner config
         from cryptography.fernet import Fernet
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
         import base64
-        
         # Use a fixed salt for miner config (this is acceptable since it's just obfuscation)
         salt = b'miner_config_salt_v1'
         kdf = PBKDF2HMAC(
@@ -298,37 +300,30 @@ def read_encrypted_miner_config() -> Optional[str]:
             salt=salt,
             iterations=100000,
         )
-        
         # Derive key from a known string (this is obfuscation, not true security)
         password = "miner_config_encryption_key_v1".encode()
         key = base64.urlsafe_b64encode(kdf.derive(password))
-        
         # Decrypt
         f = Fernet(key)
         decrypted_data = f.decrypt(encrypted_data['data'].encode())
         config_data = json.loads(decrypted_data)
-        
         return config_data.get('miner_key')
-    
     except Exception:
         return None
 
 def read_encrypted_install_config() -> Optional[str]:
     """Read install_id from encrypted install config file created by installer."""
     try:
-        config_path = os.path.join(app_dir(), "install_config.enc")
+        config_path = os.path.join(app_dir(), "config", "install_config.enc")
         if not os.path.exists(config_path):
             return None
-        
         with open(config_path, 'r') as f:
             encrypted_data = json.load(f)
-        
         # Use same encryption scheme as miner_config
         from cryptography.fernet import Fernet
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
         import base64
-        
         # Use fixed salt for install config
         salt = b'install_config_salt_v1'
         kdf = PBKDF2HMAC(
@@ -337,17 +332,13 @@ def read_encrypted_install_config() -> Optional[str]:
             salt=salt,
             iterations=100000,
         )
-        
         password = "install_config_encryption_key_v1".encode()
         key = base64.urlsafe_b64encode(kdf.derive(password))
-        
         # Decrypt
         f = Fernet(key)
         decrypted_data = f.decrypt(encrypted_data['data'].encode())
         config_data = json.loads(decrypted_data)
-        
         return config_data.get('install_id')
-    
     except Exception:
         return None
 
@@ -358,7 +349,80 @@ def read_miner_key() -> str:
     if miner_key:
         return miner_key
     
-    raise RuntimeError("Miner key not found in miner_config.enc file")
+    raise RuntimeError("Miner key not found in config/miner_config.enc file")
+
+def derive_measurement_key(miner_key: str) -> bytes:
+    """Derive Fernet key from miner_key for measurement encryption.
+    
+    Uses PBKDF2-HMAC-SHA256 with fixed salt (same as GUI worker).
+    This allows GUI and service to encrypt/decrypt measurements using the same key.
+    """
+    try:
+        import base64
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        from cryptography.hazmat.primitives import hashes
+        
+        salt = b'measurements_key_v1'
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+        )
+        derived = kdf.derive(miner_key.encode('utf-8'))
+        return base64.urlsafe_b64encode(derived)
+    except Exception:
+        return b''
+
+def read_measurement_files() -> List[Dict[str, Any]]:
+    """Read and decrypt all measurement files from the measurements directory.
+    
+    Returns list of decrypted measurement data dicts.
+    Each dict contains: timestamp, miner_key, group, measurement.
+    """
+    measurements = []
+    try:
+        from cryptography.fernet import Fernet
+        
+        # Get miner key for decryption
+        miner_key = read_miner_key()
+        if not miner_key:
+            return measurements
+        
+        # Derive Fernet key
+        fernet_key = derive_measurement_key(miner_key)
+        if not fernet_key:
+            return measurements
+        
+        fernet = Fernet(fernet_key)
+        
+        # Get measurements directory
+        measurements_dir = os.path.join(data_dir(), "measurements")
+        if not os.path.exists(measurements_dir):
+            return measurements
+        
+        # Read all .enc files
+        for filename in os.listdir(measurements_dir):
+            if not filename.endswith('.json.enc'):
+                continue
+            
+            filepath = os.path.join(measurements_dir, filename)
+            try:
+                with open(filepath, 'rb') as f:
+                    encrypted = f.read()
+                
+                # Decrypt
+                decrypted = fernet.decrypt(encrypted)
+                data = json.loads(decrypted)
+                measurements.append(data)
+            except Exception:
+                # Skip corrupted or unreadable files
+                pass
+    
+    except Exception:
+        pass
+    
+    return measurements
 
 def owen_decrypt(key: bytes, ciphertext: bytes) -> bytes:
     nonce, ct = ciphertext[:16], ciphertext[16:]
@@ -397,18 +461,25 @@ def load_config() -> Dict[str, Any]:
     # No fallback - production builds must have embedded config from 1Password
     return {}
 
-def required_version_from_db(client) -> Optional[str]:
-    """Return software_version_needed for this miner code from PoC.versions.
-    Falls back to None if unavailable."""
+def required_versions_from_db(client) -> Dict[str, str]:
+    """Return software_version_needed and poc_version_needed for this miner code from PoC.versions.
+    Returns dict with 'software_version' and 'poc_version' keys (may be empty if unavailable)."""
     try:
-        doc = client["PoC"]["versions"].find_one({"miner_code": MINER_CODE}, {"software_version_needed": 1, "_id": 0})
+        doc = client["PoC"]["versions"].find_one(
+            {"miner_code": MINER_CODE}, 
+            {"software_version_needed": 1, "poc_version_needed": 1, "_id": 0}
+        )
+        result: Dict[str, str] = {}
         if isinstance(doc, dict):
-            v = doc.get("software_version_needed")
-            if isinstance(v, str) and v:
-                return v
+            software = doc.get("software_version_needed")
+            poc = doc.get("poc_version_needed")
+            if isinstance(software, str) and software:
+                result["software_version"] = software
+            if isinstance(poc, str) and poc:
+                result["poc_version"] = poc
+        return result
     except Exception:
-        pass
-    return None
+        return {}
 
 # --- Local cache integrity (anti-tamper) ---
 def _local_signing_key() -> Optional[bytes]:
@@ -460,11 +531,60 @@ def hour_and_slot(ts: dt.datetime, interval_seconds: int) -> tuple[int, int]:
     sec_in_hour = ts.minute * 60 + ts.second
     return ts.hour, sec_in_hour // max(1, interval_seconds)
 
+def get_miner_type_offset() -> int:
+    """Return the time offset in seconds for this miner type to stagger API calls.
+    
+    Spreads different miner types across 10 minutes (one per minute):
+    - BM:  0 seconds (xx:00)
+    - IDM: 60 seconds (xx:01)
+    - ODM: 120 seconds (xx:02)
+    - ISM: 180 seconds (xx:03)
+    - OSM: 240 seconds (xx:04)
+    - RDN: 300 seconds (xx:05)
+    - SDN: 360 seconds (xx:06)
+    - SVN: 420 seconds (xx:07)
+    - AEM: 480 seconds (xx:08)
+    - IRM: 540 seconds (xx:09)
+    """
+    offsets = {
+        "BM": 0,
+        "IDM": 60,
+        "ODM": 120,
+        "ISM": 180,
+        "OSM": 240,
+        "RDN": 300,
+        "SDN": 360,
+        "SVN": 420,
+        "AEM": 480,
+        "IRM": 540,
+    }
+    return offsets.get(MINER_CODE, 0)
+
 def next_boundary(ts: dt.datetime, interval_seconds: int) -> dt.datetime:
+    """Calculate next interval boundary with miner-type-specific offset.
+    
+    Adds a fixed offset based on miner type to stagger API load across different miner types.
+    """
     base = day_bucket(ts)
     elapsed = (ts - base).seconds
-    next_multiple = ((elapsed // interval_seconds) + 1) * interval_seconds
-    return base + dt.timedelta(seconds=next_multiple)
+    
+    # Get the miner type offset (0-540 seconds depending on type)
+    offset = get_miner_type_offset()
+    
+    # Calculate elapsed time relative to our offset
+    elapsed_from_offset = elapsed - offset
+    if elapsed_from_offset < 0:
+        elapsed_from_offset += 86400  # Handle wrap-around at midnight
+    
+    # Find next multiple of interval from our offset point
+    next_multiple = ((elapsed_from_offset // interval_seconds) + 1) * interval_seconds
+    next_wake_seconds = (offset + next_multiple) % 86400
+    
+    # If we wrapped past midnight, add a day
+    if next_wake_seconds < elapsed:
+        base += dt.timedelta(days=1)
+    
+    return base + dt.timedelta(seconds=next_wake_seconds)
 
 def hour_key(ts: dt.datetime) -> str:
     return ts.strftime("%Y%m%d%H")
@@ -560,29 +680,37 @@ def upsert_installation_record(
     miner_key: str,
     install_id: str,
     *,
-    version_needed: Optional[str] = None,
+    software_version_needed: Optional[str] = None,
+    poc_version_needed: Optional[str] = None,
     is_uptodate: Optional[bool] = None,
     is_outdated: Optional[bool] = None,
 ):
     """Track per-machine installation in main.installations.
     Keyed by (miner_key, install_id).
-    Records version_installed, and optionally version_needed and booleans is_uptodate/is_outdated.
+    Records software_version_installed and poc_version_installed, and optionally version requirements and status flags.
     """
     try:
         coll = client["main"]["installations"]
         hn = platform.node(); hn_norm, hn_base = _host_norms()
+        
+        # Get the PoC version from config_profile (same as VERSION for hardware PoC service)
+        from config_profile import VERSION as POC_VERSION
+        
         payload_set = {
             "miner_key": miner_key,
             "install_id": install_id,
             "minerCode": MINER_CODE,
-            "version_installed": VERSION,
+            "software_version_installed": VERSION,
+            "poc_version_installed": POC_VERSION,
             "hostname": hn,
             "os": platform.platform(),
             "last_seen_at": now_utc(),
             "is_installed": True,
         }
-        if isinstance(version_needed, str) and version_needed:
-            payload_set["version_needed"] = version_needed
+        if isinstance(software_version_needed, str) and software_version_needed:
+            payload_set["software_version_needed"] = software_version_needed
+        if isinstance(poc_version_needed, str) and poc_version_needed:
+            payload_set["poc_version_needed"] = poc_version_needed
         if is_uptodate is not None:
             payload_set["is_uptodate"] = bool(is_uptodate)
         if is_outdated is not None:
@@ -754,7 +882,8 @@ def verify_or_acquire_installation_lease(client: MongoProxyClient, miner_key: st
 def write_status(coll, miner_key: str, ts: dt.datetime, status: str, interval_seconds: int,
                  software_needed: Optional[str] = None,
                  miner_mac: Optional[str] = None,
-                 mac_registered: Optional[str] = None) -> None:
+                 mac_registered: Optional[str] = None,
+                 poi_data: Optional[dict] = None) -> None:
     day = day_iso(ts)
     hour, slot = hour_and_slot(ts, interval_seconds)
 
@@ -824,14 +953,18 @@ def write_status(coll, miner_key: str, ts: dt.datetime, status: str, interval_se
         if not isinstance(software_info.get("software_uptodate"), bool):
             software_info["software_uptodate"] = None
 
+    # For AEM miners, include PoI data if provided
+    miner_type_val = existing_doc.get("miner_type") if isinstance(existing_doc.get("miner_type"), str) else MINER_CODE
+    
     new_doc = _compose_hardware_doc(
         miner_key,
-        miner_type=existing_doc.get("miner_type") if isinstance(existing_doc.get("miner_type"), str) else MINER_CODE,
+        miner_type=miner_type_val,
         mac=mac_info,
         software=software_info,
         poc=poc_compact,
         pol=existing_pol,
         last_updated=now_utc(),
+        poi=poi_data if (miner_type_val == "AEM" and poi_data) else None,
     )
 
     try:
@@ -894,7 +1027,7 @@ def ensure_dirs():
         except Exception: pass
 
 def cache_path_for(ts: dt.datetime) -> str:
-    return os.path.join(data_dir(), f"status-{ts.strftime('%Y%m%d')}.json")
+    return os.path.join(data_dir(), "status", f"status-{ts.strftime('%Y%m%d')}.json")
 
 def read_local_cache(path: str) -> dict:
     try:
@@ -939,7 +1072,7 @@ def atomic_write_json(path: str, payload: dict):
 
 def cache_lock_path_for(ts: dt.datetime) -> str:
     """Return the lock file path for the given day's cache."""
-    return os.path.join(data_dir(), f"status-{ts.strftime('%Y%m%d')}.lock")
+    return os.path.join(data_dir(), "status", f"status-{ts.strftime('%Y%m%d')}.lock")
 
 class _CacheLock:
     """Lightweight advisory lock for a day's cache file.
@@ -1611,7 +1744,7 @@ def main():
         time.sleep(2)
         sys.exit(3)  # Exit code 3: not found
     
-    required_version: Optional[str] = None
+    required_versions: Dict[str, str] = {}
     # miner_mac selected in GUI (persisted to shared data dir)
     miner_mac_local: Optional[str] = read_selected_miner_mac() or None
     mac_registered: Optional[str] = None
@@ -1630,23 +1763,35 @@ def main():
                 sys.exit(9)  # Exit code 9: lease verification failed
             # Update this installation record (per-machine)
             upsert_installation_record(client, miner_key, install_id)
-            # Check required version and warn (do not exit; backend can enforce rewards policy)
+            # Check required versions and warn (do not exit; backend can enforce rewards policy)
             try:
-                required_version = required_version_from_db(client)
-                if isinstance(required_version, str) and cmp_ver(VERSION, required_version) < 0:
-                    log.warning("Service version %s is below required %s; continuing (rewards may be paused)", VERSION, required_version)
-                # Also update installations with the is_outdated flag on first connect
-                try:
-                    is_outdated = bool(isinstance(required_version, str) and cmp_ver(VERSION, required_version) < 0)
-                except Exception:
-                    is_outdated = False
+                required_versions = required_versions_from_db(client)
+                software_required = required_versions.get("software_version")
+                poc_required = required_versions.get("poc_version")
+                
+                # Check if software version is outdated
+                is_software_outdated = False
+                if isinstance(software_required, str) and cmp_ver(VERSION, software_required) < 0:
+                    log.warning("Service version %s is below required %s; continuing (rewards may be paused)", VERSION, software_required)
+                    is_software_outdated = True
+                
+                # Check if PoC version is outdated (using same VERSION since hardware PoC service version = PoC version)
+                is_poc_outdated = False
+                if isinstance(poc_required, str) and cmp_ver(VERSION, poc_required) < 0:
+                    log.warning("PoC version %s is below required %s; continuing (rewards may be paused)", VERSION, poc_required)
+                    is_poc_outdated = True
+                
+                is_outdated = is_software_outdated or is_poc_outdated
+                
+                # Update installations with version requirements and status
                 try:
                     upsert_installation_record(
                         client,
                         miner_key,
                         install_id,
-                        version_needed=(required_version if isinstance(required_version, str) else None),
-                        is_uptodate=(not is_outdated if isinstance(required_version, str) else None),
+                        software_version_needed=software_required,
+                        poc_version_needed=poc_required,
+                        is_uptodate=(not is_outdated if (software_required or poc_required) else None),
                         is_outdated=is_outdated,
                     )
                 except Exception:
@@ -1694,10 +1839,11 @@ def main():
                         pol_map[day] = pol_entry
                         # Ensure software requirement fields are present immediately so the UI shows them
                         try:
-                            if isinstance(required_version, str) and required_version:
-                                software_info["software_needed"] = required_version
+                            software_required = required_versions.get("software_version")
+                            if isinstance(software_required, str) and software_required:
+                                software_info["software_needed"] = software_required
                                 try:
-                                    software_info["software_uptodate"] = (cmp_ver(VERSION, required_version) >= 0)
+                                    software_info["software_uptodate"] = (cmp_ver(VERSION, software_required) >= 0)
                                 except Exception:
                                     software_info["software_uptodate"] = None
                             else:
@@ -1706,14 +1852,20 @@ def main():
                         except Exception:
                             pass
 
+                        # For AEM miners, add PoI (Proof of Installed)
+                        miner_type_val = existing_doc.get("miner_type") if isinstance(existing_doc.get("miner_type"), str) else MINER_CODE
+                        poi_data = None
+                        if miner_type_val == "AEM":
+                            poi_data = monitor_poi_for_aem()
                         new_doc = _compose_hardware_doc(
                             miner_key,
-                            miner_type=existing_doc.get("miner_type") if isinstance(existing_doc.get("miner_type"), str) else MINER_CODE,
+                            miner_type=miner_type_val,
                             mac=mac_info,
                             software=software_info,
                             poc=poc_map,
                             pol=pol_map,
                             last_updated=now_utc(),
+                            poi=poi_data,
                         )
                         try:
                             coll.replace_one({"miner_key": miner_key}, new_doc, upsert=True)
@@ -1749,24 +1901,34 @@ def main():
         except Exception:
             pass
         try:
-            # Refresh required version at most once per UTC hour
+            # Refresh required versions at most once per UTC hour
             try:
                 hour_start_for_check = slot_ts.replace(minute=0, second=0, microsecond=0)
                 if (last_version_check_hour is None) or (hour_start_for_check > last_version_check_hour):
-                    required_version = required_version_from_db(client)
+                    required_versions = required_versions_from_db(client)
                     last_version_check_hour = hour_start_for_check
             except Exception:
                 pass
-            outdated = False
+            
+            # Check if either software or PoC version is outdated
+            software_required = required_versions.get("software_version")
+            poc_required = required_versions.get("poc_version")
+            outdated: bool = False
+            
             try:
-                if isinstance(required_version, str) and required_version:
-                    outdated = (cmp_ver(VERSION, required_version) < 0)
+                is_software_outdated = isinstance(software_required, str) and software_required and (cmp_ver(VERSION, software_required) < 0)
+                is_poc_outdated = isinstance(poc_required, str) and poc_required and (cmp_ver(VERSION, poc_required) < 0)
+                outdated = bool(is_software_outdated or is_poc_outdated)
             except Exception:
                 outdated = False
-            # Warn the user once if this install is behind the required version
+            
+            # Warn the user once if this install is behind the required versions
             try:
                 if outdated and not warned_version:
-                    log.warning("Software version %s is below required %s; please update.", VERSION, required_version)
+                    if isinstance(software_required, str) and software_required and cmp_ver(VERSION, software_required) < 0:
+                        log.warning("Software version %s is below required %s; please update.", VERSION, software_required)
+                    if isinstance(poc_required, str) and poc_required and cmp_ver(VERSION, poc_required) < 0:
+                        log.warning("PoC version %s is below required %s; please update.", VERSION, poc_required)
                     warned_version = True
             except Exception:
                 pass
@@ -1789,23 +1951,64 @@ def main():
                     mac_registered = mr
             except Exception:
                 pass
+            
+            # For AEM miners, get PoI data
+            poi_data = None
+            if MINER_CODE == "AEM":
+                poi_data = monitor_poi_for_aem()
+            
             # Write to DB (day/hour aggregates)
             write_status(coll, miner_key, slot_ts, status, interval,
-                         software_needed=(required_version if isinstance(required_version, str) and required_version else None),
+                         software_needed=software_required,
                          miner_mac=miner_mac_local,
-                         mac_registered=mac_registered)
+                         mac_registered=mac_registered,
+                         poi_data=poi_data)
             # Refresh installation heartbeat each cycle (and mark version state)
             try:
+                has_requirements = software_required or poc_required
                 upsert_installation_record(
                     client,
                     miner_key,
                     install_id,
-                    version_needed=(required_version if isinstance(required_version, str) else None),
-                    is_uptodate=(False if (isinstance(required_version, str) and outdated) else (True if isinstance(required_version, str) else None)),
+                    software_version_needed=software_required,
+                    poc_version_needed=poc_required,
+                    is_uptodate=(False if (has_requirements and outdated) else (True if has_requirements else None)),
                     is_outdated=outdated,
                 )
             except Exception:
                 pass
+            
+            # Upload measurements to External API (if registered hexId exists)
+            try:
+                # Get registered hexId for this miner
+                hex_registered = registered_hexid_from_devices(client, miner_key)
+                
+                if hex_registered:
+                    # Read and decrypt measurement files
+                    measurement_data_list = read_measurement_files()
+                    
+                    # Upload each measurement
+                    for measurement_data in measurement_data_list:
+                        try:
+                            timestamp = measurement_data.get("timestamp")
+                            measurements = measurement_data.get("measurement", {})
+                            
+                            if timestamp and measurements:
+                                # Upload to External API indexed by hexId
+                                client._api.upload_measurements(
+                                    hex_id=hex_registered,
+                                    miner_code=MINER_CODE,
+                                    install_id=install_id,
+                                    timestamp=timestamp,
+                                    measurements=measurements
+                                )
+                        except Exception as e:
+                            # Log but don't fail - continue with other measurements
+                            log.error("Failed to upload measurement: %s", e)
+            except Exception as e:
+                # Don't fail the main loop if measurement upload fails
+                log.error("Measurement upload error: %s", e)
+            
             # Renew our lease; if renewal fails, try to reacquire (API may have been down)
             try:
                 renewed = renew_installation_lease(client, miner_key, install_id, lease_seconds=lease_seconds)

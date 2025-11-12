@@ -112,11 +112,16 @@ class MongoProxyCollection:
             if not isinstance(miner_code, str):
                 return None
             try:
-                version = self._api.get_required_version(miner_code)
+                versions = self._api.get_required_version(miner_code)
             except ApiError:
                 return None
-            if version:
-                return {"software_version_needed": version}
+            if versions:
+                result = {}
+                if "software_version" in versions:
+                    result["software_version_needed"] = versions["software_version"]
+                if "poc_version" in versions:
+                    result["poc_version_needed"] = versions["poc_version"]
+                return result if result else None
             return None
         if self._db == "main" and self._coll == "devices":
             miner_key = filter.get("miner_key") if isinstance(filter, dict) else None

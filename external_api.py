@@ -78,17 +78,21 @@ class ExternalApiClient:
         except ValueError as exc:
             raise ApiError(f"{method} {url} returned invalid JSON: {exc}") from exc
 
-    def get_required_version(self, miner_code: str) -> Optional[str]:
-        """GET {base}/versions/{miner_code} -> {"required_version": "5.1.4"}
+    def get_required_version(self, miner_code: str) -> Dict[str, str]:
+        """GET {base}/versions/{miner_code} -> {"software_version": "6.0.3", "poc_version": "1.0.0"}
 
-        (endpoint unchanged)
+        Returns dict with software_version and poc_version keys.
         """
         data = self._request("GET", f"/versions/{miner_code}")
+        result: Dict[str, str] = {}
         if isinstance(data, dict):
-            value = data.get("required_version") or data.get("version")
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        return None
+            software = data.get("software_version")
+            poc = data.get("poc_version")
+            if isinstance(software, str) and software.strip():
+                result["software_version"] = software.strip()
+            if isinstance(poc, str) and poc.strip():
+                result["poc_version"] = poc.strip()
+        return result
 
     def get_miner_profile(self, miner_key: str) -> Dict[str, Any]:
         """GET {base}/credentials/{miner_key} -> {"exists": bool, "registered_mac": str|None, "hex_id": str|None}
@@ -108,6 +112,27 @@ class ExternalApiClient:
         body = dict(payload)
         body.setdefault("install_id", install_id)
         self._request("POST", f"/installations/{miner_key}/installations/{install_id}", json_body=body)
+
+    def upload_measurements(self, hex_id: str, miner_code: str, install_id: str, timestamp: str, measurements: Dict[str, Any]) -> None:
+        """POST {base}/measurements/{hex_id} with measurement data.
+        
+        Uploads measurement data indexed by hexId with miner_code to allow multiple miner types per hex.
+        Each miner instance is tracked by install_id to handle multiple miners of same type.
+        
+        Args:
+            hex_id: The H3 hex cell ID (registered location)
+            miner_code: Miner type code (BM, ISM, IRM, etc.)
+            install_id: Installation UUID to distinguish multiple miners
+            timestamp: ISO timestamp of the measurement
+            measurements: Dict containing measurement data (dl, ul, cpm, sats, etc.)
+        """
+        body = {
+            "miner_code": miner_code,
+            "install_id": install_id,
+            "timestamp": timestamp,
+            "measurements": measurements,
+        }
+        self._request("POST", f"/measurements/{hex_id}", json_body=body)
 
     def acquire_installation_lease(self, miner_key: str, install_id: str, lease_seconds: int) -> bool:
         """POST {base}/installations/{miner_key}/leases/{install_id} -> {"granted": bool, "expires_at": "..."}
