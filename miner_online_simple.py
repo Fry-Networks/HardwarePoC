@@ -126,30 +126,63 @@ def _extract_software_fields(doc: dict[str, Any]) -> dict[str, Any]:
         "software_version": VERSION,
         "software_needed": None,
         "software_uptodate": None,
+        "software_version_installed": VERSION,
+        "software_version_needed": None,
+        "software_outdated": None,
+        "poc_version_installed": VERSION,
+        "poc_version_needed": None,
+        "poc_uptodate": None,
+        "poc_outdated": None,
+        "is_uptodate": None,
+        "is_outdated": None,
     }
     if not isinstance(doc, dict):
         return info
-    version_val = doc.get("software_version")
-    if isinstance(version_val, str) and version_val:
-        info["software_version"] = version_val
-    needed_val = doc.get("software_needed")
-    if isinstance(needed_val, str) and needed_val:
-        info["software_needed"] = needed_val
-    uptodate_val = doc.get("software_uptodate")
-    if isinstance(uptodate_val, bool):
-        info["software_uptodate"] = uptodate_val
-    elif isinstance(doc.get("software_outdated"), bool):
-        info["software_uptodate"] = not doc.get("software_outdated")
-    sw_obj = doc.get("software")
-    if isinstance(sw_obj, dict):
-        if isinstance(sw_obj.get("software_version"), str) and sw_obj.get("software_version"):
-            info["software_version"] = sw_obj["software_version"]
-        if isinstance(sw_obj.get("software_needed"), str) and sw_obj.get("software_needed"):
-            info["software_needed"] = sw_obj["software_needed"]
-        if isinstance(sw_obj.get("software_uptodate"), bool):
-            info["software_uptodate"] = sw_obj["software_uptodate"]
-        elif isinstance(sw_obj.get("software_outdated"), bool):
-            info["software_uptodate"] = not sw_obj["software_outdated"]
+
+    def _ingest(source: Optional[dict[str, Any]]) -> None:
+        if not isinstance(source, dict):
+            return
+        val = source.get("software_version")
+        if isinstance(val, str) and val:
+            info["software_version"] = val
+        val = source.get("software_version_installed")
+        if isinstance(val, str) and val:
+            info["software_version_installed"] = val
+        val = source.get("software_needed") or source.get("software_version_needed")
+        if isinstance(val, str) and val:
+            info["software_needed"] = val
+            info["software_version_needed"] = val
+        val = source.get("software_uptodate")
+        if isinstance(val, bool):
+            info["software_uptodate"] = val
+        val = source.get("software_outdated")
+        if isinstance(val, bool):
+            info["software_outdated"] = val
+            if info["software_uptodate"] is None:
+                info["software_uptodate"] = not val
+        val = source.get("poc_version_installed")
+        if isinstance(val, str) and val:
+            info["poc_version_installed"] = val
+        val = source.get("poc_version_needed")
+        if isinstance(val, str) and val:
+            info["poc_version_needed"] = val
+        val = source.get("poc_uptodate")
+        if isinstance(val, bool):
+            info["poc_uptodate"] = val
+        val = source.get("poc_outdated")
+        if isinstance(val, bool):
+            info["poc_outdated"] = val
+            if info["poc_uptodate"] is None:
+                info["poc_uptodate"] = not val
+        val = source.get("is_uptodate")
+        if isinstance(val, bool):
+            info["is_uptodate"] = val
+        val = source.get("is_outdated")
+        if isinstance(val, bool):
+            info["is_outdated"] = val
+
+    _ingest(doc)
+    _ingest(doc.get("software"))
     return info
 
 def _extract_poc_map(doc: dict[str, Any]) -> dict[str, float]:
@@ -231,9 +264,38 @@ def _compose_hardware_doc(
     }
     doc["software"] = {
         "software_version": software.get("software_version") or VERSION,
+        "software_version_installed": software.get("software_version_installed") or software.get("software_version") or VERSION,
         "software_needed": software.get("software_needed") if isinstance(software.get("software_needed"), str) and software.get("software_needed") else None,
+        "software_version_needed": software.get("software_version_needed") if isinstance(software.get("software_version_needed"), str) and software.get("software_version_needed") else software.get("software_needed"),
         "software_uptodate": software.get("software_uptodate") if isinstance(software.get("software_uptodate"), bool) else None,
+        "software_outdated": software.get("software_outdated") if isinstance(software.get("software_outdated"), bool) else None,
+        "poc_version_installed": software.get("poc_version_installed") or software.get("software_version_installed") or VERSION,
+        "poc_version_needed": software.get("poc_version_needed") if isinstance(software.get("poc_version_needed"), str) and software.get("poc_version_needed") else None,
+        "poc_uptodate": software.get("poc_uptodate") if isinstance(software.get("poc_uptodate"), bool) else None,
+        "poc_outdated": software.get("poc_outdated") if isinstance(software.get("poc_outdated"), bool) else None,
+        "is_uptodate": software.get("is_uptodate") if isinstance(software.get("is_uptodate"), bool) else None,
+        "is_outdated": software.get("is_outdated") if isinstance(software.get("is_outdated"), bool) else None,
     }
+    def _maybe_set_str(key: str, value: Any) -> None:
+        if isinstance(value, str) and value:
+            doc[key] = value
+    def _maybe_set_bool(key: str, value: Any) -> None:
+        if isinstance(value, bool):
+            doc[key] = value
+
+    _maybe_set_str("software_version_installed", doc["software"].get("software_version_installed"))
+    _maybe_set_str("software_version_needed", doc["software"].get("software_version_needed"))
+    _maybe_set_bool("software_uptodate", doc["software"].get("software_uptodate"))
+    if doc["software"].get("software_outdated") is not None:
+        _maybe_set_bool("software_outdated", doc["software"].get("software_outdated"))
+    _maybe_set_str("poc_version_installed", doc["software"].get("poc_version_installed"))
+    _maybe_set_str("poc_version_needed", doc["software"].get("poc_version_needed"))
+    _maybe_set_bool("poc_uptodate", doc["software"].get("poc_uptodate"))
+    if doc["software"].get("poc_outdated") is not None:
+        _maybe_set_bool("poc_outdated", doc["software"].get("poc_outdated"))
+    _maybe_set_bool("is_uptodate", doc["software"].get("is_uptodate"))
+    _maybe_set_bool("is_outdated", doc["software"].get("is_outdated"))
+
     doc["PoC"] = {str(k): float(v) for k, v in poc.items()}
     pol_compact: dict[str, dict[str, Any]] = {}
     for key in sorted(pol.keys()):
@@ -881,6 +943,7 @@ def verify_or_acquire_installation_lease(client: MongoProxyClient, miner_key: st
 
 def write_status(coll, miner_key: str, ts: dt.datetime, status: str, interval_seconds: int,
                  software_needed: Optional[str] = None,
+                 poc_version_needed: Optional[str] = None,
                  miner_mac: Optional[str] = None,
                  mac_registered: Optional[str] = None,
                  poi_data: Optional[dict] = None) -> None:
@@ -942,16 +1005,50 @@ def write_status(coll, miner_key: str, ts: dt.datetime, status: str, interval_se
     mac_info["mac_match"] = bool(norm_miner and norm_registered and norm_miner == norm_registered)
 
     needed_value = software_needed.strip() if isinstance(software_needed, str) and software_needed.strip() else software_info.get("software_needed")
+    poc_needed_value = poc_version_needed.strip() if isinstance(poc_version_needed, str) and poc_version_needed.strip() else software_info.get("poc_version_needed")
     software_info["software_version"] = VERSION
+    software_info["software_version_installed"] = VERSION
     software_info["software_needed"] = needed_value
+    software_info["software_version_needed"] = needed_value
     if isinstance(needed_value, str) and needed_value:
         try:
-            software_info["software_uptodate"] = (cmp_ver(VERSION, needed_value) >= 0)
+            cmp_res = cmp_ver(VERSION, needed_value)
+            software_info["software_uptodate"] = (cmp_res >= 0)
+            software_info["software_outdated"] = (cmp_res < 0)
         except Exception:
             software_info["software_uptodate"] = None
+            software_info["software_outdated"] = None
     else:
         if not isinstance(software_info.get("software_uptodate"), bool):
             software_info["software_uptodate"] = None
+        software_info["software_outdated"] = None
+
+    software_info["poc_version_installed"] = VERSION
+    software_info["poc_version_needed"] = poc_needed_value if isinstance(poc_needed_value, str) and poc_needed_value else None
+    if isinstance(poc_needed_value, str) and poc_needed_value:
+        try:
+            poc_cmp = cmp_ver(VERSION, poc_needed_value)
+            software_info["poc_uptodate"] = (poc_cmp >= 0)
+            software_info["poc_outdated"] = (poc_cmp < 0)
+        except Exception:
+            software_info["poc_uptodate"] = None
+            software_info["poc_outdated"] = None
+    else:
+        if not isinstance(software_info.get("poc_uptodate"), bool):
+            software_info["poc_uptodate"] = None
+        software_info["poc_outdated"] = None
+
+    has_requirements = bool((software_info.get("software_version_needed") or software_info.get("poc_version_needed")))
+    if has_requirements:
+        any_outdated = bool(
+            (software_info.get("software_outdated") is True) or
+            (software_info.get("poc_outdated") is True)
+        )
+        software_info["is_outdated"] = any_outdated
+        software_info["is_uptodate"] = not any_outdated
+    else:
+        software_info["is_outdated"] = None
+        software_info["is_uptodate"] = None
 
     # For AEM miners, include PoI data if provided
     miner_type_val = existing_doc.get("miner_type") if isinstance(existing_doc.get("miner_type"), str) else MINER_CODE
@@ -1157,7 +1254,15 @@ def _lc_write_slot(doc: dict, ts: dt.datetime, status: str, interval_seconds: in
     h["totalSlots"] = slots_per_hour
     doc["hours"][str(hour)] = h
 
-def write_status_local(miner_key: str, ts: dt.datetime, status: str, interval_seconds: int, mac_registered: Optional[str] = None, mac_mismatch: Optional[bool] = None):
+def write_status_local(
+    miner_key: str,
+    ts: dt.datetime,
+    status: str,
+    interval_seconds: int,
+    mac_registered: Optional[str] = None,
+    mac_mismatch: Optional[bool] = None,
+    poi_data: Optional[dict[str, Any]] = None,
+):
     ensure_dirs()
     cur_day_path = cache_path_for(ts)
     cur_lock_path = cache_lock_path_for(ts)
@@ -1266,6 +1371,8 @@ def write_status_local(miner_key: str, ts: dt.datetime, status: str, interval_se
         doc["mac_mismatch"] = bool(mac_mismatch)
     else:
         doc["mac_mismatch"] = bool(doc.get("mac_mismatch", False))
+    if isinstance(poi_data, dict):
+        doc["PoI"] = poi_data
 
     doc["lastUpdated"] = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
     doc["lastSlotWritten"] = cur_slot.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1278,6 +1385,19 @@ def write_status_local(miner_key: str, ts: dt.datetime, status: str, interval_se
         pass
     with _CacheLock(cur_lock_path):
         atomic_write_json(cur_day_path, doc)
+    _update_rolling7_summary(miner_key, ts)
+
+
+def _update_rolling7_summary(miner_key: str, ts: dt.datetime) -> None:
+    """Best-effort rolling7 update; failure should not interrupt status writes."""
+    try:
+        from rolling_days import update_rolling_7_days
+    except Exception:
+        return
+    try:
+        update_rolling_7_days(miner_key, ts=ts)
+    except Exception:
+        pass
 
 
 
@@ -1892,12 +2012,26 @@ def main():
         slot_ts = now_utc()
         # Determine online status first
         status = "online" if is_internet_up(timeout=4) else "offline"
+        poi_snapshot: Optional[dict[str, Any]] = None
+        if MINER_CODE == "AEM":
+            try:
+                poi_snapshot = monitor_poi_for_aem()
+            except Exception:
+                poi_snapshot = None
         # Always write the local rolling 24h cache, regardless of DB connectivity
         try:
             norm_active = re.sub(r'[^0-9a-f]', '', (miner_mac_local or '').lower())
             norm_registered = re.sub(r'[^0-9a-f]', '', (mac_registered or '').lower())
             local_mismatch = bool(norm_active and norm_registered and norm_active != norm_registered)
-            write_status_local(miner_key, slot_ts, status, interval, mac_registered=mac_registered, mac_mismatch=local_mismatch)
+            write_status_local(
+                miner_key,
+                slot_ts,
+                status,
+                interval,
+                mac_registered=mac_registered,
+                mac_mismatch=local_mismatch,
+                poi_data=poi_snapshot,
+            )
         except Exception:
             pass
         try:
@@ -1952,14 +2086,18 @@ def main():
             except Exception:
                 pass
             
-            # For AEM miners, get PoI data
-            poi_data = None
-            if MINER_CODE == "AEM":
-                poi_data = monitor_poi_for_aem()
+            # For AEM miners, reuse PoI snapshot or fetch if missing
+            poi_data = poi_snapshot
+            if MINER_CODE == "AEM" and poi_data is None:
+                try:
+                    poi_data = monitor_poi_for_aem()
+                except Exception:
+                    poi_data = None
             
             # Write to DB (day/hour aggregates)
             write_status(coll, miner_key, slot_ts, status, interval,
                          software_needed=software_required,
+                         poc_version_needed=poc_required,
                          miner_mac=miner_mac_local,
                          mac_registered=mac_registered,
                          poi_data=poi_data)
