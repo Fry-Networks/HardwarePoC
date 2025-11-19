@@ -113,24 +113,31 @@ class ExternalApiClient:
         body.setdefault("install_id", install_id)
         self._request("POST", f"/installations/{miner_key}/installations/{install_id}", json_body=body)
 
-    def upload_measurements(self, hex_id: str, miner_code: str, install_id: str, timestamp: str, measurements: Dict[str, Any]) -> None:
-        """POST {base}/measurements/{hex_id} with measurement data.
-        
-        Uploads measurement data indexed by hexId with miner_code to allow multiple miner types per hex.
-        Each miner instance is tracked by install_id to handle multiple miners of same type.
-        
+    def upload_measurement(
+        self,
+        hex_id: str,
+        miner_code: str,
+        install_id: str,
+        timestamp: str,
+        measurement_type: str,
+        value: Dict[str, Any],
+    ) -> None:
+        """POST {base}/measurements/{hex_id} with a typed measurement entry.
+
         Args:
-            hex_id: The H3 hex cell ID (registered location)
-            miner_code: Miner type code (BM, ISM, IRM, etc.)
-            install_id: Installation UUID to distinguish multiple miners
-            timestamp: ISO timestamp of the measurement
-            measurements: Dict containing measurement data (dl, ul, cpm, sats, etc.)
+            hex_id: The H3 hex cell ID (registered location).
+            miner_code: Miner type code (BM, ISM, IRM, etc.).
+            install_id: Installation UUID to distinguish multiple miners.
+            timestamp: ISO timestamp of the measurement.
+            measurement_type: Logical measurement group (bandwidth, satellite, etc.).
+            value: Dict containing the measurement payload (dl, ul, cpm, sats, etc.).
         """
         body = {
             "miner_code": miner_code,
             "install_id": install_id,
             "timestamp": timestamp,
-            "measurements": measurements,
+            "measurement_type": measurement_type,
+            "value": dict(value),
         }
         self._request("POST", f"/measurements/{hex_id}", json_body=body)
 

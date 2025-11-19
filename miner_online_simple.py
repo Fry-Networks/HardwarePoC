@@ -238,7 +238,7 @@ def _compose_hardware_doc(
     poc: dict[str, float],
     pol: dict[str, dict[str, Any]],
     last_updated: dt.datetime,
-    poi: Optional[dict] = None,
+    poi: Optional[bool] = None,
 ) -> dict[str, Any]:
     doc: dict[str, Any] = {}
     doc["miner_key"] = miner_key
@@ -309,9 +309,9 @@ def _compose_hardware_doc(
         }
     doc["PoL"] = pol_compact
     doc["lastUpdated"] = last_updated.isoformat()
-    # Add PoI only for AEM miners
-    if (doc.get("miner_type") == "AEM" or (miner_type == "AEM")) and poi:
-        doc["PoI"] = poi
+    # Add PoI only for AEM miners when state is known
+    if (doc.get("miner_type") == "AEM" or (miner_type == "AEM")) and poi is not None:
+        doc["PoI"] = bool(poi)
     return doc
 
 
@@ -941,12 +941,18 @@ def verify_or_acquire_installation_lease(client: MongoProxyClient, miner_key: st
 
 
 
-def write_status(coll, miner_key: str, ts: dt.datetime, status: str, interval_seconds: int,
-                 software_needed: Optional[str] = None,
-                 poc_version_needed: Optional[str] = None,
-                 miner_mac: Optional[str] = None,
-                 mac_registered: Optional[str] = None,
-                 poi_data: Optional[dict] = None) -> None:
+def write_status(
+    coll,
+    miner_key: str,
+    ts: dt.datetime,
+    status: str,
+    interval_seconds: int,
+    software_needed: Optional[str] = None,
+    poc_version_needed: Optional[str] = None,
+    miner_mac: Optional[str] = None,
+    mac_registered: Optional[str] = None,
+    poi_data: Optional[bool] = None,
+) -> None:
     day = day_iso(ts)
     hour, slot = hour_and_slot(ts, interval_seconds)
 
@@ -1061,7 +1067,7 @@ def write_status(coll, miner_key: str, ts: dt.datetime, status: str, interval_se
         poc=poc_compact,
         pol=existing_pol,
         last_updated=now_utc(),
-        poi=poi_data if (miner_type_val == "AEM" and poi_data) else None,
+        poi=poi_data if (miner_type_val == "AEM") else None,
     )
 
     try:
@@ -1261,7 +1267,7 @@ def write_status_local(
     interval_seconds: int,
     mac_registered: Optional[str] = None,
     mac_mismatch: Optional[bool] = None,
-    poi_data: Optional[dict[str, Any]] = None,
+    poi_data: Optional[bool] = None,
 ):
     ensure_dirs()
     cur_day_path = cache_path_for(ts)
@@ -1371,8 +1377,8 @@ def write_status_local(
         doc["mac_mismatch"] = bool(mac_mismatch)
     else:
         doc["mac_mismatch"] = bool(doc.get("mac_mismatch", False))
-    if isinstance(poi_data, dict):
-        doc["PoI"] = poi_data
+    if poi_data is not None:
+        doc["PoI"] = bool(poi_data)
 
     doc["lastUpdated"] = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
     doc["lastSlotWritten"] = cur_slot.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -2011,13 +2017,20 @@ def main():
     while True:
         slot_ts = now_utc()
         # Determine online status first
-        status = "online" if is_internet_up(timeout=4) else "offline"
-        poi_snapshot: Optional[dict[str, Any]] = None
+        status_raw = "online" if is_internet_up(timeout=4) else "offline"
+        poi_snapshot: Optional[bool] = None
         if MINER_CODE == "AEM":
             try:
                 poi_snapshot = monitor_poi_for_aem()
             except Exception:
                 poi_snapshot = None
+        status = status_raw
+        if MINER_CODE == "AEM":
+            poi_ok = bool(poi_snapshot)
+            if status_raw == "online" and poi_ok:
+                status = "online"
+            else:
+                status = "offline"
         # Always write the local rolling 24h cache, regardless of DB connectivity
         try:
             norm_active = re.sub(r'[^0-9a-f]', '', (miner_mac_local or '').lower())
@@ -2116,36 +2129,43 @@ def main():
             except Exception:
                 pass
             
-            # Upload measurements to External API (if registered hexId exists)
-            try:
-                # Get registered hexId for this miner
-                hex_registered = registered_hexid_from_devices(client, miner_key)
-                
-                if hex_registered:
-                    # Read and decrypt measurement files
-                    measurement_data_list = read_measurement_files()
+            # Upload measurements to External API (if registered hexId exists); AEM uses PoI so skip uploads
+            if MINER_CODE != "AEM":
+                try:
+                    # Get registered hexId for this miner
+                    hex_registered = registered_hexid_from_devices(client, miner_key)
                     
-                    # Upload each measurement
-                    for measurement_data in measurement_data_list:
-                        try:
-                            timestamp = measurement_data.get("timestamp")
-                            measurements = measurement_data.get("measurement", {})
-                            
-                            if timestamp and measurements:
-                                # Upload to External API indexed by hexId
-                                client._api.upload_measurements(
-                                    hex_id=hex_registered,
-                                    miner_code=MINER_CODE,
-                                    install_id=install_id,
-                                    timestamp=timestamp,
-                                    measurements=measurements
-                                )
-                        except Exception as e:
-                            # Log but don't fail - continue with other measurements
-                            log.error("Failed to upload measurement: %s", e)
-            except Exception as e:
-                # Don't fail the main loop if measurement upload fails
-                log.error("Measurement upload error: %s", e)
+                    if hex_registered:
+                        # Read and decrypt measurement files
+                        measurement_data_list = read_measurement_files()
+                        
+                        # Upload each measurement
+                        for measurement_data in measurement_data_list:
+                            try:
+                                timestamp = measurement_data.get("timestamp")
+                                measurement_type = measurement_data.get("group") or measurement_data.get("measurement_type")
+                                value = measurement_data.get("measurement", {})
+
+                                if isinstance(measurement_type, str):
+                                    measurement_type = measurement_type.strip()
+                                if timestamp and measurement_type and isinstance(value, dict) and value:
+                                    # Upload to External API indexed by hexId
+                                    client._api.upload_measurement(
+                                        hex_id=hex_registered,
+                                        miner_code=MINER_CODE,
+                                        install_id=install_id,
+                                        timestamp=str(timestamp),
+                                        measurement_type=measurement_type,
+                                        value=value,
+                                    )
+                                else:
+                                    log.debug("Skipping measurement upload; missing required fields: %s", measurement_data)
+                            except Exception as e:
+                                # Log but don't fail - continue with other measurements
+                                log.error("Failed to upload measurement: %s", e)
+                except Exception as e:
+                    # Don't fail the main loop if measurement upload fails
+                    log.error("Measurement upload error: %s", e)
             
             # Renew our lease; if renewal fails, try to reacquire (API may have been down)
             try:
