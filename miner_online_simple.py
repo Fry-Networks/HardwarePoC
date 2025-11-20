@@ -67,13 +67,68 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 
-from config_profile import MINER_CODE, VERSION
+import config_profile as _cfg
+
+MINER_CODE = getattr(_cfg, "MINER_CODE", "")
+VERSION = getattr(_cfg, "VERSION", "")
+SOFTWARE_VERSION = getattr(_cfg, "SOFTWARE_VERSION", VERSION)
+POC_VERSION = getattr(_cfg, "POC_VERSION", VERSION)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("miner-online")
 
 DEFAULT_H3_RES = 4
 MAX_POC_DAYS = 14
+
+class ApiHealthBackoff:
+    """Simple backoff controller that pauses API traffic while the health endpoint fails."""
+
+    def __init__(self, delays: Optional[Iterable[int]] = None) -> None:
+        seq = list(delays) if delays is not None else [60, 600, 3600]
+        self.delays: List[int] = seq if seq else [60, 600, 3600]
+        self.level: int = -1
+        self.next_check_epoch: Optional[float] = None
+
+    def reset(self) -> None:
+        self.level = -1
+        self.next_check_epoch = None
+
+    def record_failure(self) -> int:
+        if self.level < len(self.delays) - 1:
+            self.level += 1
+        delay = self.delays[self.level]
+        self.next_check_epoch = time.time() + delay
+        return delay
+
+    def wait_for_health(self, base_url: str, *, timeout: float = 5.0) -> None:
+        """Block until the health endpoint responds healthy, backing off between probes."""
+        while self.level >= 0:
+            now_ts = time.time()
+            if self.next_check_epoch and self.next_check_epoch > now_ts:
+                time.sleep(min(5.0, self.next_check_epoch - now_ts))
+                continue
+            try:
+                if api_health_ok(base_url, timeout=timeout):
+                    self.reset()
+                    return
+            except Exception:
+                pass
+            delay = self.record_failure()
+            try:
+                log.warning("Hardware API health check failed; next probe in %ss", delay)
+            except Exception:
+                pass
+
+def api_health_ok(base_url: str, *, timeout: float = 5.0) -> bool:
+    """Return True if the /health endpoint responds with 2xx JSON or text."""
+    url = f"{base_url.rstrip('/')}/health"
+    try:
+        resp = requests.get(url, timeout=timeout)
+        if 200 <= resp.status_code < 300:
+            return True
+    except Exception:
+        return False
+    return False
 
 def _get_existing_hardware_doc(coll, miner_key: str) -> dict[str, Any]:
     try:
@@ -123,13 +178,13 @@ def _extract_mac_fields(doc: dict[str, Any]) -> dict[str, Any]:
 
 def _extract_software_fields(doc: dict[str, Any]) -> dict[str, Any]:
     info: dict[str, Any] = {
-        "software_version": VERSION,
+        "software_version": SOFTWARE_VERSION,
         "software_needed": None,
         "software_uptodate": None,
-        "software_version_installed": VERSION,
+        "software_version_installed": SOFTWARE_VERSION,
         "software_version_needed": None,
         "software_outdated": None,
-        "poc_version_installed": VERSION,
+        "poc_version_installed": POC_VERSION,
         "poc_version_needed": None,
         "poc_uptodate": None,
         "poc_outdated": None,
@@ -754,15 +809,12 @@ def upsert_installation_record(
     try:
         coll = client["main"]["installations"]
         hn = platform.node(); hn_norm, hn_base = _host_norms()
-        
-        # Get the PoC version from config_profile (same as VERSION for hardware PoC service)
-        from config_profile import VERSION as POC_VERSION
-        
+
         payload_set = {
             "miner_key": miner_key,
             "install_id": install_id,
             "minerCode": MINER_CODE,
-            "software_version_installed": VERSION,
+            "software_version_installed": SOFTWARE_VERSION,
             "poc_version_installed": POC_VERSION,
             "hostname": hn,
             "os": platform.platform(),
@@ -834,7 +886,7 @@ def acquire_installation_lease(client: MongoProxyClient, miner_key: str, install
                 "last_seen_at": now,
                 "is_installed": True,
                 "minerCode": MINER_CODE,
-                "version_installed": VERSION,
+                "version_installed": SOFTWARE_VERSION,
                 "hostname": this_host,
                 "os": platform.platform(),
                 "_lease": True,
@@ -1012,13 +1064,13 @@ def write_status(
 
     needed_value = software_needed.strip() if isinstance(software_needed, str) and software_needed.strip() else software_info.get("software_needed")
     poc_needed_value = poc_version_needed.strip() if isinstance(poc_version_needed, str) and poc_version_needed.strip() else software_info.get("poc_version_needed")
-    software_info["software_version"] = VERSION
-    software_info["software_version_installed"] = VERSION
+    software_info["software_version"] = SOFTWARE_VERSION
+    software_info["software_version_installed"] = SOFTWARE_VERSION
     software_info["software_needed"] = needed_value
     software_info["software_version_needed"] = needed_value
     if isinstance(needed_value, str) and needed_value:
         try:
-            cmp_res = cmp_ver(VERSION, needed_value)
+            cmp_res = cmp_ver(SOFTWARE_VERSION, needed_value)
             software_info["software_uptodate"] = (cmp_res >= 0)
             software_info["software_outdated"] = (cmp_res < 0)
         except Exception:
@@ -1029,11 +1081,11 @@ def write_status(
             software_info["software_uptodate"] = None
         software_info["software_outdated"] = None
 
-    software_info["poc_version_installed"] = VERSION
+    software_info["poc_version_installed"] = POC_VERSION
     software_info["poc_version_needed"] = poc_needed_value if isinstance(poc_needed_value, str) and poc_needed_value else None
     if isinstance(poc_needed_value, str) and poc_needed_value:
         try:
-            poc_cmp = cmp_ver(VERSION, poc_needed_value)
+            poc_cmp = cmp_ver(POC_VERSION, poc_needed_value)
             software_info["poc_uptodate"] = (poc_cmp >= 0)
             software_info["poc_outdated"] = (poc_cmp < 0)
         except Exception:
@@ -1279,7 +1331,7 @@ def write_status_local(
         doc = {
             "miner_key": miner_key,
             "minerCode": MINER_CODE,
-            "agentVersion": VERSION,
+            "agentVersion": SOFTWARE_VERSION,
             "date": day_iso,
             "hours": {},
             "lastSlotWritten": None
@@ -1829,6 +1881,7 @@ def main():
     cfg = load_config()
 
     api_base = require_api_base(cfg)
+    api_health_backoff = ApiHealthBackoff()
     
     # Validate that we have embedded credentials from 1Password build process
     if not cfg.get("api_token") and not cfg.get("api_key"):
@@ -1848,7 +1901,7 @@ def main():
         cfg_src = cfg_path if os.path.exists(cfg_path) else "(embedded/default)"
         log.info(
             "Starting monitoring service v%s | miner_key=%s | ProgramData=%s | config=%s | api_base=%s | interval=%s | lease_seconds=%s",
-            VERSION,
+            SOFTWARE_VERSION,
             miner_key,
             data_dir(),
             cfg_src,
@@ -1897,14 +1950,14 @@ def main():
                 
                 # Check if software version is outdated
                 is_software_outdated = False
-                if isinstance(software_required, str) and cmp_ver(VERSION, software_required) < 0:
-                    log.warning("Service version %s is below required %s; continuing (rewards may be paused)", VERSION, software_required)
+                if isinstance(software_required, str) and cmp_ver(SOFTWARE_VERSION, software_required) < 0:
+                    log.warning("Service version %s is below required %s; continuing (rewards may be paused)", SOFTWARE_VERSION, software_required)
                     is_software_outdated = True
                 
                 # Check if PoC version is outdated (using same VERSION since hardware PoC service version = PoC version)
                 is_poc_outdated = False
-                if isinstance(poc_required, str) and cmp_ver(VERSION, poc_required) < 0:
-                    log.warning("PoC version %s is below required %s; continuing (rewards may be paused)", VERSION, poc_required)
+                if isinstance(poc_required, str) and cmp_ver(POC_VERSION, poc_required) < 0:
+                    log.warning("PoC version %s is below required %s; continuing (rewards may be paused)", POC_VERSION, poc_required)
                     is_poc_outdated = True
                 
                 is_outdated = is_software_outdated or is_poc_outdated
@@ -1969,7 +2022,7 @@ def main():
                             if isinstance(software_required, str) and software_required:
                                 software_info["software_needed"] = software_required
                                 try:
-                                    software_info["software_uptodate"] = (cmp_ver(VERSION, software_required) >= 0)
+                                    software_info["software_uptodate"] = (cmp_ver(SOFTWARE_VERSION, software_required) >= 0)
                                 except Exception:
                                     software_info["software_uptodate"] = None
                             else:
@@ -2004,9 +2057,19 @@ def main():
             except Exception:
                 # If we cannot read requirement, proceed; next loop will try again
                 pass
+
+            try:
+                api_health_backoff.reset()
+            except Exception:
+                pass
         except Exception as e:
             log.error("Initial API connect failed: %s", e)
-            time.sleep(5)
+            try:
+                api_health_backoff.record_failure()
+                api_health_backoff.wait_for_health(api_base)
+            except Exception:
+                pass
+            time.sleep(1)
 
     first_wake = next_boundary(now_utc(), interval)
     time.sleep(max(1, int((first_wake - now_utc()).total_seconds())))
@@ -2063,22 +2126,22 @@ def main():
             outdated: bool = False
             
             try:
-                is_software_outdated = isinstance(software_required, str) and software_required and (cmp_ver(VERSION, software_required) < 0)
-                is_poc_outdated = isinstance(poc_required, str) and poc_required and (cmp_ver(VERSION, poc_required) < 0)
+                is_software_outdated = isinstance(software_required, str) and software_required and (cmp_ver(SOFTWARE_VERSION, software_required) < 0)
+                is_poc_outdated = isinstance(poc_required, str) and poc_required and (cmp_ver(POC_VERSION, poc_required) < 0)
                 outdated = bool(is_software_outdated or is_poc_outdated)
             except Exception:
                 outdated = False
             
-            # Warn the user once if this install is behind the required versions
-            try:
-                if outdated and not warned_version:
-                    if isinstance(software_required, str) and software_required and cmp_ver(VERSION, software_required) < 0:
-                        log.warning("Software version %s is below required %s; please update.", VERSION, software_required)
-                    if isinstance(poc_required, str) and poc_required and cmp_ver(VERSION, poc_required) < 0:
-                        log.warning("PoC version %s is below required %s; please update.", VERSION, poc_required)
-                    warned_version = True
-            except Exception:
-                pass
+                # Warn the user once if this install is behind the required versions
+                try:
+                    if outdated and not warned_version:
+                        if isinstance(software_required, str) and software_required and cmp_ver(SOFTWARE_VERSION, software_required) < 0:
+                            log.warning("Software version %s is below required %s; please update.", SOFTWARE_VERSION, software_required)
+                        if isinstance(poc_required, str) and poc_required and cmp_ver(POC_VERSION, poc_required) < 0:
+                            log.warning("PoC version %s is below required %s; please update.", POC_VERSION, poc_required)
+                        warned_version = True
+                except Exception:
+                    pass
             # Refresh miner_mac from disk (if GUI selection changed)
             try:
                 mm = read_selected_miner_mac()
@@ -2208,11 +2271,25 @@ def main():
             except Exception:
                 pass
 
+            try:
+                api_health_backoff.reset()
+            except Exception:
+                pass
+
         except ApiError as e:
             log.error("API error: %s", e)
             try:
+                api_health_backoff.record_failure()
+                api_health_backoff.wait_for_health(api_base)
+            except Exception:
+                pass
+            try:
                 client = connect_mongo(api_base, tlsCAFile, cfg)
                 coll = client["PoC"]["hardware"]
+                try:
+                    api_health_backoff.reset()
+                except Exception:
+                    pass
             except Exception as e2:
                 log.error("Reconnect failed: %s", e2)
         except Exception as e:
