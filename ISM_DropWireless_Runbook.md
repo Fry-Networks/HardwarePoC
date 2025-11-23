@@ -21,12 +21,16 @@ Partner-facing runbook for DropWireless. We provide the Linux-ready ISM PoC bund
    ```bash
    sha256sum -c FRY_PoC_ISM_v1.0.0.sha256
    ```
-2. Create a runtime directory (example: `/opt/frynetworks/ism-miner`).
-3. Copy in:
+2. Create a runtime directory with a config subfolder (example):
+   ```bash
+   sudo mkdir -p /opt/frynetworks/ism-miner/config
+   ```
+3. Copy into the runtime directory:
    - `FRY_PoC_ISM_v1.0.0`
    - `FRY_PoC_ISM_v1.0.0.sha256`
    - `create_miner_config.py`
    - `create_install_config.py`
+   *(If you prefer to avoid sudo entirely, you can place the runtime dir under your home, e.g., `~/Documents/ism-miner/config`, and adjust the paths below accordingly.)*
 4. Make the binary executable:
    ```bash
    chmod +x FRY_PoC_ISM_v1.0.0
@@ -64,6 +68,10 @@ python3 create_install_config.py create   --install-id "c8425ebe-4657-4dcd-86c0-
 ### 2.5 Permissions
 ```bash
 chmod 600 *.enc
+# Place configs where the binary reads them
+sudo mv miner_config.enc install_config.enc /opt/frynetworks/ism-miner/config/
+# Ensure the runtime user can read the files (adjust user as needed)
+sudo chown "$USER":"$USER" /opt/frynetworks/ism-miner/config/miner_config.enc /opt/frynetworks/ism-miner/config/install_config.enc
 ```
 
 ---
@@ -107,12 +115,41 @@ curl -i -X PATCH -H "Authorization: Bearer ${API_TOKEN}"   "${API_BASE}/installa
 ./FRY_PoC_ISM_v1.0.0
 ```
 
+- Configs must live at `config/miner_config.enc` and `config/install_config.enc` under the app directory (e.g., `/opt/frynetworks/ism-miner/config/`)  
+- Data/output on Linux lives in `/var/lib/frynetworks/miner-ISM`:
+  - Status files: `/var/lib/frynetworks/miner-ISM/status/status-YYYYMMDD.json`
+  - Measurements: `/var/lib/frynetworks/miner-ISM/measurements/`
+  - Ensure the miner’s service user can write there (`sudo mkdir -p /var/lib/frynetworks/miner-ISM/{status,measurements} && sudo chown "$USER":"$USER" /var/lib/frynetworks/miner-ISM -R`) — do this once, then everything else runs without sudo if your runtime dir is under your home
 - Exits immediately if configs are missing or lease not held  
 - Wrap in systemd/supervisor for persistence
 
 ---
 
-## 5. Support and Recovery
+## 5. Measurement Files (Satellite)
+
+- Location (Linux): `/var/lib/frynetworks/miner-ISM/measurements/measurements-Satellite-latest.json.enc`
+- Encryption: Fernet; key derived from miner_key using PBKDF2-HMAC-SHA256 (salt `b'measurements_key_v1'`, 100k iterations); no separate key file required.
+- Decrypted JSON shape:
+  ```json
+  {
+    "timestamp": "2025-11-23T12:00:05.123456Z",
+    "miner_key": "ISM-EXAMPLEKEY32CHARS1234567890ABCD",
+    "group": "Satellite",
+    "measurement": {
+      "sats": 8,
+      "fix": "GPS",
+      "lat": 37.7749,
+      "lon": -122.4194,
+      "alt": 45.2,
+      "hdop": 1.2
+    }
+  }
+  ```
+- Fields: `sats` (count), `fix` (NONE/GPS/DGPS/etc.), optional `lat`/`lon`/`alt`/`hdop`.
+
+---
+
+## 6. Support and Recovery
 
 - Lease resets: contact Fry Networks  
 - Regenerating configs: use same `INSTALL_ID`  
@@ -120,7 +157,7 @@ curl -i -X PATCH -H "Authorization: Bearer ${API_TOKEN}"   "${API_BASE}/installa
 
 ---
 
-## 6. Partner Self-Service Lease Flow (Optional)
+## 7. Partner Self-Service Lease Flow (Optional)
 
 If a partner self-manages their lease:
 
@@ -135,7 +172,7 @@ Same check → acquire → renew flow as Section 3.
 
 ---
 
-## 7. DropWireless Operational Summary
+## 8. DropWireless Operational Summary
 
 1. Verify checksum  
 2. Create runtime directory  
@@ -145,7 +182,7 @@ Same check → acquire → renew flow as Section 3.
 
 ---
 
-## 8. Internal Delivery Checklist
+## 9. Internal Delivery Checklist
 
 - [ ] Git state clean  
 - [ ] `config_profile.py` updated  
