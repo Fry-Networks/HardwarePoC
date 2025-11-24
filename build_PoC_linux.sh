@@ -2,6 +2,19 @@
 
 set -e
 
+VENV_DIR=${VENV_DIR:-".venv"}
+if [ ! -d "$VENV_DIR" ]; then
+  echo "Creating Python virtual environment at $VENV_DIR"
+  python3 -m venv "$VENV_DIR"
+fi
+if [ ! -f "$VENV_DIR/bin/activate" ]; then
+  echo "Virtual environment activation script not found at $VENV_DIR/bin/activate"
+  exit 1
+fi
+# shellcheck disable=SC1090
+source "$VENV_DIR/bin/activate"
+PYTHON_BIN="${VENV_DIR}/bin/python3"
+
 # Parameters
 CODE=${1^^}  # to upper
 VERSION=$2
@@ -31,7 +44,7 @@ PRODUCT_NAME=${PRODUCT_NAME:-""}
 FILE_DESCRIPTION=${FILE_DESCRIPTION:-""}
 
 # Install Python packages
-python3 -m pip install --upgrade pip
+"$PYTHON_BIN" -m pip install --upgrade pip
 
 packages=('pyinstaller' 'psutil' 'requests' 'cryptography' 'sounddevice' 'pyserial' 'numpy' 'matplotlib' 'h3' 'pillow' 'shapely' 'geoip2')
 if [ "$BUILD_GUI" = true ]; then
@@ -39,7 +52,7 @@ if [ "$BUILD_GUI" = true ]; then
 fi
 
 echo "Installing Python packages: ${packages[*]}"
-python3 -m pip install "${packages[@]}"
+"$PYTHON_BIN" -m pip install "${packages[@]}"
 
 # Metadata maps
 declare -A GROUP_MAP=(
@@ -240,7 +253,7 @@ fi
 
 # Create config
 tmp_cfg="_tmp_config.json"
-python3 - <<EOF > "$tmp_cfg"
+"$PYTHON_BIN" - <<EOF > "$tmp_cfg"
 import json
 use_github = "${USE_GITHUB,,}" == "true"
 software_uptodate = "${SOFTWARE_UPTODATE,,}" == "true"
@@ -282,17 +295,17 @@ if [ ! -f "$make_encrypted" ]; then
   exit 1
 fi
 enc_tmp="enc_tmp.json"
-python3 "$make_encrypted" --in "$tmp_cfg" --json > "$enc_tmp"
+"$PYTHON_BIN" "$make_encrypted" --in "$tmp_cfg" --json > "$enc_tmp"
 if [ $? -ne 0 ]; then
   echo "Error: Failed to run make_encrypted_config.py"
   exit 1
 fi
 
 # Parse encrypted values
-dlt=$(python3 -c "import json; print(json.load(open('$enc_tmp'))['dlt'])")
-dlp=$(python3 -c "import json; print(json.load(open('$enc_tmp'))['dlp'])")
-knt=$(python3 -c "import json; print(json.load(open('$enc_tmp'))['knt'])")
-knp=$(python3 -c "import json; print(json.load(open('$enc_tmp'))['knp'])")
+dlt=$("$PYTHON_BIN" -c "import json; print(json.load(open('$enc_tmp'))['dlt'])")
+dlp=$("$PYTHON_BIN" -c "import json; print(json.load(open('$enc_tmp'))['dlp'])")
+knt=$("$PYTHON_BIN" -c "import json; print(json.load(open('$enc_tmp'))['knt'])")
+knp=$("$PYTHON_BIN" -c "import json; print(json.load(open('$enc_tmp'))['knp'])")
 
 # Patch miner_online_simple.py
 src_path="miner_online_simple.py"
@@ -306,7 +319,7 @@ if [ -z "$line_num" ]; then
   echo "Error: Placeholder line not found in miner_online_simple.py"
   exit 1
 fi
-python3 -c "
+"$PYTHON_BIN" -c "
 import sys
 line_num = int(sys.argv[1])
 dlt = sys.argv[2]
@@ -365,7 +378,7 @@ if [ -n "$TLS_CA_FILE" ]; then
 fi
 
 # Build
-python3 -m PyInstaller "${svc_args[@]}" miner_online_simple.py
+"$PYTHON_BIN" -m PyInstaller "${svc_args[@]}" miner_online_simple.py
 svc_built="$svc_dist_dir/$svc_name"
 
 # Signing (placeholder for Linux)

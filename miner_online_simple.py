@@ -80,6 +80,19 @@ log = logging.getLogger("miner-online")
 DEFAULT_H3_RES = 4
 MAX_POC_DAYS = 14
 
+# Expected measurement groups per miner type (drives Proof of Data checks).
+MEASUREMENT_EXPECTATIONS: dict[str, List[str]] = {
+    "BM": ["Bandwidth"],
+    "IRM": ["Radiation"],
+    "ISM": ["Satellite"],
+    "OSM": ["Satellite"],
+    "IDM": ["Decibel"],
+    "ODM": ["Decibel"],
+}
+SDK_NAMES: Tuple[str, ...] = ("bright", "honeygain")
+_TRUE_SET = {"1", "true", "yes", "y", "on", "approved", "allow", "allowed", "enabled"}
+_FALSE_SET = {"0", "false", "no", "n", "off", "deny", "denied", "blocked"}
+
 class ApiHealthBackoff:
     """Simple backoff controller that pauses API traffic while the health endpoint fails."""
 
@@ -263,6 +276,31 @@ def _extract_poc_map(doc: dict[str, Any]) -> dict[str, float]:
                 continue
     return result
 
+def _extract_pod_map(doc: dict[str, Any]) -> dict[str, float]:
+    result: dict[str, float] = {}
+    if not isinstance(doc, dict):
+        return result
+    pod_obj = doc.get("PoD")
+    if isinstance(pod_obj, dict):
+        for key, value in pod_obj.items():
+            date_key = key
+            percent_val = value
+            if isinstance(value, dict):
+                if isinstance(value.get("date"), str) and value.get("date"):
+                    date_key = value["date"]
+                percent_val = value.get("Percent")
+                if percent_val is None:
+                    percent_val = value.get("PoDPercent")
+            try:
+                if isinstance(date_key, str) and date_key:
+                    if isinstance(percent_val, (int, float)):
+                        result[date_key] = float(percent_val)
+                    elif isinstance(percent_val, str):
+                        result[date_key] = float(percent_val)
+            except (TypeError, ValueError):
+                continue
+    return result
+
 
 def _extract_pol_map(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
@@ -291,6 +329,7 @@ def _compose_hardware_doc(
     mac: dict[str, Any],
     software: dict[str, Any],
     poc: dict[str, float],
+    pod: dict[str, float],
     pol: dict[str, dict[str, Any]],
     last_updated: dt.datetime,
     poi: Optional[bool] = None,
@@ -352,6 +391,7 @@ def _compose_hardware_doc(
     _maybe_set_bool("is_outdated", doc["software"].get("is_outdated"))
 
     doc["PoC"] = {str(k): float(v) for k, v in poc.items()}
+    doc["PoD"] = {str(k): float(v) for k, v in pod.items()}
     pol_compact: dict[str, dict[str, Any]] = {}
     for key in sorted(pol.keys()):
         value = pol[key] or {}
@@ -468,6 +508,25 @@ def read_miner_key() -> str:
     
     raise RuntimeError("Miner key not found in config/miner_config.enc file")
 
+def expected_measurement_groups() -> List[str]:
+    """Return normalized list of measurement groups required for PoD for this miner."""
+    groups = MEASUREMENT_EXPECTATIONS.get(MINER_CODE, [])
+    cleaned: List[str] = []
+    for g in groups:
+        if isinstance(g, str):
+            val = g.strip()
+            if val:
+                cleaned.append(val)
+    return cleaned
+
+def _normalize_measurement_group(name: Optional[str]) -> str:
+    try:
+        if not isinstance(name, str):
+            return ""
+        return name.strip().lower()
+    except Exception:
+        return ""
+
 def derive_measurement_key(miner_key: str) -> bytes:
     """Derive Fernet key from miner_key for measurement encryption.
     
@@ -540,6 +599,60 @@ def read_measurement_files() -> List[Dict[str, Any]]:
         pass
     
     return measurements
+
+def upload_measurements_for_slot(
+    client: MongoProxyClient,
+    miner_key: str,
+    install_id: str,
+    *,
+    expected_groups: Optional[List[str]] = None,
+) -> Tuple[bool, List[str]]:
+    """Upload local measurement files and return (pod_met, delivered_groups)."""
+    delivered_groups: List[str] = []
+    expected_set = {_normalize_measurement_group(g) for g in (expected_groups or []) if g}
+    pod_required = bool(expected_set)
+    if MINER_CODE == "AEM":
+        # AEM uses PoI; PoD not enforced.
+        return True, delivered_groups
+    try:
+        hex_registered = registered_hexid_from_devices(client, miner_key)
+    except Exception:
+        hex_registered = None
+    if not hex_registered:
+        log.debug("Skipping measurement upload; no registered hexId for %s", miner_key)
+        return (False if pod_required else True), delivered_groups
+    try:
+        measurement_data_list = read_measurement_files()
+    except Exception:
+        measurement_data_list = []
+    if not measurement_data_list:
+        return (False if pod_required else True), delivered_groups
+    for measurement_data in measurement_data_list:
+        try:
+            timestamp = measurement_data.get("timestamp")
+            measurement_type_raw = measurement_data.get("group") or measurement_data.get("measurement_type")
+            value = measurement_data.get("measurement", {})
+            measurement_type = measurement_type_raw.strip() if isinstance(measurement_type_raw, str) else None
+            if timestamp and measurement_type and isinstance(value, dict) and value:
+                client._api.upload_measurement(
+                    hex_id=hex_registered,
+                    miner_code=MINER_CODE,
+                    install_id=install_id,
+                    timestamp=str(timestamp),
+                    measurement_type=measurement_type,
+                    value=value,
+                )
+                normalized = _normalize_measurement_group(measurement_type)
+                if normalized and normalized in expected_set and normalized not in delivered_groups:
+                    delivered_groups.append(normalized)
+            else:
+                log.debug("Skipping measurement upload; missing required fields: %s", measurement_data)
+        except Exception as e:
+            log.error("Failed to upload measurement: %s", e)
+    if not pod_required:
+        return True, delivered_groups
+    delivered_set = set(delivered_groups)
+    return (delivered_set.issuperset(expected_set), delivered_groups)
 
 def owen_decrypt(key: bytes, ciphertext: bytes) -> bytes:
     nonce, ct = ciphertext[:16], ciphertext[16:]
@@ -1013,6 +1126,7 @@ def write_status(
 
     existing_doc = _get_existing_hardware_doc(coll, miner_key)
     existing_poc = _extract_poc_map(existing_doc)
+    existing_pod = _extract_pod_map(existing_doc)
     existing_pol = _extract_pol_map(existing_doc)
     mac_info = _extract_mac_fields(existing_doc)
     software_info = _extract_software_fields(existing_doc)
@@ -1043,7 +1157,26 @@ def write_status(
     else:
         day_percent = 0.0
 
-    existing_poc[day] = float(day_percent)
+    poc_percent = float(day_percent)
+
+    pod_count = local_doc.get("podCountDay") if isinstance(local_doc, dict) else None
+    pod_total = local_doc.get("podTotalSlotsDay") if isinstance(local_doc, dict) else None
+    pod_percent_local = local_doc.get("podPercentDay") if isinstance(local_doc, dict) else None
+    if isinstance(pod_percent_local, (int, float)):
+        pod_percent = round(float(pod_percent_local), 1)
+    elif isinstance(pod_count, int) and isinstance(pod_total, int) and pod_total > 0:
+        pod_percent = round(100.0 * max(0, min(pod_count, pod_total)) / max(1, pod_total), 1)
+    elif isinstance(pod_count, int) and slots_elapsed > 0:
+        pod_percent = round(100.0 * max(0, min(pod_count, slots_elapsed)) / max(1, slots_elapsed), 1)
+    else:
+        pod_percent = 0.0
+    existing_pod[day] = float(pod_percent)
+    pod_keys = sorted(existing_pod.keys())[-MAX_POC_DAYS:]
+    pod_compact = {key: float(existing_pod[key]) for key in pod_keys}
+    pod_ratio = max(0.0, min(100.0, existing_pod.get(day, 0.0))) / 100.0
+    merged_poc = round(poc_percent * pod_ratio, 1) if pod_ratio > 0 else 0.0
+    merged_poc = float(apply_bm_sdk_cap(merged_poc))
+    existing_poc[day] = merged_poc
     poc_keys = sorted(existing_poc.keys())[-MAX_POC_DAYS:]
     poc_compact = {key: float(existing_poc[key]) for key in poc_keys}
 
@@ -1117,6 +1250,7 @@ def write_status(
         mac=mac_info,
         software=software_info,
         poc=poc_compact,
+        pod=pod_compact,
         pol=existing_pol,
         last_updated=now_utc(),
         poi=poi_data if (miner_type_val == "AEM") else None,
@@ -1143,6 +1277,149 @@ def data_dir() -> str:
 def read_selected_miner_mac() -> str:
     p = os.path.join(data_dir(), "miner_mac.txt")
     return read_text_optional(p)
+
+
+def _parse_bool_flag(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        val = value.strip().lower()
+        if not val:
+            return None
+        if val in _TRUE_SET:
+            return True
+        if val in _FALSE_SET:
+            return False
+    return None
+
+
+def read_encrypted_sdk_config() -> Dict[str, Any]:
+    """Read SDK approval config from encrypted file (installer-managed)."""
+    try:
+        config_path = os.path.join(app_dir(), "config", "sdk_config.enc")
+        if not os.path.exists(config_path):
+            return {}
+        with open(config_path, "r", encoding="utf-8") as f:
+            encrypted_data = json.load(f)
+        from cryptography.fernet import Fernet
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        import base64
+
+        salt = b'sdk_config_salt_v1'
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+        )
+        password = "sdk_config_encryption_key_v1".encode()
+        key = base64.urlsafe_b64encode(kdf.derive(password))
+        f = Fernet(key)
+        decrypted = f.decrypt(encrypted_data['data'].encode())
+        payload = json.loads(decrypted)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        pass
+    return {}
+
+
+def read_sdk_approval_state() -> Dict[str, bool]:
+    """Read SDK approval flags from encrypted config only."""
+    state: Dict[str, bool] = {}
+
+    def _ingest_payload(payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        entries = payload
+        # Allow {"approvals": {...}} structure
+        if "approvals" in payload and isinstance(payload["approvals"], dict):
+            entries = payload["approvals"]
+        for key, value in entries.items():
+            name = str(key).strip().lower()
+            if not name:
+                continue
+            maybe = _parse_bool_flag(value)
+            if maybe is None and isinstance(value, dict):
+                for inner_key in ("approved", "allow", "allowed", "value", "enabled", "status"):
+                    if inner_key in value:
+                        maybe = _parse_bool_flag(value[inner_key])
+                        if maybe is not None:
+                            break
+            if maybe is not None:
+                state[name] = maybe
+
+    try:
+        encrypted_payload = read_encrypted_sdk_config()
+        _ingest_payload(encrypted_payload)
+    except Exception:
+        pass
+    return state
+
+
+def sdk_approved(name: str) -> bool:
+    """Return True if the given SDK (Bright, Honeygain, etc.) is approved by the user."""
+    if not isinstance(name, str) or not name:
+        return False
+    key = name.strip().lower()
+    env_keys = [
+        f"FRY_SDK_{key.upper()}_APPROVED",
+        f"{key.upper()}_SDK_APPROVED",
+    ]
+    for env_key in env_keys:
+        try:
+            env_val = os.getenv(env_key)
+        except Exception:
+            env_val = None
+        parsed = _parse_bool_flag(env_val)
+        if parsed is not None:
+            return parsed
+    state = read_sdk_approval_state()
+    return bool(state.get(key, False))
+
+
+def apply_bm_sdk_cap(percent: float) -> float:
+    """Cap BM PoC depending on SDK approvals (Bright, Olostep)."""
+    if MINER_CODE != "BM":
+        return percent
+    try:
+        bright_ok = sdk_approved("bright")
+    except Exception:
+        bright_ok = False
+    try:
+        honeygain_ok = sdk_approved("honeygain")
+    except Exception:
+        honeygain_ok = False
+    is_windows = sys.platform.startswith("win")
+    cap = 100.0
+    if is_windows:
+        approved_count = int(bool(bright_ok)) + int(bool(honeygain_ok))
+        if approved_count <= 0:
+            cap = 50.0
+        elif approved_count == 1:
+            cap = 75.0
+        else:
+            cap = 100.0
+    else:
+        cap = 75.0
+        if honeygain_ok:
+            cap = 100.0
+    if percent > cap:
+        try:
+            log.debug(
+                "BM PoC capped at %.1f%% (requested %.1f%%, bright=%s, honeygain=%s)",
+                cap,
+                percent,
+                bright_ok,
+                honeygain_ok,
+            )
+        except Exception:
+            pass
+        return cap
+    return percent
 
 
 def detect_local_mac() -> str:
@@ -1312,11 +1589,28 @@ def _lc_write_slot(doc: dict, ts: dt.datetime, status: str, interval_seconds: in
     h["totalSlots"] = slots_per_hour
     doc["hours"][str(hour)] = h
 
+def _lc_write_pod_slot(doc: dict, ts: dt.datetime, delivered: bool, interval_seconds: int):
+    hour, slot = hour_and_slot(ts, interval_seconds)
+    slots_per_hour = max(1, 3600 // max(1, interval_seconds))
+    pod_hours = doc.setdefault("podHours", {})
+    entry = pod_hours.get(str(hour))
+    if not isinstance(entry, dict) or not isinstance(entry.get("slots"), list) or len(entry["slots"]) < slots_per_hour:
+        entry = {"slots": [False] * slots_per_hour, "deliveredCount": 0, "totalSlots": slots_per_hour}
+    slots = entry.get("slots", [])
+    if len(slots) < slots_per_hour:
+        slots = (slots + [False] * slots_per_hour)[:slots_per_hour]
+    slots[slot] = bool(delivered)
+    entry["slots"] = [bool(s) for s in slots]
+    entry["deliveredCount"] = sum(1 for s in entry["slots"] if s)
+    entry["totalSlots"] = slots_per_hour
+    pod_hours[str(hour)] = entry
+
 def write_status_local(
     miner_key: str,
     ts: dt.datetime,
     status: str,
     interval_seconds: int,
+    pod_status: Optional[bool] = None,
     mac_registered: Optional[str] = None,
     mac_mismatch: Optional[bool] = None,
     poi_data: Optional[bool] = None,
@@ -1334,6 +1628,7 @@ def write_status_local(
             "agentVersion": SOFTWARE_VERSION,
             "date": day_iso,
             "hours": {},
+            "podHours": {},
             "lastSlotWritten": None
         }
 
@@ -1362,6 +1657,7 @@ def write_status_local(
                 "agentVersion": VERSION,
                 "date": last_day_iso,
                 "hours": {},
+                "podHours": {},
                 "lastSlotWritten": None
             }
             t = floor_slot(last_ts) + dt.timedelta(seconds=max(1, interval_seconds))
@@ -1370,6 +1666,7 @@ def write_status_local(
             end = start_of_day + dt.timedelta(days=1) - dt.timedelta(seconds=max(1, interval_seconds))
             while t <= end:
                 _lc_write_slot(last_doc, t, "offline", interval_seconds)
+                _lc_write_pod_slot(last_doc, t, False, interval_seconds)
                 t += dt.timedelta(seconds=max(1, interval_seconds))
             last_doc["lastUpdated"] = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
             last_doc["lastSlotWritten"] = end.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1387,15 +1684,20 @@ def write_status_local(
         t = floor_slot(last_ts) + dt.timedelta(seconds=max(1, interval_seconds))
         while t < cur_slot and t.date() == ts.date():
             _lc_write_slot(doc, t, "offline", interval_seconds)
+            _lc_write_pod_slot(doc, t, False, interval_seconds)
             t += dt.timedelta(seconds=max(1, interval_seconds))
 
     _lc_write_slot(doc, cur_slot, status, interval_seconds)
+    _lc_write_pod_slot(doc, cur_slot, bool(pod_status), interval_seconds)
     # Ensure all 24 hours exist and compute day totals
     slots_per_hour = max(1, 3600 // max(1, interval_seconds))
     OFFLINE_N = ["offline"] * slots_per_hour
+    POD_FALSE = [False] * slots_per_hour
     day_total_full = 24 * slots_per_hour
     day_online = 0
     hourly_online_counts: list[int] = []
+    pod_hours = doc.setdefault("podHours", {})
+    pod_hourly_counts: list[int] = []
     for h in range(24):
         key = str(h)
         hdoc = doc["hours"].get(key)
@@ -1411,6 +1713,19 @@ def write_status_local(
         doc["hours"][key] = hdoc
         day_online += online_count
         hourly_online_counts.append(online_count)
+        ph = pod_hours.get(key)
+        if not isinstance(ph, dict):
+            ph = {"slots": POD_FALSE.copy(), "deliveredCount": 0, "totalSlots": slots_per_hour}
+        pslots = ph.get("slots") or []
+        if len(pslots) < slots_per_hour:
+            pslots = (pslots + POD_FALSE)[:slots_per_hour]
+        pslots = [bool(v) for v in pslots]
+        delivered = sum(1 for v in pslots if v)
+        ph["slots"] = pslots
+        ph["deliveredCount"] = delivered
+        ph["totalSlots"] = slots_per_hour
+        pod_hours[key] = ph
+        pod_hourly_counts.append(delivered)
 
     hour, slot = hour_and_slot(ts, interval_seconds)
     slots_elapsed = max(1, min(day_total_full, hour * slots_per_hour + (slot + 1)))
@@ -1420,6 +1735,12 @@ def write_status_local(
     doc["onlineCountDay"] = day_online_so_far
     doc["totalSlotsDay"] = slots_elapsed
     doc["onlinePercentDay"] = round(100.0 * day_online_so_far / max(1, slots_elapsed), 1)
+    completed_pod = sum(pod_hourly_counts[:hour])
+    current_hour_pod = pod_hourly_counts[hour] if hour < len(pod_hourly_counts) else 0
+    pod_day_so_far = completed_pod + max(0, min(current_hour_pod, slot + 1))
+    doc["podCountDay"] = pod_day_so_far
+    doc["podTotalSlotsDay"] = slots_elapsed
+    doc["podPercentDay"] = round(100.0 * pod_day_so_far / max(1, slots_elapsed), 1)
 
     if isinstance(mac_registered, str) and mac_registered.strip():
         doc["mac_registered"] = mac_registered.strip()
@@ -1759,6 +2080,7 @@ def write_location_daily(coll, client: MongoProxyClient, miner_key: str, ts: dt.
     mac_info = _extract_mac_fields(existing_doc)
     software_info = _extract_software_fields(existing_doc)
     poc_map = _extract_poc_map(existing_doc)
+    pod_map = _extract_pod_map(existing_doc)
     pol_map = _extract_pol_map(existing_doc)
 
     pol_map[day] = pol_entry
@@ -1771,6 +2093,7 @@ def write_location_daily(coll, client: MongoProxyClient, miner_key: str, ts: dt.
         mac=mac_info,
         software=software_info,
         poc=poc_map,
+        pod=pod_map,
         pol=pol_compact,
         last_updated=checked_at,
     )
@@ -1992,6 +2315,7 @@ def main():
                         mac_info = _extract_mac_fields(existing_doc)
                         software_info = _extract_software_fields(existing_doc)
                         poc_map = _extract_poc_map(existing_doc)
+                        pod_map = _extract_pod_map(existing_doc)
                         pol_map = _extract_pol_map(existing_doc)
                         # update registered values if present
                         # prefer the local selected miner MAC when available so the UI can show a match immediately
@@ -2042,6 +2366,7 @@ def main():
                             mac=mac_info,
                             software=software_info,
                             poc=poc_map,
+                            pod=pod_map,
                             pol=pol_map,
                             last_updated=now_utc(),
                             poi=poi_data,
@@ -2087,6 +2412,32 @@ def main():
                 poi_snapshot = monitor_poi_for_aem()
             except Exception:
                 poi_snapshot = None
+        expected_groups = expected_measurement_groups()
+        pod_slot_ok = False if expected_groups else True
+        delivered_groups: List[str] = []
+        if MINER_CODE != "AEM" or expected_groups:
+            try:
+                pod_slot_ok, delivered_groups = upload_measurements_for_slot(
+                    client,
+                    miner_key,
+                    install_id,
+                    expected_groups=expected_groups,
+                )
+            except Exception as e:
+                log.error("Measurement upload error: %s", e)
+                pod_slot_ok = False if expected_groups else True
+        else:
+            pod_slot_ok = True
+        if expected_groups and not pod_slot_ok:
+            try:
+                log.debug(
+                    "PoD incomplete for %s: expected %s delivered %s",
+                    miner_key,
+                    expected_groups,
+                    delivered_groups,
+                )
+            except Exception:
+                pass
         status = status_raw
         if MINER_CODE == "AEM":
             poi_ok = bool(poi_snapshot)
@@ -2104,6 +2455,7 @@ def main():
                 slot_ts,
                 status,
                 interval,
+                pod_status=pod_slot_ok,
                 mac_registered=mac_registered,
                 mac_mismatch=local_mismatch,
                 poi_data=poi_snapshot,
@@ -2191,44 +2543,6 @@ def main():
                 )
             except Exception:
                 pass
-            
-            # Upload measurements to External API (if registered hexId exists); AEM uses PoI so skip uploads
-            if MINER_CODE != "AEM":
-                try:
-                    # Get registered hexId for this miner
-                    hex_registered = registered_hexid_from_devices(client, miner_key)
-                    
-                    if hex_registered:
-                        # Read and decrypt measurement files
-                        measurement_data_list = read_measurement_files()
-                        
-                        # Upload each measurement
-                        for measurement_data in measurement_data_list:
-                            try:
-                                timestamp = measurement_data.get("timestamp")
-                                measurement_type = measurement_data.get("group") or measurement_data.get("measurement_type")
-                                value = measurement_data.get("measurement", {})
-
-                                if isinstance(measurement_type, str):
-                                    measurement_type = measurement_type.strip()
-                                if timestamp and measurement_type and isinstance(value, dict) and value:
-                                    # Upload to External API indexed by hexId
-                                    client._api.upload_measurement(
-                                        hex_id=hex_registered,
-                                        miner_code=MINER_CODE,
-                                        install_id=install_id,
-                                        timestamp=str(timestamp),
-                                        measurement_type=measurement_type,
-                                        value=value,
-                                    )
-                                else:
-                                    log.debug("Skipping measurement upload; missing required fields: %s", measurement_data)
-                            except Exception as e:
-                                # Log but don't fail - continue with other measurements
-                                log.error("Failed to upload measurement: %s", e)
-                except Exception as e:
-                    # Don't fail the main loop if measurement upload fails
-                    log.error("Measurement upload error: %s", e)
             
             # Renew our lease; if renewal fails, try to reacquire (API may have been down)
             try:
