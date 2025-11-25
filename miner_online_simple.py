@@ -71,16 +71,27 @@ import config_profile as _cfg
 
 
 def _guess_gui_version_from_fs() -> str:
-    """Best-effort: infer GUI/agent version from a local EXE filename (FRY_<CODE>_vX.Y.Z*.exe)."""
+    """Best-effort: infer GUI/agent version from local binaries.
+    Windows: FRY_<CODE>_vX.Y.Z*.exe in app_dir or miner_GUI/.
+    Linux: FRY_<CODE>_vX.Y.Z in app_dir or a release/<CODE>/ sibling.
+    """
     try:
         base_path = pathlib.Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
-        pattern = re.compile(r"FRY_[A-Z]{2,3}_v(\d+\.\d+\.\d+).*\.exe$", re.IGNORECASE)
+        pattern_win = re.compile(r"FRY_[A-Z]{2,3}_v(\d+\.\d+\.\d+).*\.exe$", re.IGNORECASE)
+        pattern_lin = re.compile(r"FRY_[A-Z]{2,3}_v(\d+\.\d+\.\d+)$", re.IGNORECASE)
         candidates: list[str] = []
-        for search_root in {base_path, base_path / "miner_GUI"}:
+        search_roots = {base_path, base_path / "miner_GUI"}
+        # Also consider sibling release/<CODE> on Linux installs
+        release_dir = base_path / "release"
+        if release_dir.exists():
+            for sub in release_dir.iterdir():
+                if sub.is_dir():
+                    search_roots.add(sub)
+        for search_root in search_roots:
             if not search_root.exists():
                 continue
             for p in search_root.iterdir():
-                m = pattern.match(p.name)
+                m = pattern_win.match(p.name) or pattern_lin.match(p.name)
                 if m:
                     candidates.append(m.group(1))
         if not candidates:
