@@ -69,9 +69,36 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 
 import config_profile as _cfg
 
+
+def _guess_gui_version_from_fs() -> str:
+    """Best-effort: infer GUI/agent version from a local EXE filename (FRY_<CODE>_vX.Y.Z*.exe)."""
+    try:
+        base_path = pathlib.Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
+        pattern = re.compile(r"FRY_[A-Z]{2,3}_v(\d+\.\d+\.\d+).*\.exe$", re.IGNORECASE)
+        candidates: list[str] = []
+        for search_root in {base_path, base_path / "miner_GUI"}:
+            if not search_root.exists():
+                continue
+            for p in search_root.iterdir():
+                m = pattern.match(p.name)
+                if m:
+                    candidates.append(m.group(1))
+        if not candidates:
+            return ""
+        def _v_tuple(v: str) -> tuple[int, ...]:
+            try:
+                return tuple(int(x) for x in v.split("."))
+            except Exception:
+                return (0, 0, 0)
+        return max(candidates, key=_v_tuple)
+    except Exception:
+        return ""
+
+
 MINER_CODE = getattr(_cfg, "MINER_CODE", "")
 VERSION = getattr(_cfg, "VERSION", "")
-SOFTWARE_VERSION = getattr(_cfg, "SOFTWARE_VERSION", VERSION)
+GUI_VERSION = _guess_gui_version_from_fs()
+SOFTWARE_VERSION = GUI_VERSION or getattr(_cfg, "SOFTWARE_VERSION", VERSION)
 POC_VERSION = getattr(_cfg, "POC_VERSION", VERSION)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -190,19 +217,16 @@ def _extract_mac_fields(doc: dict[str, Any]) -> dict[str, Any]:
     return info
 
 def _extract_software_fields(doc: dict[str, Any]) -> dict[str, Any]:
+    host_os = "windows" if platform.system().lower().startswith("win") else "linux"
     info: dict[str, Any] = {
-        "software_version": SOFTWARE_VERSION,
-        "software_needed": None,
-        "software_uptodate": None,
         "software_version_installed": SOFTWARE_VERSION,
         "software_version_needed": None,
-        "software_outdated": None,
+        "software_uptodate": None,
+        "os": host_os,
         "poc_version_installed": POC_VERSION,
         "poc_version_needed": None,
         "poc_uptodate": None,
-        "poc_outdated": None,
         "is_uptodate": None,
-        "is_outdated": None,
     }
     if not isinstance(doc, dict):
         return info
@@ -210,15 +234,11 @@ def _extract_software_fields(doc: dict[str, Any]) -> dict[str, Any]:
     def _ingest(source: Optional[dict[str, Any]]) -> None:
         if not isinstance(source, dict):
             return
-        val = source.get("software_version")
-        if isinstance(val, str) and val:
-            info["software_version"] = val
         val = source.get("software_version_installed")
         if isinstance(val, str) and val:
             info["software_version_installed"] = val
-        val = source.get("software_needed") or source.get("software_version_needed")
+        val = source.get("software_version_needed")
         if isinstance(val, str) and val:
-            info["software_needed"] = val
             info["software_version_needed"] = val
         val = source.get("software_uptodate")
         if isinstance(val, bool):
@@ -228,6 +248,9 @@ def _extract_software_fields(doc: dict[str, Any]) -> dict[str, Any]:
             info["software_outdated"] = val
             if info["software_uptodate"] is None:
                 info["software_uptodate"] = not val
+        val = source.get("os")
+        if isinstance(val, str) and val:
+            info["os"] = val.lower()
         val = source.get("poc_version_installed")
         if isinstance(val, str) and val:
             info["poc_version_installed"] = val
@@ -356,39 +379,17 @@ def _compose_hardware_doc(
         "mac_registered": _format_mac_display(mac.get("mac_registered") or ""),
         "mac_match": bool(mac.get("mac_match")),
     }
+    host_os = "windows" if platform.system().lower().startswith("win") else "linux"
     doc["software"] = {
-        "software_version": software.get("software_version") or VERSION,
-        "software_version_installed": software.get("software_version_installed") or software.get("software_version") or VERSION,
-        "software_needed": software.get("software_needed") if isinstance(software.get("software_needed"), str) and software.get("software_needed") else None,
-        "software_version_needed": software.get("software_version_needed") if isinstance(software.get("software_version_needed"), str) and software.get("software_version_needed") else software.get("software_needed"),
+        "os": software.get("os") if isinstance(software.get("os"), str) and software.get("os") else host_os,
+        "software_version_installed": software.get("software_version_installed") if isinstance(software.get("software_version_installed"), str) and software.get("software_version_installed") else SOFTWARE_VERSION,
+        "software_version_needed": software.get("software_version_needed") if isinstance(software.get("software_version_needed"), str) and software.get("software_version_needed") else None,
         "software_uptodate": software.get("software_uptodate") if isinstance(software.get("software_uptodate"), bool) else None,
-        "software_outdated": software.get("software_outdated") if isinstance(software.get("software_outdated"), bool) else None,
-        "poc_version_installed": software.get("poc_version_installed") or software.get("software_version_installed") or VERSION,
+        "poc_version_installed": software.get("poc_version_installed") or POC_VERSION,
         "poc_version_needed": software.get("poc_version_needed") if isinstance(software.get("poc_version_needed"), str) and software.get("poc_version_needed") else None,
         "poc_uptodate": software.get("poc_uptodate") if isinstance(software.get("poc_uptodate"), bool) else None,
-        "poc_outdated": software.get("poc_outdated") if isinstance(software.get("poc_outdated"), bool) else None,
-        "is_uptodate": software.get("is_uptodate") if isinstance(software.get("is_uptodate"), bool) else None,
-        "is_outdated": software.get("is_outdated") if isinstance(software.get("is_outdated"), bool) else None,
+        "is_uptodate": software.get("is_uptodate") if isinstance(software.get("is_uptodate"), bool) else None
     }
-    def _maybe_set_str(key: str, value: Any) -> None:
-        if isinstance(value, str) and value:
-            doc[key] = value
-    def _maybe_set_bool(key: str, value: Any) -> None:
-        if isinstance(value, bool):
-            doc[key] = value
-
-    _maybe_set_str("software_version_installed", doc["software"].get("software_version_installed"))
-    _maybe_set_str("software_version_needed", doc["software"].get("software_version_needed"))
-    _maybe_set_bool("software_uptodate", doc["software"].get("software_uptodate"))
-    if doc["software"].get("software_outdated") is not None:
-        _maybe_set_bool("software_outdated", doc["software"].get("software_outdated"))
-    _maybe_set_str("poc_version_installed", doc["software"].get("poc_version_installed"))
-    _maybe_set_str("poc_version_needed", doc["software"].get("poc_version_needed"))
-    _maybe_set_bool("poc_uptodate", doc["software"].get("poc_uptodate"))
-    if doc["software"].get("poc_outdated") is not None:
-        _maybe_set_bool("poc_outdated", doc["software"].get("poc_outdated"))
-    _maybe_set_bool("is_uptodate", doc["software"].get("is_uptodate"))
-    _maybe_set_bool("is_outdated", doc["software"].get("is_outdated"))
 
     doc["PoC"] = {str(k): float(v) for k, v in poc.items()}
     doc["PoD"] = {str(k): float(v) for k, v in pod.items()}
@@ -1112,7 +1113,7 @@ def write_status(
     ts: dt.datetime,
     status: str,
     interval_seconds: int,
-    software_needed: Optional[str] = None,
+    software_version_needed: Optional[str] = None,
     poc_version_needed: Optional[str] = None,
     miner_mac: Optional[str] = None,
     mac_registered: Optional[str] = None,
@@ -1195,11 +1196,10 @@ def write_status(
     norm_registered = _norm_mac(mac_info.get("mac_registered"))
     mac_info["mac_match"] = bool(norm_miner and norm_registered and norm_miner == norm_registered)
 
-    needed_value = software_needed.strip() if isinstance(software_needed, str) and software_needed.strip() else software_info.get("software_needed")
+    needed_value = software_version_needed.strip() if isinstance(software_version_needed, str) and software_version_needed.strip() else software_info.get("software_version_needed")
     poc_needed_value = poc_version_needed.strip() if isinstance(poc_version_needed, str) and poc_version_needed.strip() else software_info.get("poc_version_needed")
     software_info["software_version"] = SOFTWARE_VERSION
     software_info["software_version_installed"] = SOFTWARE_VERSION
-    software_info["software_needed"] = needed_value
     software_info["software_version_needed"] = needed_value
     if isinstance(needed_value, str) and needed_value:
         try:
@@ -2344,7 +2344,7 @@ def main():
                         try:
                             software_required = required_versions.get("software_version")
                             if isinstance(software_required, str) and software_required:
-                                software_info["software_needed"] = software_required
+                                software_info["software_version_needed"] = software_required
                                 try:
                                     software_info["software_uptodate"] = (cmp_ver(SOFTWARE_VERSION, software_required) >= 0)
                                 except Exception:
@@ -2524,7 +2524,7 @@ def main():
             
             # Write to DB (day/hour aggregates)
             write_status(coll, miner_key, slot_ts, status, interval,
-                         software_needed=software_required,
+                         software_version_needed=software_required,
                          poc_version_needed=poc_required,
                          miner_mac=miner_mac_local,
                          mac_registered=mac_registered,
