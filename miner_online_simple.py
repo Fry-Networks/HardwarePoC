@@ -1185,10 +1185,8 @@ def write_status(
     existing_pod[day] = float(pod_percent)
     pod_keys = sorted(existing_pod.keys())[-MAX_POC_DAYS:]
     pod_compact = {key: float(existing_pod[key]) for key in pod_keys}
-    pod_ratio = max(0.0, min(100.0, existing_pod.get(day, 0.0))) / 100.0
-    merged_poc = round(poc_percent * pod_ratio, 1) if pod_ratio > 0 else 0.0
-    merged_poc = float(apply_bm_sdk_cap(merged_poc))
-    existing_poc[day] = merged_poc
+    poc_value = round(float(apply_bm_sdk_cap(poc_percent)), 1)
+    existing_poc[day] = poc_value
     poc_keys = sorted(existing_poc.keys())[-MAX_POC_DAYS:]
     poc_compact = {key: float(existing_poc[key]) for key in poc_keys}
 
