@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import platform
 from typing import Any, Dict, List, Optional
 
 from external_api import ExternalApiClient, ApiError
@@ -112,7 +113,11 @@ class MongoProxyCollection:
             if not isinstance(miner_code, str):
                 return None
             try:
-                versions = self._api.get_required_version(miner_code)
+                host_platform = "windows" if platform.system().lower().startswith("win") else "linux"
+            except Exception:
+                host_platform = None
+            try:
+                versions = self._api.get_required_version(miner_code, platform=host_platform)
             except ApiError:
                 return None
             if versions:

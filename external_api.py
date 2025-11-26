@@ -78,12 +78,15 @@ class ExternalApiClient:
         except ValueError as exc:
             raise ApiError(f"{method} {url} returned invalid JSON: {exc}") from exc
 
-    def get_required_version(self, miner_code: str) -> Dict[str, str]:
-        """GET {base}/versions/{miner_code} -> {"software_version": "6.0.3", "poc_version": "1.0.0"}
+    def get_required_version(self, miner_code: str, *, platform: Optional[str] = None) -> Dict[str, str]:
+        """GET {base}/versions/{miner_code}?platform=<windows|linux>
 
         Returns dict with software_version and poc_version keys.
         """
-        data = self._request("GET", f"/versions/{miner_code}")
+        params: Dict[str, Any] = {}
+        if isinstance(platform, str) and platform.strip():
+            params["platform"] = platform.strip().lower()
+        data = self._request("GET", f"/versions/{miner_code}", params=params or None)
         result: Dict[str, str] = {}
         if isinstance(data, dict):
             software = data.get("software_version")
