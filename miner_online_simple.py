@@ -363,10 +363,11 @@ def _compose_hardware_doc(
     mac: dict[str, Any],
     software: dict[str, Any],
     poc: dict[str, float],
-    pod: dict[str, float],
+    pod: Optional[dict[str, float]],
     pol: dict[str, dict[str, Any]],
     last_updated: dt.datetime,
     poi: Optional[bool] = None,
+    poi_slots: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     doc: dict[str, Any] = {}
     doc["miner_key"] = miner_key
@@ -403,7 +404,8 @@ def _compose_hardware_doc(
     }
 
     doc["PoC"] = {str(k): float(v) for k, v in poc.items()}
-    doc["PoD"] = {str(k): float(v) for k, v in pod.items()}
+    if pod is not None:
+        doc["PoD"] = {str(k): float(v) for k, v in pod.items()}
     pol_compact: dict[str, dict[str, Any]] = {}
     for key in sorted(pol.keys()):
         value = pol[key] or {}
@@ -419,6 +421,8 @@ def _compose_hardware_doc(
     # Add PoI only for AEM miners when state is known
     if (doc.get("miner_type") == "AEM" or (miner_type == "AEM")) and poi is not None:
         doc["PoI"] = bool(poi)
+    if poi_slots is not None:
+        doc["PoI_slots"] = poi_slots
     return doc
 
 
@@ -1189,6 +1193,44 @@ def write_status(
     existing_poc[day] = poc_value
     poc_keys = sorted(existing_poc.keys())[-MAX_POC_DAYS:]
     poc_compact = {key: float(existing_poc[key]) for key in poc_keys}
+    # For AEM, PoD is redundant; drop it so UI shows PoC + PoI only.
+    if miner_type_val == "AEM":
+        pod_compact = None
+
+    # PoI slots (AEM only): include percentDay plus per-hour slots
+    poi_slots: Optional[dict[str, Any]] = None
+    if miner_type_val == "AEM":
+        poi_count = local_doc.get("poiCountDay") if isinstance(local_doc, dict) else None
+        poi_total = local_doc.get("poiTotalSlotsDay") if isinstance(local_doc, dict) else None
+        poi_percent_local = local_doc.get("poiPercentDay") if isinstance(local_doc, dict) else None
+        if isinstance(poi_percent_local, (int, float)):
+            poi_percent = round(float(poi_percent_local), 1)
+        elif isinstance(poi_count, int) and isinstance(poi_total, int) and poi_total > 0:
+            poi_percent = round(100.0 * max(0, min(poi_count, poi_total)) / max(1, poi_total), 1)
+        elif isinstance(poi_count, int) and slots_elapsed > 0:
+            poi_percent = round(100.0 * max(0, min(poi_count, slots_elapsed)) / max(1, slots_elapsed), 1)
+        else:
+            poi_percent = None
+
+        slots_per_hour = max(1, 3600 // max(1, interval_seconds))
+        poi_hours_clean: dict[str, list[bool]] = {}
+        poi_hours_raw = local_doc.get("poiHours") if isinstance(local_doc, dict) else None
+        if isinstance(poi_hours_raw, dict):
+            for h in range(24):
+                key = str(h)
+                entry = poi_hours_raw.get(key)
+                if not isinstance(entry, dict):
+                    continue
+                slots_val = entry.get("slots") or []
+                if not isinstance(slots_val, list):
+                    continue
+                slots_clean = [bool(v) for v in (slots_val + [False] * slots_per_hour)[:slots_per_hour]]
+                poi_hours_clean[key] = slots_clean
+        if poi_percent is not None or poi_hours_clean:
+            poi_slots = {
+                "percentDay": float(poi_percent) if poi_percent is not None else None,
+                "hours": poi_hours_clean,
+            }
 
     if isinstance(miner_mac, str) and miner_mac:
         mac_info["miner_mac"] = miner_mac
@@ -1263,6 +1305,7 @@ def write_status(
         pol=existing_pol,
         last_updated=now_utc(),
         poi=poi_data if (miner_type_val == "AEM") else None,
+        poi_slots=poi_slots if (miner_type_val == "AEM") else None,
     )
 
     try:
@@ -1614,6 +1657,23 @@ def _lc_write_pod_slot(doc: dict, ts: dt.datetime, delivered: bool, interval_sec
     entry["totalSlots"] = slots_per_hour
     pod_hours[str(hour)] = entry
 
+def _lc_write_poi_slot(doc: dict, ts: dt.datetime, installed: bool, interval_seconds: int):
+    """Write a PoI slot (installed = True/False) for the given interval."""
+    hour, slot = hour_and_slot(ts, interval_seconds)
+    slots_per_hour = max(1, 3600 // max(1, interval_seconds))
+    poi_hours = doc.setdefault("poiHours", {})
+    entry = poi_hours.get(str(hour))
+    if not isinstance(entry, dict) or not isinstance(entry.get("slots"), list) or len(entry["slots"]) < slots_per_hour:
+        entry = {"slots": [False] * slots_per_hour, "installedCount": 0, "totalSlots": slots_per_hour}
+    slots = entry.get("slots", [])
+    if len(slots) < slots_per_hour:
+        slots = (slots + [False] * slots_per_hour)[:slots_per_hour]
+    slots[slot] = bool(installed)
+    entry["slots"] = [bool(s) for s in slots]
+    entry["installedCount"] = sum(1 for s in entry["slots"] if s)
+    entry["totalSlots"] = slots_per_hour
+    poi_hours[str(hour)] = entry
+
 def write_status_local(
     miner_key: str,
     ts: dt.datetime,
@@ -1638,6 +1698,7 @@ def write_status_local(
             "date": day_iso,
             "hours": {},
             "podHours": {},
+            "poiHours": {},
             "lastSlotWritten": None
         }
 
@@ -1667,6 +1728,7 @@ def write_status_local(
                 "date": last_day_iso,
                 "hours": {},
                 "podHours": {},
+                "poiHours": {},
                 "lastSlotWritten": None
             }
             t = floor_slot(last_ts) + dt.timedelta(seconds=max(1, interval_seconds))
@@ -1676,6 +1738,7 @@ def write_status_local(
             while t <= end:
                 _lc_write_slot(last_doc, t, "offline", interval_seconds)
                 _lc_write_pod_slot(last_doc, t, False, interval_seconds)
+                _lc_write_poi_slot(last_doc, t, False, interval_seconds)
                 t += dt.timedelta(seconds=max(1, interval_seconds))
             last_doc["lastUpdated"] = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
             last_doc["lastSlotWritten"] = end.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1694,19 +1757,24 @@ def write_status_local(
         while t < cur_slot and t.date() == ts.date():
             _lc_write_slot(doc, t, "offline", interval_seconds)
             _lc_write_pod_slot(doc, t, False, interval_seconds)
+            _lc_write_poi_slot(doc, t, False, interval_seconds)
             t += dt.timedelta(seconds=max(1, interval_seconds))
 
     _lc_write_slot(doc, cur_slot, status, interval_seconds)
     _lc_write_pod_slot(doc, cur_slot, bool(pod_status), interval_seconds)
+    _lc_write_poi_slot(doc, cur_slot, bool(poi_data), interval_seconds)
     # Ensure all 24 hours exist and compute day totals
     slots_per_hour = max(1, 3600 // max(1, interval_seconds))
     OFFLINE_N = ["offline"] * slots_per_hour
     POD_FALSE = [False] * slots_per_hour
+    POI_FALSE = [False] * slots_per_hour
     day_total_full = 24 * slots_per_hour
     day_online = 0
     hourly_online_counts: list[int] = []
     pod_hours = doc.setdefault("podHours", {})
+    poi_hours = doc.setdefault("poiHours", {})
     pod_hourly_counts: list[int] = []
+    poi_hourly_counts: list[int] = []
     for h in range(24):
         key = str(h)
         hdoc = doc["hours"].get(key)
@@ -1735,6 +1803,19 @@ def write_status_local(
         ph["totalSlots"] = slots_per_hour
         pod_hours[key] = ph
         pod_hourly_counts.append(delivered)
+        poi_entry = poi_hours.get(key)
+        if not isinstance(poi_entry, dict):
+            poi_entry = {"slots": POI_FALSE.copy(), "installedCount": 0, "totalSlots": slots_per_hour}
+        poislots = poi_entry.get("slots") or []
+        if len(poislots) < slots_per_hour:
+            poislots = (poislots + POI_FALSE)[:slots_per_hour]
+        poislots = [bool(v) for v in poislots]
+        installed = sum(1 for v in poislots if v)
+        poi_entry["slots"] = poislots
+        poi_entry["installedCount"] = installed
+        poi_entry["totalSlots"] = slots_per_hour
+        poi_hours[key] = poi_entry
+        poi_hourly_counts.append(installed)
 
     hour, slot = hour_and_slot(ts, interval_seconds)
     slots_elapsed = max(1, min(day_total_full, hour * slots_per_hour + (slot + 1)))
@@ -1750,6 +1831,12 @@ def write_status_local(
     doc["podCountDay"] = pod_day_so_far
     doc["podTotalSlotsDay"] = slots_elapsed
     doc["podPercentDay"] = round(100.0 * pod_day_so_far / max(1, slots_elapsed), 1)
+    completed_poi = sum(poi_hourly_counts[:hour])
+    current_hour_poi = poi_hourly_counts[hour] if hour < len(poi_hourly_counts) else 0
+    poi_day_so_far = completed_poi + max(0, min(current_hour_poi, slot + 1))
+    doc["poiCountDay"] = poi_day_so_far
+    doc["poiTotalSlotsDay"] = slots_elapsed
+    doc["poiPercentDay"] = round(100.0 * poi_day_so_far / max(1, slots_elapsed), 1)
 
     if isinstance(mac_registered, str) and mac_registered.strip():
         doc["mac_registered"] = mac_registered.strip()
@@ -2369,6 +2456,7 @@ def main():
                         poi_data = None
                         if miner_type_val == "AEM":
                             poi_data = monitor_poi_for_aem()
+                            pod_map = None
                         new_doc = _compose_hardware_doc(
                             miner_key,
                             miner_type=miner_type_val,
@@ -2379,6 +2467,7 @@ def main():
                             pol=pol_map,
                             last_updated=now_utc(),
                             poi=poi_data,
+                            poi_slots=None,
                         )
                         try:
                             coll.replace_one({"miner_key": miner_key}, new_doc, upsert=True)
@@ -2405,12 +2494,10 @@ def main():
                 pass
             time.sleep(1)
 
-    first_wake = next_boundary(now_utc(), interval)
-    time.sleep(max(1, int((first_wake - now_utc()).total_seconds())))
-
     warned_version = False
     last_location_day: Optional[str] = None
     last_version_check_hour: Optional[dt.datetime] = None
+    # Begin monitoring immediately so MAC registration/PoI reach the GUI without waiting for the first interval boundary.
     while True:
         slot_ts = now_utc()
         # Determine online status first
