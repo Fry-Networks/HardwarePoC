@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env python3
 from __future__ import annotations
 import datetime as dt
-import json, os, sys, time, tempfile, logging, re, hashlib, argparse, uuid, platform, pathlib
+import json, os, sys, time, tempfile, logging, re, hashlib, argparse, uuid, platform, pathlib, threading
 from poi_monitor_aem import monitor_poi_for_aem
 from typing import Dict, Any, Optional, Tuple, List, Callable, Iterable, cast
 
@@ -117,6 +117,32 @@ log = logging.getLogger("miner-online")
 
 DEFAULT_H3_RES = 4
 MAX_POC_DAYS = 14
+DEFAULT_POI_POLL_SECONDS = 15  # Fast PoI refresh for local cache/UI
+
+# Shared PoI state across main loop and PoI monitor thread
+_POI_STATE_LOCK = threading.Lock()
+_POI_STATE_READY = threading.Event()
+_POI_STATE: Dict[str, Any] = {
+    "status": "offline",
+    "pod_status": None,
+    "mac_registered": None,
+    "mac_mismatch": None,
+    "interval": 600,
+    "last_poi": None,
+}
+
+
+def _update_poi_state(**kwargs: Any) -> None:
+    with _POI_STATE_LOCK:
+        _POI_STATE.update(kwargs)
+    _POI_STATE_READY.set()
+
+
+def _get_poi_state_snapshot(wait: bool = False, timeout: Optional[float] = None) -> Dict[str, Any]:
+    if wait:
+        _POI_STATE_READY.wait(timeout=timeout)
+    with _POI_STATE_LOCK:
+        return dict(_POI_STATE)
 
 # Expected measurement groups per miner type (drives Proof of Data checks).
 MEASUREMENT_EXPECTATIONS: dict[str, List[str]] = {
@@ -1875,6 +1901,40 @@ def _update_rolling7_summary(miner_key: str, ts: dt.datetime) -> None:
         pass
 
 
+def _start_poi_local_loop(miner_key: str, interval_seconds: int, poll_seconds: int) -> None:
+    """Launch a background loop that refreshes PoI in the local cache more frequently."""
+    if poll_seconds <= 0:
+        return
+
+    def _loop() -> None:
+        _POI_STATE_READY.wait(timeout=5)
+        while True:
+            try:
+                installed = monitor_poi_for_aem()
+            except Exception:
+                installed = None
+            try:
+                snap = _get_poi_state_snapshot()
+                if snap.get("pod_status") is None:
+                    time.sleep(max(1, poll_seconds))
+                    continue
+                write_status_local(
+                    miner_key,
+                    now_utc(),
+                    snap.get("status", "offline"),
+                    int(snap.get("interval", interval_seconds)),
+                    pod_status=snap.get("pod_status"),
+                    mac_registered=snap.get("mac_registered"),
+                    mac_mismatch=snap.get("mac_mismatch"),
+                    poi_data=installed,
+                )
+                _update_poi_state(last_poi=installed)
+            except Exception:
+                pass
+            time.sleep(max(1, poll_seconds))
+
+    threading.Thread(target=_loop, name="poi-local-monitor", daemon=True).start()
+
 
 def _maxmind_db_path() -> pathlib.Path:
     env = os.getenv("MAXMIND_DB_PATH")
@@ -2312,6 +2372,8 @@ def main():
     tlsCAFile = cfg.get("tlsCAFile")
 
     interval = int(cfg.get("interval_seconds", 600))
+    poi_poll_seconds = int(cfg.get("poi_interval_seconds", DEFAULT_POI_POLL_SECONDS))
+    poi_poll_seconds = max(1, poi_poll_seconds)
 
     lease_seconds = int(cfg.get("lease_seconds", 900))
 
@@ -2319,13 +2381,14 @@ def main():
         cfg_path = os.path.join(app_dir(), "config.json")
         cfg_src = cfg_path if os.path.exists(cfg_path) else "(embedded/default)"
         log.info(
-            "Starting monitoring service v%s | miner_key=%s | ProgramData=%s | config=%s | api_base=%s | interval=%s | lease_seconds=%s",
+            "Starting monitoring service v%s | miner_key=%s | ProgramData=%s | config=%s | api_base=%s | interval=%s | poi_interval=%s | lease_seconds=%s",
             SOFTWARE_VERSION,
             miner_key,
             data_dir(),
             cfg_src,
             (api_base or "-"),
             interval,
+            poi_poll_seconds,
             lease_seconds,
         )
     except Exception:
@@ -2346,6 +2409,19 @@ def main():
     # miner_mac selected in GUI (persisted to shared data dir)
     miner_mac_local: Optional[str] = read_selected_miner_mac() or None
     mac_registered: Optional[str] = None
+    _update_poi_state(
+        interval=interval,
+        mac_registered=mac_registered,
+        mac_mismatch=None,
+        pod_status=None,
+        status="offline",
+        last_poi=None,
+    )
+    if MINER_CODE == "AEM":
+        try:
+            _start_poi_local_loop(miner_key, interval, poi_poll_seconds)
+        except Exception:
+            pass
     while client is None:
         try:
             client = connect_mongo(api_base, tlsCAFile, cfg)
@@ -2504,10 +2580,17 @@ def main():
         status_raw = "online" if is_internet_up(timeout=4) else "offline"
         poi_snapshot: Optional[bool] = None
         if MINER_CODE == "AEM":
+            snap = _get_poi_state_snapshot()
+            poi_snapshot = snap.get("last_poi")
+            if poi_snapshot is None:
+                try:
+                    poi_snapshot = monitor_poi_for_aem()
+                except Exception:
+                    poi_snapshot = None
             try:
-                poi_snapshot = monitor_poi_for_aem()
+                _update_poi_state(last_poi=poi_snapshot)
             except Exception:
-                poi_snapshot = None
+                pass
         expected_groups = expected_measurement_groups()
         pod_slot_ok = False if expected_groups else True
         delivered_groups: List[str] = []
@@ -2546,6 +2629,19 @@ def main():
             norm_active = re.sub(r'[^0-9a-f]', '', (miner_mac_local or '').lower())
             norm_registered = re.sub(r'[^0-9a-f]', '', (mac_registered or '').lower())
             local_mismatch = bool(norm_active and norm_registered and norm_active != norm_registered)
+            try:
+                update_kwargs = {
+                    "status": status,
+                    "pod_status": pod_slot_ok,
+                    "mac_registered": mac_registered,
+                    "mac_mismatch": local_mismatch,
+                    "interval": interval,
+                }
+                if MINER_CODE == "AEM":
+                    update_kwargs["last_poi"] = poi_snapshot
+                _update_poi_state(**update_kwargs)
+            except Exception:
+                pass
             write_status_local(
                 miner_key,
                 slot_ts,
