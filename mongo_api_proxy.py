@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import datetime as dt
 import platform
+import os
+import sys
+import json
 from typing import Any, Dict, List, Optional
 
 from external_api import ExternalApiClient, ApiError
@@ -55,6 +58,39 @@ class MongoProxyCollection:
         self._db = db_name
 
         self._coll = coll_name
+
+
+    def _version_platform_override(self, miner_code: Optional[str]) -> Optional[str]:
+        """Return explicit version platform override if configured."""
+        allowed = {"windows", "linux", "test-windows", "test-linux"}
+        # Env override
+        for key in ("FRY_VERSION_PLATFORM", "VERSION_PLATFORM"):
+            try:
+                val = os.getenv(key)
+            except Exception:
+                val = None
+            if isinstance(val, str) and val.strip().lower() in allowed:
+                return val.strip().lower()
+
+        # Installer config json (unencrypted), if present
+        if isinstance(miner_code, str) and miner_code:
+            try:
+                if sys.platform.startswith("win"):
+                    base = os.environ.get("PROGRAMDATA", r"C:\\ProgramData")
+                    cfg_path = os.path.join(base, "FryNetworks", f"miner-{miner_code}", "config", "installer_config.json")
+                else:
+                    cfg_path = os.path.join("/var/lib/frynetworks", f"miner-{miner_code}", "config", "installer_config.json")
+                if os.path.exists(cfg_path):
+                    with open(cfg_path, "r", encoding="utf-8") as fh:
+                        payload = json.load(fh)
+                    if isinstance(payload, dict):
+                        for key in ("version_platform", "VERSION_PLATFORM"):
+                            val = payload.get(key)
+                            if isinstance(val, str) and val.strip().lower() in allowed:
+                                return val.strip().lower()
+            except Exception:
+                pass
+        return None
 
 
 
@@ -112,10 +148,14 @@ class MongoProxyCollection:
             miner_code = filter.get("miner_code") if isinstance(filter, dict) else None
             if not isinstance(miner_code, str):
                 return None
-            try:
-                host_platform = "windows" if platform.system().lower().startswith("win") else "linux"
-            except Exception:
-                host_platform = None
+            platform_override = self._version_platform_override(miner_code)
+            if platform_override:
+                host_platform = platform_override
+            else:
+                try:
+                    host_platform = "windows" if platform.system().lower().startswith("win") else "linux"
+                except Exception:
+                    host_platform = None
             try:
                 versions = self._api.get_required_version(miner_code, platform=host_platform)
             except ApiError:

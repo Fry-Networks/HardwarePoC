@@ -1,7 +1,7 @@
 ﻿#!/usr/bin/env python3
 from __future__ import annotations
 import datetime as dt
-import json, os, sys, time, tempfile, logging, re, hashlib, argparse, uuid, platform, pathlib, threading
+import json, os, sys, time, tempfile, logging, re, hashlib, argparse, uuid, platform, pathlib, threading, subprocess
 from poi_monitor_aem import monitor_poi_for_aem
 from typing import Dict, Any, Optional, Tuple, List, Callable, Iterable, cast
 
@@ -114,6 +114,193 @@ POC_VERSION = getattr(_cfg, "POC_VERSION", VERSION)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("miner-online")
+_LOG_ONCE: dict[str, bool] = {}
+_CRIT_FAILURES: dict[str, int] = {}
+
+
+def _record_critical_failure(key: str, msg: str, *, threshold: int = 2, exit_code: int = 12, miner_key: Optional[str] = None) -> None:
+    """Count a critical failure; exit once threshold is reached to signal GUI restart."""
+    count = _CRIT_FAILURES.get(key, 0) + 1
+    _CRIT_FAILURES[key] = count
+    try:
+        if count >= threshold:
+            log.error("%s (hit %d/%d, exiting)", msg, count, threshold)
+            try:
+                _write_stop_reason(msg, miner_key=miner_key)
+            except Exception:
+                pass
+            sys.exit(exit_code)
+        else:
+            log.warning("%s (hit %d/%d)", msg, count, threshold)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+
+
+def _reset_critical_failure(key: str) -> None:
+    _CRIT_FAILURES.pop(key, None)
+
+
+def _write_stop_reason(reason: str, *, miner_key: Optional[str] = None) -> None:
+    """Persist last stop reason for GUI consumption."""
+    try:
+        payload = {
+            "reason": str(reason),
+            "miner_key": miner_key,
+            "timestamp": now_utc().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        path = os.path.join(data_dir(), "status", "last_stop.json")
+        atomic_write_json(path, payload)
+    except Exception:
+        pass
+
+
+def _log_once(key: str, level: int, msg: str, *args: Any) -> None:
+    """Log a message once per key to avoid spam."""
+    if key in _LOG_ONCE:
+        return
+    _LOG_ONCE[key] = True
+    try:
+        log.log(level, msg, *args)
+    except Exception:
+        pass
+
+
+def _init_service_file_logging() -> None:
+    """Attach a file handler under the ProgramData logs folder for service diagnostics."""
+    try:
+        log_dir = os.path.join(data_dir(), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        file_path = os.path.join(log_dir, "service.err.log")
+        fh = logging.FileHandler(file_path, encoding="utf-8")
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+        root = logging.getLogger()
+        root.addHandler(fh)
+    except Exception:
+        # Do not block startup if logging cannot initialize
+        pass
+
+def _detect_virtual_machine() -> Dict[str, Any]:
+    """Best-effort virtual machine detection across major platforms."""
+    info: Dict[str, Any] = {"vm": None, "evidence": [], "method": "heuristic"}
+    try:
+        sys_name = platform.system()
+        sys_lower = sys_name.lower()
+
+        vm_markers = [
+            "virtual", "vmware", "hyper-v", "xen", "qemu", "kvm",
+            "parallels", "virtualbox", "vbox", "bochs"
+        ]
+
+        # --- Windows ---
+        if sys_lower == "windows":
+            try:
+                wmi_cmd = ["powershell", "-NoLogo", "-WindowStyle", "Hidden", "-NoProfile", "-Command",
+                           "Get-CimInstance Win32_ComputerSystem | Select Manufacturer,Model"]
+                r = subprocess.run(wmi_cmd, capture_output=True, text=True, timeout=5)
+                out = (r.stdout + r.stderr).lower()
+                if any(m in out for m in vm_markers):
+                    info["vm"] = True
+                    info["evidence"].append(f"WMI Manufacturer/Model: {out.strip()[:120]}")
+                    info["method"] = "wmi"
+                    return info
+            except Exception:
+                pass
+            # BIOS vendor / product via wmic (fallback)
+            try:
+                r = subprocess.run(["wmic", "computersystem", "get", "manufacturer,model"],
+                                   capture_output=True, text=True, timeout=5)
+                out = (r.stdout + r.stderr).lower()
+                if any(m in out for m in vm_markers):
+                    info["vm"] = True
+                    info["evidence"].append(f"WMIC manufacturer/model: {out.strip()[:120]}")
+                    info["method"] = "wmic"
+                    return info
+            except Exception:
+                pass
+            # MAC OUI heuristic
+            try:
+                mac = uuid.getnode()
+                oui = f"{(mac >> 40) & 0xff:02x}:{(mac >> 32) & 0xff:02x}:{(mac >> 24) & 0xff:02x}"
+                vm_ouis = {"00:05:69", "00:0c:29", "00:1c:14", "00:50:56"}  # VMware ranges
+                if oui.lower() in vm_ouis:
+                    info["vm"] = True
+                    info["evidence"].append(f"VM OUI prefix detected: {oui}")
+                    info["method"] = "mac_oui"
+            except Exception:
+                pass
+            if info["vm"] is None:
+                info["vm"] = False  # Default to physical if no evidence
+            return info
+
+        # --- Linux ---
+        if sys_lower == "linux":
+            # systemd-detect-virt
+            try:
+                r = subprocess.run(["systemd-detect-virt"], capture_output=True, text=True, timeout=5)
+                if r.returncode == 0 and r.stdout.strip() and r.stdout.strip() != "none":
+                    info["vm"] = True
+                    info["evidence"].append(f"systemd-detect-virt: {r.stdout.strip()}")
+                    info["method"] = "systemd-detect-virt"
+                    return info
+            except Exception:
+                pass
+            # DMI product name / sys vendor
+            dmi_paths = [
+                "/sys/class/dmi/id/product_name",
+                "/sys/class/dmi/id/sys_vendor",
+                "/sys/class/dmi/id/bios_vendor"
+            ]
+            for p in dmi_paths:
+                try:
+                    if os.path.exists(p):
+                        content = pathlib.Path(p).read_text(encoding="utf-8", errors="ignore").lower()
+                        if any(m in content for m in vm_markers):
+                            info["vm"] = True
+                            info["evidence"].append(f"DMI {os.path.basename(p)}: {content.strip()[:80]}")
+                            info["method"] = "dmi"
+                            return info
+                except Exception:
+                    pass
+            # /proc/cpuinfo hypervisor flag
+            try:
+                cpuinfo = pathlib.Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="ignore").lower()
+                if "hypervisor" in cpuinfo:
+                    info["vm"] = True
+                    info["evidence"].append("CPU hypervisor flag present")
+                    info["method"] = "cpuinfo"
+                    return info
+            except Exception:
+                pass
+            if info["vm"] is None:
+                info["vm"] = False
+            return info
+
+        # --- macOS ---
+        if sys_lower == "darwin":
+            try:
+                r = subprocess.run(["sysctl", "-a"], capture_output=True, text=True, timeout=8)
+                out = r.stdout.lower()
+                if any(m in out for m in vm_markers):
+                    info["vm"] = True
+                    info["evidence"].append("sysctl hypervisor indicators present")
+                    info["method"] = "sysctl"
+                    return info
+            except Exception:
+                pass
+            # Apple Silicon / hardware model seldom virtualized publicly; default False if no evidence
+            info["vm"] = False if info["vm"] is None else info["vm"]
+            return info
+
+        # Other/unknown OS
+        info["vm"] = None
+        return info
+    except Exception as e:
+        info["vm"] = None
+        info["evidence"].append(f"vm-detect-error: {e}")
+        return info
 
 DEFAULT_H3_RES = 4
 MAX_POC_DAYS = 14
@@ -153,7 +340,7 @@ MEASUREMENT_EXPECTATIONS: dict[str, List[str]] = {
     "IDM": ["Decibel"],
     "ODM": ["Decibel"],
 }
-SDK_NAMES: Tuple[str, ...] = ("bright", "honeygain")
+SDK_NAMES: Tuple[str, ...] = ("bright", "honeygain", "mysterium")
 _TRUE_SET = {"1", "true", "yes", "y", "on", "approved", "allow", "allowed", "enabled"}
 _FALSE_SET = {"0", "false", "no", "n", "off", "deny", "denied", "blocked"}
 
@@ -660,8 +847,12 @@ def upload_measurements_for_slot(
         hex_registered = registered_hexid_from_devices(client, miner_key)
     except Exception:
         hex_registered = None
+    else:
+        if hex_registered:
+            _reset_critical_failure(f"pod-no-hex-{miner_key}")
+            _reset_critical_failure(f"pod-upload-error-{miner_key}")
     if not hex_registered:
-        log.debug("Skipping measurement upload; no registered hexId for %s", miner_key)
+        _record_critical_failure(f"pod-no-hex-{miner_key}", f"Skipping measurement upload; no registered hexId for {miner_key}", miner_key=miner_key)
         return (False if pod_required else True), delivered_groups
     try:
         measurement_data_list = read_measurement_files()
@@ -690,7 +881,9 @@ def upload_measurements_for_slot(
             else:
                 log.debug("Skipping measurement upload; missing required fields: %s", measurement_data)
         except Exception as e:
-            log.error("Failed to upload measurement: %s", e)
+            _record_critical_failure(f"pod-upload-error-{miner_key}", f"Failed to upload measurement for {miner_key}: {e}", miner_key=miner_key)
+        else:
+            _reset_critical_failure(f"pod-upload-error-{miner_key}")
     if not pod_required:
         return True, delivered_groups
     delivered_set = set(delivered_groups)
@@ -802,6 +995,196 @@ def hour_and_slot(ts: dt.datetime, interval_seconds: int) -> tuple[int, int]:
     """
     sec_in_hour = ts.minute * 60 + ts.second
     return ts.hour, sec_in_hour // max(1, interval_seconds)
+
+def _ensure_slot_entry(container: Dict[str, Any], hour_key: str, slots_per_hour: int, fill: Any) -> Dict[str, Any]:
+    """Ensure a slot entry exists for an hour, padded/truncated to slots_per_hour."""
+    entry = container.get(hour_key)
+    if not isinstance(entry, dict):
+        entry = {}
+    slots = entry.get("slots")
+    if not isinstance(slots, list):
+        slots = []
+    if len(slots) < slots_per_hour:
+        slots = (slots + [fill] * slots_per_hour)[:slots_per_hour]
+    else:
+        slots = slots[:slots_per_hour]
+    entry["slots"] = slots
+    container[hour_key] = entry
+    return entry
+
+def _prune_slot_hours(container: Dict[str, Any], keep_hours: int = 336) -> Dict[str, Any]:
+    """Return a new dict keeping only the most recent keep_hours keys (sorted). Default ~14 days @1h keys."""
+    if not isinstance(container, dict):
+        return {}
+    keys = sorted([k for k in container.keys() if isinstance(k, str)])
+    if len(keys) <= keep_hours:
+        return {k: container[k] for k in keys}
+    keep = keys[-keep_hours:]
+    return {k: container[k] for k in keep}
+
+def _compute_rewards_multiplier(
+    miner_type: str,
+    mac_match: bool,
+    poc_ok: bool,
+    pod_ok: bool,
+    poi_ok: Optional[bool],
+    bright_active: bool,
+    honeygain_active: bool,
+    mysterium_active: bool,
+) -> float:
+    """Compute per-slot rewards multiplier based on gating and active tools."""
+    if not (mac_match and poc_ok and pod_ok):
+        return 0.0
+    if miner_type == "AEM":
+        return 1.0 if poi_ok else 0.0
+    if miner_type == "BM":
+        tool_count = (
+            int(bool(bright_active))
+            + int(bool(honeygain_active))
+            + int(bool(mysterium_active))
+        )
+        base = 0.25
+        return min(1.0, base + 0.25 * tool_count)
+    # Non-BM/AEM: gate passed -> full multiplier
+    return 1.0
+
+def _compute_day_multiplier_avg(slots_by_hour: Dict[str, Any], day_prefix: str) -> Optional[float]:
+    """Average all numeric slot values for hours matching the given YYYYMMDD prefix."""
+    if not isinstance(slots_by_hour, dict):
+        return None
+    values: list[float] = []
+    for hk, entry in slots_by_hour.items():
+        if not isinstance(hk, str) or not hk.startswith(day_prefix):
+            continue
+        slots = entry.get("slots") if isinstance(entry, dict) else None
+        if not isinstance(slots, list):
+            continue
+        for v in slots:
+            if isinstance(v, (int, float)):
+                values.append(float(v))
+            else:
+                values.append(0.0)
+    if not values:
+        return None
+    return round(sum(values) / len(values), 3)
+
+def _rewards_multiplier_for_slot(
+    ts: dt.datetime,
+    interval_seconds: int,
+    miner_mac: Optional[str],
+    mac_registered: Optional[str],
+    poi_data: Optional[bool],
+) -> float:
+    """Best-effort rewards multiplier for current slot using local state."""
+    try:
+        hour, slot = hour_and_slot(ts, interval_seconds)
+        local_doc: dict[str, Any] = {}
+        try:
+            cache_doc = read_local_cache(cache_path_for(ts))
+            if isinstance(cache_doc, dict):
+                local_doc = cache_doc
+        except Exception:
+            local_doc = {}
+
+        poc_slot_ok = False
+        try:
+            hours_local = local_doc.get("hours") if isinstance(local_doc, dict) else {}
+            if isinstance(hours_local, dict):
+                h_entry = hours_local.get(str(hour))
+                slots = h_entry.get("slots") if isinstance(h_entry, dict) else None
+                if isinstance(slots, list) and slot < len(slots):
+                    poc_slot_ok = (slots[slot] == "online")
+        except Exception:
+            pass
+
+        pod_slot_ok = False
+        try:
+            pod_hours_local = local_doc.get("podHours") if isinstance(local_doc, dict) else {}
+            if isinstance(pod_hours_local, dict):
+                pod_entry = pod_hours_local.get(str(hour))
+                pod_slots_list = pod_entry.get("slots") if isinstance(pod_entry, dict) else None
+                if isinstance(pod_slots_list, list) and slot < len(pod_slots_list):
+                    pod_slot_ok = bool(pod_slots_list[slot])
+        except Exception:
+            pass
+
+        poi_slot_ok: Optional[bool] = None
+        if MINER_CODE == "AEM":
+            poi_slot_ok = bool(poi_data)
+
+        def _norm_mac(value: Optional[str]) -> str:
+            try:
+                return re.sub(r"[^0-9a-f]", "", (value or "").lower())
+            except Exception:
+                return ""
+
+        norm_miner = _norm_mac(miner_mac)
+        norm_registered = _norm_mac(mac_registered)
+        mac_match = bool(norm_miner and norm_registered and norm_miner == norm_registered)
+
+        bright_active = False
+        honeygain_active = False
+        mysterium_active = False
+        if MINER_CODE == "BM":
+            try:
+                bright_active = sdk_approved("bright")
+            except Exception:
+                bright_active = False
+            try:
+                honeygain_active = sdk_approved("honeygain")
+            except Exception:
+                honeygain_active = False
+            try:
+                mysterium_active = sdk_approved("mysterium")
+            except Exception:
+                mysterium_active = False
+
+        return _compute_rewards_multiplier(
+            MINER_CODE,
+            mac_match,
+            poc_slot_ok,
+            pod_slot_ok,
+            poi_slot_ok,
+            bright_active,
+            honeygain_active,
+            mysterium_active,
+        )
+    except Exception:
+        return 0.0
+
+def _get_boot_time_iso() -> Optional[str]:
+    """Return system boot time as ISO string in UTC if available."""
+    try:
+        import psutil  # type: ignore
+        bt = psutil.boot_time()
+        return dt.datetime.fromtimestamp(bt, UTC).replace(microsecond=0).isoformat()
+    except Exception:
+        return None
+
+def _compute_uptime_24h_from_slots(poc_slots: Dict[str, Any], ts: dt.datetime, interval_seconds: int) -> tuple[float, float]:
+    """Compute uptime/downtime seconds over the last 24h window from PoC slots."""
+    if not isinstance(poc_slots, dict):
+        return 0.0, 0.0
+    window_start = ts - dt.timedelta(hours=24)
+    online_slots = 0
+    total_slots = 0
+    for hk, entry in poc_slots.items():
+        if not isinstance(hk, str) or not isinstance(entry, dict):
+            continue
+        try:
+            hour_start = dt.datetime.strptime(hk, "%Y%m%d%H").replace(tzinfo=UTC)
+        except Exception:
+            continue
+        if hour_start < window_start or hour_start > ts:
+            continue
+        slots = entry.get("slots")
+        if not isinstance(slots, list):
+            continue
+        online_slots += sum(1 for s in slots if bool(s))
+        total_slots += len(slots)
+    uptime_seconds = float(online_slots * max(1, interval_seconds))
+    downtime_seconds = float(max(0, (total_slots - online_slots)) * max(1, interval_seconds))
+    return uptime_seconds, downtime_seconds
 
 def get_miner_type_offset() -> int:
     """Return the time offset in seconds for this miner type to stagger API calls.
@@ -987,7 +1370,7 @@ def upsert_installation_record(
         payload_set_on_insert = {
             "first_installed_at": now_utc(),
         }
-        coll.update_one(
+        coll.update_one(  # type: ignore[attr-defined]
             {"miner_key": miner_key, "install_id": install_id},
             {"$set": payload_set, "$setOnInsert": payload_set_on_insert},
             upsert=True,
@@ -1005,7 +1388,7 @@ def other_active_installation_exists(client: MongoProxyClient, miner_key: str, i
             "lease_install_id": {"$exists": True, "$ne": install_id},
             "lease_expires_at": {"$gt": now},
         }
-        doc = coll.find_one(q, {"_id": 1})
+        doc = coll.find_one(q, {"_id": 1})  # type: ignore[attr-defined]
         return doc is not None
     except Exception:
         return False
@@ -1052,7 +1435,7 @@ def acquire_installation_lease(client: MongoProxyClient, miner_key: str, install
             log.debug("lease-acquire attempt | miner_key=%s install_id=%s filt=%s", miner_key, install_id, filt)
         except Exception:
             pass
-        res = coll.update_one(filt, update, upsert=True)
+        res = coll.update_one(filt, update, upsert=True)  # type: ignore[attr-defined]
         ok = bool(res.matched_count or res.upserted_id)
         try:
             log.debug("lease-acquire result | matched=%s upserted=%s modified=%s ok=%s", res.matched_count, res.upserted_id, getattr(res, 'modified_count', '?'), ok)
@@ -1072,7 +1455,7 @@ def renew_installation_lease(client: MongoProxyClient, miner_key: str, install_i
         coll = client["PoC"]["installations"]
         now = now_utc()
         expiry = now + dt.timedelta(seconds=max(60, lease_seconds))
-        res = coll.update_one(
+        res = coll.update_one(  # type: ignore[attr-defined]
             {"_id": _lease_doc_id(miner_key), "lease_install_id": install_id},
             {"$set": {"lease_expires_at": expiry, "last_seen_at": now, "install_id": install_id, "miner_key": miner_key}},
         )
@@ -1167,9 +1550,17 @@ def write_status(
     day_total_full = 24 * slots_per_hour
 
     existing_doc = _get_existing_hardware_doc(coll, miner_key)
+    miner_type_val = existing_doc.get("miner_type") if isinstance(existing_doc.get("miner_type"), str) else MINER_CODE
     existing_poc = _extract_poc_map(existing_doc)
     existing_pod = _extract_pod_map(existing_doc)
     existing_pol = _extract_pol_map(existing_doc)
+    mac_slots = cast(Dict[str, Any], existing_doc.get("mac_slots") if isinstance(existing_doc.get("mac_slots"), dict) else {})
+    poc_slots = cast(Dict[str, Any], existing_doc.get("PoC_slots") if isinstance(existing_doc.get("PoC_slots"), dict) else {})
+    pod_slots = cast(Dict[str, Any], existing_doc.get("PoD_slots") if isinstance(existing_doc.get("PoD_slots"), dict) else {})
+    bandwidth_tools_slots = cast(Dict[str, Any], existing_doc.get("bandwidth_tools_slots") if isinstance(existing_doc.get("bandwidth_tools_slots"), dict) else {})
+    rewards_multiplier_slots = cast(Dict[str, Any], existing_doc.get("rewards_multiplier_slots") if isinstance(existing_doc.get("rewards_multiplier_slots"), dict) else {})
+    uptime_info_existing = existing_doc.get("uptime") if isinstance(existing_doc.get("uptime"), dict) else {}
+    boot_time_existing = existing_doc.get("boot_time")
     mac_info = _extract_mac_fields(existing_doc)
     software_info = _extract_software_fields(existing_doc)
 
@@ -1192,31 +1583,30 @@ def write_status(
         day_online_so_far = max(0, min(local_online, slots_elapsed))
 
     local_percent = local_doc.get("onlinePercentDay") if isinstance(local_doc, dict) else None
+    day_percent: Optional[float] = None
     if isinstance(local_percent, (int, float)):
         day_percent = round(float(local_percent), 1)
-    elif slots_elapsed > 0:
-        day_percent = round(100.0 * day_online_so_far / max(1, slots_elapsed), 1)
-    else:
-        day_percent = 0.0
+    elif isinstance(local_total, int) and local_total > 0:
+        day_percent = round(100.0 * day_online_so_far / max(1, local_total), 1)
 
-    poc_percent = float(day_percent)
+    poc_percent: Optional[float] = float(day_percent) if isinstance(day_percent, (int, float)) else None
 
     pod_count = local_doc.get("podCountDay") if isinstance(local_doc, dict) else None
     pod_total = local_doc.get("podTotalSlotsDay") if isinstance(local_doc, dict) else None
     pod_percent_local = local_doc.get("podPercentDay") if isinstance(local_doc, dict) else None
+    pod_percent: Optional[float] = None
     if isinstance(pod_percent_local, (int, float)):
         pod_percent = round(float(pod_percent_local), 1)
     elif isinstance(pod_count, int) and isinstance(pod_total, int) and pod_total > 0:
         pod_percent = round(100.0 * max(0, min(pod_count, pod_total)) / max(1, pod_total), 1)
-    elif isinstance(pod_count, int) and slots_elapsed > 0:
-        pod_percent = round(100.0 * max(0, min(pod_count, slots_elapsed)) / max(1, slots_elapsed), 1)
-    else:
-        pod_percent = 0.0
-    existing_pod[day] = float(pod_percent)
+
+    if pod_percent is not None:
+        existing_pod[day] = float(pod_percent)
     pod_keys = sorted(existing_pod.keys())[-MAX_POC_DAYS:]
     pod_compact = {key: float(existing_pod[key]) for key in pod_keys}
-    poc_value = round(float(apply_bm_sdk_cap(poc_percent)), 1)
-    existing_poc[day] = poc_value
+    if poc_percent is not None:
+        poc_value = round(float(apply_bm_sdk_cap(poc_percent)), 1)
+        existing_poc[day] = poc_value
     poc_keys = sorted(existing_poc.keys())[-MAX_POC_DAYS:]
     poc_compact = {key: float(existing_poc[key]) for key in poc_keys}
     # For AEM, PoD is redundant; drop it so UI shows PoC + PoI only.
@@ -1233,8 +1623,6 @@ def write_status(
             poi_percent = round(float(poi_percent_local), 1)
         elif isinstance(poi_count, int) and isinstance(poi_total, int) and poi_total > 0:
             poi_percent = round(100.0 * max(0, min(poi_count, poi_total)) / max(1, poi_total), 1)
-        elif isinstance(poi_count, int) and slots_elapsed > 0:
-            poi_percent = round(100.0 * max(0, min(poi_count, slots_elapsed)) / max(1, slots_elapsed), 1)
         else:
             poi_percent = None
 
@@ -1250,7 +1638,7 @@ def write_status(
                 slots_val = entry.get("slots") or []
                 if not isinstance(slots_val, list):
                     continue
-                slots_clean = [bool(v) for v in (slots_val + [False] * slots_per_hour)[:slots_per_hour]]
+                slots_clean = [bool(v) for v in slots_val[:slots_per_hour] if isinstance(v, bool)]
                 poi_hours_clean[key] = slots_clean
         if poi_percent is not None or poi_hours_clean:
             poi_slots = {
@@ -1318,9 +1706,125 @@ def write_status(
         software_info["is_outdated"] = None
         software_info["is_uptodate"] = None
 
-    # For AEM miners, include PoI data if provided
-    miner_type_val = existing_doc.get("miner_type") if isinstance(existing_doc.get("miner_type"), str) else MINER_CODE
-    
+    # Slot-level tracking (testing mode; keep recent hours only)
+    hour_key_str = hour_key(ts)
+    day_prefix = ts.strftime("%Y%m%d")
+    poc_slot_ok = False
+    try:
+        hours_local = local_doc.get("hours") if isinstance(local_doc, dict) else {}
+        if isinstance(hours_local, dict):
+            h_entry = hours_local.get(str(hour))
+            slots = h_entry.get("slots") if isinstance(h_entry, dict) else None
+            if isinstance(slots, list) and slot < len(slots):
+                poc_slot_ok = (slots[slot] == "online")
+    except Exception:
+        poc_slot_ok = (status == "online")
+
+    pod_slot_ok = False
+    try:
+        pod_hours_local = local_doc.get("podHours") if isinstance(local_doc, dict) else {}
+        if isinstance(pod_hours_local, dict):
+            pod_entry = pod_hours_local.get(str(hour))
+            pod_slots_list = pod_entry.get("slots") if isinstance(pod_entry, dict) else None
+            if isinstance(pod_slots_list, list) and slot < len(pod_slots_list):
+                pod_slot_ok = bool(pod_slots_list[slot])
+    except Exception:
+        pod_slot_ok = False
+
+    poi_slot_ok: Optional[bool] = None
+    if miner_type_val == "AEM":
+        poi_slot_ok = bool(poi_data)
+
+    # BM bandwidth tools state (selected/active)
+    bright_active = False
+    honeygain_active = False
+    mysterium_active = False
+    bandwidth_slot_entry: Optional[dict[str, Any]] = None
+    if miner_type_val == "BM":
+        try:
+            bright_active = sdk_approved("bright")
+        except Exception:
+            bright_active = False
+        try:
+            honeygain_active = sdk_approved("honeygain")
+        except Exception:
+            honeygain_active = False
+        try:
+            mysterium_active = sdk_approved("mysterium")
+        except Exception:
+            mysterium_active = False
+        selected_tools = [name for name, active in (("bright", bright_active), ("honeygain", honeygain_active), ("mysterium", mysterium_active)) if active]
+        bandwidth_slot_entry = {
+            "selected": selected_tools,
+            "active": selected_tools,
+        }
+
+    rewards_multiplier_value = _compute_rewards_multiplier(
+        miner_type_val if isinstance(miner_type_val, str) and miner_type_val else MINER_CODE,
+        bool(mac_info.get("mac_match")),
+        poc_slot_ok,
+        pod_slot_ok,
+        poi_slot_ok,
+        bright_active,
+        honeygain_active,
+        mysterium_active,
+    )
+
+    mac_entry = _ensure_slot_entry(mac_slots, hour_key_str, slots_per_hour, None)
+    mac_entry["slots"][slot] = bool(mac_info.get("mac_match"))
+    poc_entry = _ensure_slot_entry(poc_slots, hour_key_str, slots_per_hour, False)
+    poc_entry["slots"][slot] = bool(poc_slot_ok)
+    pod_entry = _ensure_slot_entry(pod_slots, hour_key_str, slots_per_hour, False)
+    pod_entry["slots"][slot] = bool(pod_slot_ok)
+    if miner_type_val == "BM":
+        bw_entry = _ensure_slot_entry(bandwidth_tools_slots, hour_key_str, slots_per_hour, None)
+        bw_slots = bw_entry.get("slots", [])
+        if isinstance(bw_slots, list) and slot < len(bw_slots):
+            bw_slots[slot] = bandwidth_slot_entry or {}
+        bw_entry["slots"] = bw_slots
+        bandwidth_tools_slots[hour_key_str] = bw_entry
+    else:
+        bandwidth_tools_slots = {}
+
+    reward_entry = _ensure_slot_entry(rewards_multiplier_slots, hour_key_str, slots_per_hour, None)
+    reward_slots_list = reward_entry.get("slots", [])
+    if isinstance(reward_slots_list, list) and slot < len(reward_slots_list):
+        reward_slots_list[slot] = rewards_multiplier_value
+    reward_entry["slots"] = reward_slots_list
+    rewards_multiplier_slots[hour_key_str] = reward_entry
+
+    mac_slots = _prune_slot_hours(mac_slots)
+    poc_slots = _prune_slot_hours(poc_slots)
+    pod_slots = _prune_slot_hours(pod_slots)
+    bandwidth_tools_slots = _prune_slot_hours(bandwidth_tools_slots)
+    rewards_multiplier_slots = _prune_slot_hours(rewards_multiplier_slots)
+    rewards_multiplier_day = _compute_day_multiplier_avg(rewards_multiplier_slots, day_prefix)
+
+    uptime_info_existing = uptime_info_existing if isinstance(uptime_info_existing, dict) else {}
+    prev_status = uptime_info_existing.get("status") if isinstance(uptime_info_existing.get("status"), str) else None
+    last_online_at = uptime_info_existing.get("last_online_at") if isinstance(uptime_info_existing.get("last_online_at"), str) else None
+    last_offline_at = uptime_info_existing.get("last_offline_at") if isinstance(uptime_info_existing.get("last_offline_at"), str) else None
+    current_run_started_at = uptime_info_existing.get("current_run_started_at") if isinstance(uptime_info_existing.get("current_run_started_at"), str) else None
+    if status == "online":
+        last_online_at = ts.isoformat()
+        if prev_status != "online" or not current_run_started_at:
+            current_run_started_at = ts.isoformat()
+    else:
+        last_offline_at = ts.isoformat()
+
+    uptime_seconds_24h, downtime_seconds_24h = _compute_uptime_24h_from_slots(poc_slots, ts, interval_seconds)
+
+    uptime_info_new = {
+        "status": status,
+        "last_online_at": last_online_at,
+        "last_offline_at": last_offline_at,
+        "current_run_started_at": current_run_started_at,
+        "uptime_seconds_24h": uptime_seconds_24h,
+        "downtime_seconds_24h": downtime_seconds_24h,
+    }
+
+    boot_time_val = _get_boot_time_iso() or (boot_time_existing if isinstance(boot_time_existing, str) else None)
+
     new_doc = _compose_hardware_doc(
         miner_key,
         miner_type=miner_type_val,
@@ -1333,9 +1837,18 @@ def write_status(
         poi=poi_data if (miner_type_val == "AEM") else None,
         poi_slots=poi_slots if (miner_type_val == "AEM") else None,
     )
+    new_doc["mac_slots"] = mac_slots
+    new_doc["PoC_slots"] = poc_slots
+    new_doc["PoD_slots"] = pod_slots
+    new_doc["bandwidth_tools_slots"] = bandwidth_tools_slots
+    new_doc["rewards_multiplier_slots"] = rewards_multiplier_slots
+    new_doc["rewards_multiplier_day"] = rewards_multiplier_day
+    new_doc["uptime"] = uptime_info_new
+    if boot_time_val:
+        new_doc["boot_time"] = boot_time_val
 
     try:
-        coll.replace_one({"miner_key": miner_key}, new_doc, upsert=True)
+        coll.replace_one({"miner_key": miner_key}, new_doc, upsert=True)  # type: ignore[attr-defined]
     except Exception:
         pass
 
@@ -1658,47 +2171,197 @@ class _CacheLock:
 
 def _lc_write_slot(doc: dict, ts: dt.datetime, status: str, interval_seconds: int):
     hour, slot = hour_and_slot(ts, interval_seconds)
-    h = doc["hours"].get(str(hour))
-    slots_per_hour = max(1, 3600 // max(1, interval_seconds))
-    if not isinstance(h, dict) or not isinstance(h.get("slots"), list) or len(h["slots"]) < slots_per_hour:
-        h = {"slots": ["offline"] * slots_per_hour, "onlineCount": 0, "totalSlots": slots_per_hour}
-    h["slots"][slot] = status
-    h["onlineCount"] = sum(1 for s in h["slots"] if s == "online")
-    h["totalSlots"] = slots_per_hour
-    doc["hours"][str(hour)] = h
+    hours = doc.setdefault("hours", {})
+    h = hours.get(str(hour)) if isinstance(hours, dict) else None
+    if not isinstance(h, dict):
+        h = {}
+    slots = h.get("slots")
+    if not isinstance(slots, list):
+        slots = []
+    if len(slots) <= slot:
+        slots = (slots + [None] * (slot + 1 - len(slots)))
+    slots[slot] = status
+    known_slots = [s for s in slots if s in ("online", "offline")]
+    h["slots"] = slots
+    h["onlineCount"] = sum(1 for s in known_slots if s == "online")
+    h["totalSlots"] = len(known_slots)
+    hours[str(hour)] = h
 
-def _lc_write_pod_slot(doc: dict, ts: dt.datetime, delivered: bool, interval_seconds: int):
+def _lc_write_mac_slot(doc: dict, ts: dt.datetime, mac_ok: Optional[bool], interval_seconds: int):
+    """Record MAC match state for a slot; leave prior slots untouched."""
     hour, slot = hour_and_slot(ts, interval_seconds)
-    slots_per_hour = max(1, 3600 // max(1, interval_seconds))
+    mac_hours = doc.setdefault("macHours", {})
+    entry = mac_hours.get(str(hour))
+    if not isinstance(entry, dict):
+        entry = {}
+    slots = entry.get("slots", [])
+    if not isinstance(slots, list):
+        slots = []
+    if len(slots) <= slot:
+        slots = slots + [None] * (slot + 1 - len(slots))
+    slots[slot] = (bool(mac_ok) if mac_ok is not None else None)
+    entry["slots"] = slots
+    known = [s for s in slots if isinstance(s, bool)]
+    entry["matchCount"] = sum(1 for s in known if s)
+    entry["totalSlots"] = len(known)
+    mac_hours[str(hour)] = entry
+
+def _lc_write_pod_slot(doc: dict, ts: dt.datetime, delivered: Optional[bool], interval_seconds: int):
+    hour, slot = hour_and_slot(ts, interval_seconds)
     pod_hours = doc.setdefault("podHours", {})
     entry = pod_hours.get(str(hour))
-    if not isinstance(entry, dict) or not isinstance(entry.get("slots"), list) or len(entry["slots"]) < slots_per_hour:
-        entry = {"slots": [False] * slots_per_hour, "deliveredCount": 0, "totalSlots": slots_per_hour}
+    if not isinstance(entry, dict):
+        entry = {}
     slots = entry.get("slots", [])
-    if len(slots) < slots_per_hour:
-        slots = (slots + [False] * slots_per_hour)[:slots_per_hour]
-    slots[slot] = bool(delivered)
-    entry["slots"] = [bool(s) for s in slots]
-    entry["deliveredCount"] = sum(1 for s in entry["slots"] if s)
-    entry["totalSlots"] = slots_per_hour
+    if not isinstance(slots, list):
+        slots = []
+    if len(slots) <= slot:
+        slots = (slots + [None] * (slot + 1 - len(slots)))
+    slots[slot] = (bool(delivered) if delivered is not None else None)
+    entry["slots"] = slots
+    entry["deliveredCount"] = sum(1 for s in slots if s is True)
+    entry["totalSlots"] = sum(1 for s in slots if isinstance(s, bool))
     pod_hours[str(hour)] = entry
 
-def _lc_write_poi_slot(doc: dict, ts: dt.datetime, installed: bool, interval_seconds: int):
+def _lc_write_poi_slot(doc: dict, ts: dt.datetime, installed: Optional[bool], interval_seconds: int):
     """Write a PoI slot (installed = True/False) for the given interval."""
     hour, slot = hour_and_slot(ts, interval_seconds)
-    slots_per_hour = max(1, 3600 // max(1, interval_seconds))
     poi_hours = doc.setdefault("poiHours", {})
     entry = poi_hours.get(str(hour))
-    if not isinstance(entry, dict) or not isinstance(entry.get("slots"), list) or len(entry["slots"]) < slots_per_hour:
-        entry = {"slots": [False] * slots_per_hour, "installedCount": 0, "totalSlots": slots_per_hour}
+    if not isinstance(entry, dict):
+        entry = {}
     slots = entry.get("slots", [])
-    if len(slots) < slots_per_hour:
-        slots = (slots + [False] * slots_per_hour)[:slots_per_hour]
-    slots[slot] = bool(installed)
-    entry["slots"] = [bool(s) for s in slots]
-    entry["installedCount"] = sum(1 for s in entry["slots"] if s)
-    entry["totalSlots"] = slots_per_hour
+    if not isinstance(slots, list):
+        slots = []
+    if len(slots) <= slot:
+        slots = (slots + [None] * (slot + 1 - len(slots)))
+    slots[slot] = (bool(installed) if installed is not None else None)
+    entry["slots"] = slots
+    entry["installedCount"] = sum(1 for s in slots if s is True)
+    entry["totalSlots"] = sum(1 for s in slots if isinstance(s, bool))
     poi_hours[str(hour)] = entry
+
+def _tool_states_for_hour() -> tuple[bool, bool, bool]:
+    """Return (bright, honeygain, mysterium) active states."""
+    bright_active = False
+    honeygain_active = False
+    mysterium_active = False
+    try:
+        bright_active = sdk_approved("bright")
+    except Exception:
+        bright_active = False
+    try:
+        honeygain_active = sdk_approved("honeygain")
+    except Exception:
+        honeygain_active = False
+    try:
+        mysterium_active = sdk_approved("mysterium")
+    except Exception:
+        mysterium_active = False
+    return bright_active, honeygain_active, mysterium_active
+
+def _inject_gui_status_slots(doc: dict, ts: dt.datetime, interval_seconds: int) -> None:
+    """Compute GUI-facing rewards_multiplier_slots and place on the current cache doc."""
+    try:
+        slots_per_hour = max(1, 3600 // max(1, interval_seconds))
+        hours_doc = doc.get("hours") if isinstance(doc, dict) else {}
+        mac_hours_doc = doc.get("macHours") if isinstance(doc, dict) else {}
+        pod_hours = doc.get("podHours") if isinstance(doc, dict) else {}
+        poi_hours = doc.get("poiHours") if isinstance(doc, dict) else {}
+        try:
+            last_written_str = doc.get("lastSlotWritten")
+            if isinstance(last_written_str, str):
+                last_written = dt.datetime.strptime(last_written_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+                max_hour = min(23, last_written.hour)
+            else:
+                max_hour = min(23, hour_and_slot(ts, interval_seconds)[0])
+        except Exception:
+            max_hour = min(23, hour_and_slot(ts, interval_seconds)[0])
+        bright_active, honeygain_active, mysterium_active = _tool_states_for_hour()
+        tools_list: list[str] = []
+        if MINER_CODE == "BM":
+            if bright_active:
+                tools_list.append("Bright")
+            if honeygain_active:
+                tools_list.append("Honeygain")
+            if mysterium_active:
+                tools_list.append("Mysterium")
+        slots_out: dict[str, dict[str, Any]] = {}
+        for h in range(max_hour + 1):
+            hour_key = str(h)
+            mac_ok: Optional[bool] = None
+            try:
+                mac_entry = mac_hours_doc.get(hour_key) if isinstance(mac_hours_doc, dict) else None
+                mac_slots = mac_entry.get("slots") if isinstance(mac_entry, dict) else None
+                if isinstance(mac_slots, list):
+                    candidates = [s for s in mac_slots[:slots_per_hour] if isinstance(s, bool)]
+                    if candidates:
+                        mac_ok = candidates[-1]
+            except Exception:
+                mac_ok = None
+            if mac_ok is None:
+                mac_ok = not bool(doc.get("mac_mismatch"))
+            poc_ok: Optional[bool] = None
+            try:
+                h_entry = hours_doc.get(hour_key) if isinstance(hours_doc, dict) else None
+                slots = h_entry.get("slots") if isinstance(h_entry, dict) else None
+                if isinstance(slots, list):
+                    known_slots = [s for s in slots[:slots_per_hour] if s in ("online", "offline")]
+                    if known_slots:
+                        poc_ok = any(s == "online" for s in known_slots)
+            except Exception:
+                poc_ok = None
+            pod_ok: Optional[bool] = None
+            try:
+                pod_entry = pod_hours.get(hour_key) if isinstance(pod_hours, dict) else None
+                pod_slots = pod_entry.get("slots") if isinstance(pod_entry, dict) else None
+                if isinstance(pod_slots, list):
+                    known_pod = [s for s in pod_slots[:slots_per_hour] if isinstance(s, bool)]
+                    if known_pod:
+                        pod_ok = any(bool(s) for s in known_pod)
+            except Exception:
+                pod_ok = None
+            poi_ok: Optional[bool] = None
+            if MINER_CODE == "AEM":
+                try:
+                    poi_entry = poi_hours.get(hour_key) if isinstance(poi_hours, dict) else None
+                    poi_slots = poi_entry.get("slots") if isinstance(poi_entry, dict) else None
+                    if isinstance(poi_slots, list):
+                        known_poi = [s for s in poi_slots[:slots_per_hour] if isinstance(s, bool)]
+                        if known_poi:
+                            poi_ok = any(bool(s) for s in known_poi)
+                except Exception:
+                    poi_ok = None
+            ready_for_multiplier = False
+            if MINER_CODE == "AEM":
+                ready_for_multiplier = (poc_ok is not None) and (poi_ok is not None)
+            else:
+                ready_for_multiplier = (poc_ok is not None) and (pod_ok is not None)
+            multiplier: Optional[float] = None
+            if ready_for_multiplier:
+                multiplier = _compute_rewards_multiplier(
+                    MINER_CODE,
+                    bool(mac_ok),
+                    bool(poc_ok),
+                    bool(pod_ok),
+                    poi_ok,
+                    bright_active,
+                    honeygain_active,
+                    mysterium_active,
+                )
+            hour_entry: dict[str, Any] = {
+                "multiplier": float(multiplier) if isinstance(multiplier, (int, float)) else None,
+                "mac_match": int(bool(mac_ok)),
+                "PoC": (int(bool(poc_ok)) if poc_ok is not None else None),
+                "PoD": (int(bool(pod_ok)) if pod_ok is not None else None),
+                "tools": tools_list if MINER_CODE == "BM" else [],
+            }
+            if MINER_CODE == "AEM":
+                hour_entry["PoI"] = (int(bool(poi_ok)) if poi_ok is not None else None)
+            slots_out[hour_key] = hour_entry
+        doc["rewards_multiplier_slots"] = slots_out
+    except Exception:
+        pass
 
 def write_status_local(
     miner_key: str,
@@ -1723,6 +2386,7 @@ def write_status_local(
             "agentVersion": SOFTWARE_VERSION,
             "date": day_iso,
             "hours": {},
+            "macHours": {},
             "podHours": {},
             "poiHours": {},
             "lastSlotWritten": None
@@ -1745,124 +2409,103 @@ def write_status_local(
     if last_ts and last_ts.date() != ts.date():
         last_day_path = cache_path_for(last_ts)
         last_lock_path = cache_lock_path_for(last_ts)
-        last_day_iso = last_ts.strftime("%Y-%m-%d")
         with _CacheLock(last_lock_path):
-            last_doc = read_local_cache(last_day_path) or {
-                "miner_key": miner_key,
-                "minerCode": MINER_CODE,
-                "agentVersion": VERSION,
-                "date": last_day_iso,
-                "hours": {},
-                "podHours": {},
-                "poiHours": {},
-                "lastSlotWritten": None
-            }
-            t = floor_slot(last_ts) + dt.timedelta(seconds=max(1, interval_seconds))
-            # last slot start of that day
-            start_of_day = dt.datetime(last_ts.year, last_ts.month, last_ts.day, tzinfo=UTC)
-            end = start_of_day + dt.timedelta(days=1) - dt.timedelta(seconds=max(1, interval_seconds))
-            while t <= end:
-                _lc_write_slot(last_doc, t, "offline", interval_seconds)
-                _lc_write_pod_slot(last_doc, t, False, interval_seconds)
-                _lc_write_poi_slot(last_doc, t, False, interval_seconds)
-                t += dt.timedelta(seconds=max(1, interval_seconds))
-            last_doc["lastUpdated"] = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
-            last_doc["lastSlotWritten"] = end.strftime("%Y-%m-%dT%H:%M:%SZ")
-            # Attach signature and write
-            try:
-                sig = compute_cache_signature(last_doc)
-                if isinstance(sig, str):
-                    last_doc["sig"] = sig
-            except Exception:
-                pass
-            atomic_write_json(last_day_path, last_doc)
+            last_doc = read_local_cache(last_day_path)
+            if isinstance(last_doc, dict) and last_doc:
+                last_doc["lastUpdated"] = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+                # Attach GUI view + signature and write
+                try:
+                    _inject_gui_status_slots(last_doc, last_ts, interval_seconds)
+                except Exception:
+                    pass
+                try:
+                    sig = compute_cache_signature(last_doc)
+                    if isinstance(sig, str):
+                        last_doc["sig"] = sig
+                except Exception:
+                    pass
+                atomic_write_json(last_day_path, last_doc)
+                # Clean up legacy underscore file name for the finalized day
+                try:
+                    legacy_path = os.path.join(data_dir(), "status", f"status_{last_ts.strftime('%Y%m%d')}.json")
+                    if os.path.exists(legacy_path):
+                        os.remove(legacy_path)
+                except Exception:
+                    pass
         last_ts = None
 
-    if last_ts:
-        t = floor_slot(last_ts) + dt.timedelta(seconds=max(1, interval_seconds))
-        while t < cur_slot and t.date() == ts.date():
-            _lc_write_slot(doc, t, "offline", interval_seconds)
-            _lc_write_pod_slot(doc, t, False, interval_seconds)
-            _lc_write_poi_slot(doc, t, False, interval_seconds)
-            t += dt.timedelta(seconds=max(1, interval_seconds))
-
     _lc_write_slot(doc, cur_slot, status, interval_seconds)
-    _lc_write_pod_slot(doc, cur_slot, bool(pod_status), interval_seconds)
-    _lc_write_poi_slot(doc, cur_slot, bool(poi_data), interval_seconds)
-    # Ensure all 24 hours exist and compute day totals
+    _lc_write_mac_slot(doc, cur_slot, (not bool(mac_mismatch) if mac_mismatch is not None else None), interval_seconds)
+    _lc_write_pod_slot(doc, cur_slot, pod_status, interval_seconds)
+    _lc_write_poi_slot(doc, cur_slot, poi_data, interval_seconds)
     slots_per_hour = max(1, 3600 // max(1, interval_seconds))
-    OFFLINE_N = ["offline"] * slots_per_hour
-    POD_FALSE = [False] * slots_per_hour
-    POI_FALSE = [False] * slots_per_hour
-    day_total_full = 24 * slots_per_hour
+    hour, slot = hour_and_slot(ts, interval_seconds)
+    slots_elapsed = hour * slots_per_hour + (slot + 1)
+    # Ensure hour-level aggregates treat unknown slots as offline for percent calculations
     day_online = 0
-    hourly_online_counts: list[int] = []
+    day_total = 0
+    hours_map = doc.setdefault("hours", {})
     pod_hours = doc.setdefault("podHours", {})
     poi_hours = doc.setdefault("poiHours", {})
-    pod_hourly_counts: list[int] = []
-    poi_hourly_counts: list[int] = []
-    for h in range(24):
+    for h in range(hour + 1):
         key = str(h)
-        hdoc = doc["hours"].get(key)
-        if not isinstance(hdoc, dict):
-            hdoc = {"slots": OFFLINE_N.copy(), "onlineCount": 0, "totalSlots": slots_per_hour}
-        slots = hdoc.get("slots") or []
-        if len(slots) < slots_per_hour:
-            slots = (slots + OFFLINE_N)[:slots_per_hour]
-        online_count = sum(1 for s in slots if s == "online")
-        hdoc["slots"] = slots
-        hdoc["onlineCount"] = online_count
-        hdoc["totalSlots"] = slots_per_hour
-        doc["hours"][key] = hdoc
-        day_online += online_count
-        hourly_online_counts.append(online_count)
+        hdoc = hours_map.get(key) if isinstance(hours_map, dict) else None
+        if isinstance(hdoc, dict):
+            slots = hdoc.get("slots") or []
+            if not isinstance(slots, list):
+                slots = []
+            hour_slots_expected = slots_per_hour if h < hour else (slot + 1)
+            slots = (slots + [None] * hour_slots_expected)[:hour_slots_expected]
+            online_count = sum(1 for s in slots if s == "online")
+            hdoc["slots"] = slots
+            hdoc["onlineCount"] = online_count
+            hdoc["totalSlots"] = hour_slots_expected
+            hours_map[key] = hdoc
+            day_online += online_count
+            day_total += hour_slots_expected
+        else:
+            hour_slots_expected = slots_per_hour if h < hour else (slot + 1)
+            day_total += hour_slots_expected
         ph = pod_hours.get(key)
-        if not isinstance(ph, dict):
-            ph = {"slots": POD_FALSE.copy(), "deliveredCount": 0, "totalSlots": slots_per_hour}
-        pslots = ph.get("slots") or []
-        if len(pslots) < slots_per_hour:
-            pslots = (pslots + POD_FALSE)[:slots_per_hour]
-        pslots = [bool(v) for v in pslots]
-        delivered = sum(1 for v in pslots if v)
-        ph["slots"] = pslots
-        ph["deliveredCount"] = delivered
-        ph["totalSlots"] = slots_per_hour
-        pod_hours[key] = ph
-        pod_hourly_counts.append(delivered)
+        if isinstance(ph, dict):
+            pslots = ph.get("slots") or []
+            if not isinstance(pslots, list):
+                pslots = []
+            hour_slots_expected = slots_per_hour if h < hour else (slot + 1)
+            pslots = (pslots + [None] * hour_slots_expected)[:hour_slots_expected]
+            delivered = sum(1 for v in pslots if v is True)
+            ph["slots"] = pslots
+            ph["deliveredCount"] = delivered
+            ph["totalSlots"] = hour_slots_expected
+            pod_hours[key] = ph
         poi_entry = poi_hours.get(key)
-        if not isinstance(poi_entry, dict):
-            poi_entry = {"slots": POI_FALSE.copy(), "installedCount": 0, "totalSlots": slots_per_hour}
-        poislots = poi_entry.get("slots") or []
-        if len(poislots) < slots_per_hour:
-            poislots = (poislots + POI_FALSE)[:slots_per_hour]
-        poislots = [bool(v) for v in poislots]
-        installed = sum(1 for v in poislots if v)
-        poi_entry["slots"] = poislots
-        poi_entry["installedCount"] = installed
-        poi_entry["totalSlots"] = slots_per_hour
-        poi_hours[key] = poi_entry
-        poi_hourly_counts.append(installed)
+        if isinstance(poi_entry, dict):
+            poislots = poi_entry.get("slots") or []
+            if not isinstance(poislots, list):
+                poislots = []
+            hour_slots_expected = slots_per_hour if h < hour else (slot + 1)
+            poislots = (poislots + [None] * hour_slots_expected)[:hour_slots_expected]
+            installed = sum(1 for v in poislots if v is True)
+            poi_entry["slots"] = poislots
+            poi_entry["installedCount"] = installed
+            poi_entry["totalSlots"] = hour_slots_expected
+            poi_hours[key] = poi_entry
 
-    hour, slot = hour_and_slot(ts, interval_seconds)
-    slots_elapsed = max(1, min(day_total_full, hour * slots_per_hour + (slot + 1)))
-    completed_online = sum(hourly_online_counts[:hour])
-    current_hour_online = hourly_online_counts[hour] if hour < len(hourly_online_counts) else 0
-    day_online_so_far = completed_online + max(0, min(current_hour_online, slot + 1))
-    doc["onlineCountDay"] = day_online_so_far
+    doc["onlineCountDay"] = day_online
     doc["totalSlotsDay"] = slots_elapsed
-    doc["onlinePercentDay"] = round(100.0 * day_online_so_far / max(1, slots_elapsed), 1)
-    completed_pod = sum(pod_hourly_counts[:hour])
-    current_hour_pod = pod_hourly_counts[hour] if hour < len(pod_hourly_counts) else 0
-    pod_day_so_far = completed_pod + max(0, min(current_hour_pod, slot + 1))
-    doc["podCountDay"] = pod_day_so_far
-    doc["podTotalSlotsDay"] = slots_elapsed
-    doc["podPercentDay"] = round(100.0 * pod_day_so_far / max(1, slots_elapsed), 1)
-    completed_poi = sum(poi_hourly_counts[:hour])
-    current_hour_poi = poi_hourly_counts[hour] if hour < len(poi_hourly_counts) else 0
-    poi_day_so_far = completed_poi + max(0, min(current_hour_poi, slot + 1))
-    doc["poiCountDay"] = poi_day_so_far
-    doc["poiTotalSlotsDay"] = slots_elapsed
-    doc["poiPercentDay"] = round(100.0 * poi_day_so_far / max(1, slots_elapsed), 1)
+    doc["onlinePercentDay"] = round(100.0 * day_online / max(1, slots_elapsed), 1)
+
+    pod_day = sum(ph.get("deliveredCount", 0) for ph in pod_hours.values() if isinstance(ph, dict))
+    pod_total_slots = slots_elapsed
+    doc["podCountDay"] = pod_day
+    doc["podTotalSlotsDay"] = pod_total_slots
+    doc["podPercentDay"] = round(100.0 * pod_day / max(1, pod_total_slots), 1)
+
+    poi_day = sum(pe.get("installedCount", 0) for pe in poi_hours.values() if isinstance(pe, dict))
+    poi_total_slots = slots_elapsed
+    doc["poiCountDay"] = poi_day
+    doc["poiTotalSlotsDay"] = poi_total_slots
+    doc["poiPercentDay"] = round(100.0 * poi_day / max(1, poi_total_slots), 1)
 
     if isinstance(mac_registered, str) and mac_registered.strip():
         doc["mac_registered"] = mac_registered.strip()
@@ -1877,6 +2520,16 @@ def write_status_local(
 
     doc["lastUpdated"] = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
     doc["lastSlotWritten"] = cur_slot.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        _inject_gui_status_slots(doc, ts, interval_seconds)
+    except Exception:
+        pass
+    # Guarantee rewards_multiplier_slots exists so the GUI can render it even if the helper failed
+    if "rewards_multiplier_slots" not in doc:
+        try:
+            _inject_gui_status_slots(doc, ts, interval_seconds)
+        except Exception:
+            doc["rewards_multiplier_slots"] = {}
     # Sign the payload if a signing key is configured
     try:
         sig = compute_cache_signature(doc)
@@ -1886,6 +2539,13 @@ def write_status_local(
         pass
     with _CacheLock(cur_lock_path):
         atomic_write_json(cur_day_path, doc)
+        # Remove legacy underscore-named file for the same day if present
+        try:
+            legacy_path = os.path.join(data_dir(), "status", f"status_{ts.strftime('%Y%m%d')}.json")
+            if os.path.exists(legacy_path):
+                os.remove(legacy_path)
+        except Exception:
+            pass
     _update_rolling7_summary(miner_key, ts)
 
 
@@ -2192,13 +2852,25 @@ def check_country_once(h3_index: Optional[str], *, area_threshold: float = COUNT
 def registered_hexid_from_devices(client: MongoProxyClient, miner_key: str) -> Optional[str]:
     """Return hexId (res7) from main.devices for this miner_key."""
     try:
-        doc = client["main"]["devices"].find_one({"miner_key": miner_key}, {"hexId": 1, "_id": 0})
+        coll = client["main"]["devices"]
+        if hasattr(coll, "find_one"):
+            doc = coll.find_one({"miner_key": miner_key}, {"hexId": 1, "_id": 0})  # type: ignore[attr-defined]
+        else:
+            doc = None
+        if not isinstance(doc, dict) and hasattr(client, "_api"):
+            try:
+                doc = client._api.get_miner_profile(miner_key)
+            except Exception:
+                doc = None
         if isinstance(doc, dict):
-            v = doc.get("hexId")
+            v = doc.get("hexId") or (doc.get("position", {}) if isinstance(doc.get("position"), dict) else {}).get("hexId")
             if isinstance(v, str) and v:
+                _reset_critical_failure(f"hexid-missing-{miner_key}")
                 return v
-    except Exception:
-        pass
+        msg = f"No hexId returned for {miner_key} from /credentials"
+        _record_critical_failure(f"hexid-missing-{miner_key}", msg, miner_key=miner_key)
+    except Exception as e:
+        _record_critical_failure(f"hexid-error-{miner_key}", f"Failed to fetch hexId for {miner_key}: {e}", miner_key=miner_key)
     return None
 
 
@@ -2268,16 +2940,27 @@ def registered_mac_from_devices(client: MongoProxyClient, miner_key: str) -> Opt
     """Return the registered MAC for a miner_key from creds.hardware.miner_mac.
     Returns None if not present or on error."""
     try:
-        dev = client["creds"]["hardware"].find_one(
-            {"miner_key": miner_key}, {"miner_mac": 1, "_id": 0}
-        )
+        coll = client["creds"]["hardware"]
+        if hasattr(coll, "find_one"):
+            dev = coll.find_one({"miner_key": miner_key}, {"miner_mac": 1, "_id": 0})  # type: ignore[attr-defined]
+        else:
+            dev = None
+        if not isinstance(dev, dict) and hasattr(client, "_api"):
+            try:
+                dev = client._api.get_miner_profile(miner_key)
+            except Exception:
+                dev = None
         if isinstance(dev, dict):
-            v = dev.get("miner_mac")
+            v = dev.get("miner_mac") or (dev.get("credentials", {}) if isinstance(dev.get("credentials"), dict) else {}).get("mac_address")
             if isinstance(v, str):
                 v = v.strip()
-                return v or None
-    except Exception:
-        pass
+                if v:
+                    _reset_critical_failure(f"mac-missing-{miner_key}")
+                    return v
+        msg = f"No registered MAC returned for {miner_key} from /credentials"
+        _record_critical_failure(f"mac-missing-{miner_key}", msg, miner_key=miner_key)
+    except Exception as e:
+        _record_critical_failure(f"mac-error-{miner_key}", f"Failed to fetch registered MAC for {miner_key}: {e}", miner_key=miner_key)
     return None
 
 def group_lock_path() -> str:
@@ -2344,6 +3027,13 @@ def _release_service_lock() -> None:
 
 def main():
     # Remove check-only modes since installer handles miner key validation and initial lease acquisition
+    _init_service_file_logging()
+    try:
+        vm_info = _detect_virtual_machine()
+        if vm_info.get("vm") is True:
+            sys.exit(0)
+    except Exception:
+        pass
 
     try:
         acquire_service_lock()
@@ -2470,91 +3160,93 @@ def main():
                     )
                 except Exception:
                     pass
-                # Also capture the registered MAC (best-effort)
-                try:
-                    mac_registered = registered_mac_from_devices(client, miner_key)
-                except Exception:
-                    mac_registered = mac_registered or None
-                # Populate hardware document immediately so UI shows registered values
-                try:
-                    hex_registered = None
-                    try:
-                        hex_registered = registered_hexid_from_devices(client, miner_key)
-                    except Exception:
-                        hex_registered = None
-                    try:
-                        existing_doc = _get_existing_hardware_doc(coll, miner_key)
-                        mac_info = _extract_mac_fields(existing_doc)
-                        software_info = _extract_software_fields(existing_doc)
-                        poc_map = _extract_poc_map(existing_doc)
-                        pod_map = _extract_pod_map(existing_doc)
-                        pol_map = _extract_pol_map(existing_doc)
-                        # update registered values if present
-                        # prefer the local selected miner MAC when available so the UI can show a match immediately
-                        if isinstance(miner_mac_local, str) and miner_mac_local:
-                            mac_info["miner_mac"] = miner_mac_local
-                        if isinstance(mac_registered, str) and mac_registered:
-                            mac_info["mac_registered"] = mac_registered
-                        # compute mac_match using the same normalization rules as write_status
-                        try:
-                            def _norm_mac_start(v: Optional[str]) -> str:
-                                try:
-                                    return re.sub(r"[^0-9a-f]", "", (v or "").lower())
-                                except Exception:
-                                    return ""
-                            norm_miner_start = _norm_mac_start(mac_info.get("miner_mac"))
-                            norm_registered_start = _norm_mac_start(mac_info.get("mac_registered"))
-                            mac_info["mac_match"] = bool(norm_miner_start and norm_registered_start and norm_miner_start == norm_registered_start)
-                        except Exception:
-                            pass
-                        day = day_iso(now_utc())
-                        pol_entry = pol_map.get(day) or {}
-                        if isinstance(hex_registered, str) and hex_registered:
-                            pol_entry["hexID_registered"] = hex_registered
-                        pol_map[day] = pol_entry
-                        # Ensure software requirement fields are present immediately so the UI shows them
-                        try:
-                            software_required = required_versions.get("software_version")
-                            if isinstance(software_required, str) and software_required:
-                                software_info["software_version_needed"] = software_required
-                                try:
-                                    software_info["software_uptodate"] = (cmp_ver(SOFTWARE_VERSION, software_required) >= 0)
-                                except Exception:
-                                    software_info["software_uptodate"] = None
-                            else:
-                                if not isinstance(software_info.get("software_uptodate"), bool):
-                                    software_info["software_uptodate"] = None
-                        except Exception:
-                            pass
+            except Exception:
+                # If we cannot read requirement, proceed; next loop will try again
+                pass
 
-                        # For AEM miners, add PoI (Proof of Installed)
-                        miner_type_val = existing_doc.get("miner_type") if isinstance(existing_doc.get("miner_type"), str) else MINER_CODE
-                        poi_data = None
-                        if miner_type_val == "AEM":
-                            poi_data = monitor_poi_for_aem()
-                            pod_map = None
-                        new_doc = _compose_hardware_doc(
-                            miner_key,
-                            miner_type=miner_type_val,
-                            mac=mac_info,
-                            software=software_info,
-                            poc=poc_map,
-                            pod=pod_map,
-                            pol=pol_map,
-                            last_updated=now_utc(),
-                            poi=poi_data,
-                            poi_slots=None,
-                        )
-                        try:
-                            coll.replace_one({"miner_key": miner_key}, new_doc, upsert=True)
-                        except Exception:
-                            pass
+            # Also capture the registered MAC (best-effort), even if version fetch failed
+            try:
+                mac_registered = registered_mac_from_devices(client, miner_key)
+            except Exception:
+                mac_registered = mac_registered or None
+
+            # Populate hardware document immediately so UI shows registered values
+            try:
+                hex_registered = None
+                try:
+                    hex_registered = registered_hexid_from_devices(client, miner_key)
+                except Exception:
+                    hex_registered = None
+                try:
+                    existing_doc = _get_existing_hardware_doc(coll, miner_key)
+                    mac_info = _extract_mac_fields(existing_doc)
+                    software_info = _extract_software_fields(existing_doc)
+                    poc_map = _extract_poc_map(existing_doc)
+                    pod_map = _extract_pod_map(existing_doc)
+                    pol_map = _extract_pol_map(existing_doc)
+                    # update registered values if present
+                    # prefer the local selected miner MAC when available so the UI can show a match immediately
+                    if isinstance(miner_mac_local, str) and miner_mac_local:
+                        mac_info["miner_mac"] = miner_mac_local
+                    if isinstance(mac_registered, str) and mac_registered:
+                        mac_info["mac_registered"] = mac_registered
+                    # compute mac_match using the same normalization rules as write_status
+                    try:
+                        def _norm_mac_start(v: Optional[str]) -> str:
+                            try:
+                                return re.sub(r"[^0-9a-f]", "", (v or "").lower())
+                            except Exception:
+                                return ""
+                        norm_miner_start = _norm_mac_start(mac_info.get("miner_mac"))
+                        norm_registered_start = _norm_mac_start(mac_info.get("mac_registered"))
+                        mac_info["mac_match"] = bool(norm_miner_start and norm_registered_start and norm_miner_start == norm_registered_start)
+                    except Exception:
+                        pass
+                    day = day_iso(now_utc())
+                    pol_entry = pol_map.get(day) or {}
+                    if isinstance(hex_registered, str) and hex_registered:
+                        pol_entry["hexID_registered"] = hex_registered
+                    pol_map[day] = pol_entry
+                    # Ensure software requirement fields are present immediately so the UI shows them
+                    try:
+                        software_required = required_versions.get("software_version")
+                        if isinstance(software_required, str) and software_required:
+                            software_info["software_version_needed"] = software_required
+                            try:
+                                software_info["software_uptodate"] = (cmp_ver(SOFTWARE_VERSION, software_required) >= 0)
+                            except Exception:
+                                software_info["software_uptodate"] = None
+                        else:
+                            if not isinstance(software_info.get("software_uptodate"), bool):
+                                software_info["software_uptodate"] = None
+                    except Exception:
+                        pass
+
+                    # For AEM miners, add PoI (Proof of Installed)
+                    miner_type_val = existing_doc.get("miner_type") if isinstance(existing_doc.get("miner_type"), str) else MINER_CODE
+                    poi_data = None
+                    if miner_type_val == "AEM":
+                        poi_data = monitor_poi_for_aem()
+                        pod_map = None
+                    new_doc = _compose_hardware_doc(
+                        miner_key,
+                        miner_type=miner_type_val,
+                        mac=mac_info,
+                        software=software_info,
+                        poc=poc_map,
+                        pod=pod_map,
+                        pol=pol_map,
+                        last_updated=now_utc(),
+                        poi=poi_data,
+                        poi_slots=None,
+                    )
+                    try:
+                        coll.replace_one({"miner_key": miner_key}, new_doc, upsert=True)
                     except Exception:
                         pass
                 except Exception:
                     pass
             except Exception:
-                # If we cannot read requirement, proceed; next loop will try again
                 pass
 
             try:
@@ -2594,19 +3286,21 @@ def main():
         expected_groups = expected_measurement_groups()
         pod_slot_ok = False if expected_groups else True
         delivered_groups: List[str] = []
-        if MINER_CODE != "AEM" or expected_groups:
-            try:
-                pod_slot_ok, delivered_groups = upload_measurements_for_slot(
-                    client,
-                    miner_key,
-                    install_id,
-                    expected_groups=expected_groups,
-                )
-            except Exception as e:
-                log.error("Measurement upload error: %s", e)
-                pod_slot_ok = False if expected_groups else True
-        else:
-            pod_slot_ok = True
+        rewards_multiplier_value = _rewards_multiplier_for_slot(slot_ts, interval, miner_mac_local, mac_registered, poi_snapshot)
+        if expected_groups:
+            if status_raw == "online":
+                try:
+                    pod_slot_ok, delivered_groups = upload_measurements_for_slot(
+                        client,
+                        miner_key,
+                        install_id,
+                        expected_groups=expected_groups,
+                    )
+                except Exception as e:
+                    log.error("Measurement upload error: %s", e)
+                    pod_slot_ok = False
+            else:
+                pod_slot_ok = False
         if expected_groups and not pod_slot_ok:
             try:
                 log.debug(

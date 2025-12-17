@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Union
 from pathlib import Path
 
 import requests
+import platform as _platform
 
 # Use string forward-references for optional optimized client type to avoid
 # import cycles at runtime. The optimized client is imported dynamically
@@ -79,22 +80,67 @@ class ExternalApiClient:
             raise ApiError(f"{method} {url} returned invalid JSON: {exc}") from exc
 
     def get_required_version(self, miner_code: str, *, platform: Optional[str] = None) -> Dict[str, str]:
-        """GET {base}/versions/{miner_code}?platform=<windows|linux>
+        """GET {base}/versions/{miner_code}?platform=<windows|linux|test-windows|test-linux>
 
-        Returns dict with software_version and poc_version keys.
+        Returns dict with software_version and poc_version keys (mapped from
+        the platform object fields software_version_needed/poc_version_needed).
+        Falls back to host platform if platform is not provided.
         """
+
+        def _extract(section: Any) -> Dict[str, str]:
+            out: Dict[str, str] = {}
+            if isinstance(section, dict):
+                sw = section.get("software_version_needed")
+                poc = section.get("poc_version_needed")
+                if isinstance(sw, str) and sw.strip():
+                    out["software_version"] = sw.strip()
+                if isinstance(poc, str) and poc.strip():
+                    out["poc_version"] = poc.strip()
+            return out
+
         params: Dict[str, Any] = {}
-        if isinstance(platform, str) and platform.strip():
-            params["platform"] = platform.strip().lower()
+        platform_key = platform.strip().lower() if isinstance(platform, str) and platform.strip() else None
+        if platform_key:
+            params["platform"] = platform_key
+
         data = self._request("GET", f"/versions/{miner_code}", params=params or None)
+        if not isinstance(data, dict):
+            return {}
+
+        # If a platform was requested explicitly, use only that section
+        if platform_key:
+            # 404 should be raised by API; here we just parse if present
+            section = data.get(platform_key)
+            if isinstance(section, bool):
+                section = None
+            result = _extract(section)
+            if result:
+                return result
+
+        # Fallback: pick host platform if available
+        try:
+            host_platform = "windows" if _platform.system().lower().startswith("win") else "linux"
+        except Exception:
+            host_platform = None
+
+        for key in [platform_key, host_platform, "windows", "linux", "test-windows", "test-linux"]:
+            if not key:
+                continue
+            section = data.get(key)
+            if isinstance(section, bool):
+                section = None
+            result = _extract(section)
+            if result:
+                return result
+
+        # Legacy compatibility: fall back to flat fields if present
         result: Dict[str, str] = {}
-        if isinstance(data, dict):
-            software = data.get("software_version")
-            poc = data.get("poc_version")
-            if isinstance(software, str) and software.strip():
-                result["software_version"] = software.strip()
-            if isinstance(poc, str) and poc.strip():
-                result["poc_version"] = poc.strip()
+        software = data.get("software_version")
+        poc = data.get("poc_version")
+        if isinstance(software, str) and software.strip():
+            result["software_version"] = software.strip()
+        if isinstance(poc, str) and poc.strip():
+            result["poc_version"] = poc.strip()
         return result
 
     def get_miner_profile(self, miner_key: str) -> Dict[str, Any]:
