@@ -61,14 +61,11 @@ _COUNTRIES: Optional[List[Tuple[str, Any]]] = None
 _GEOIP_READER: Optional[Any] = None
 _GEOIP_LOG_STATE: Optional[str] = None
 
-
-
 from cryptography.fernet import Fernet
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 
 import config_profile as _cfg
-
 
 def _guess_gui_version_from_fs() -> str:
     """Best-effort: infer GUI/agent version from local binaries.
@@ -105,7 +102,6 @@ def _guess_gui_version_from_fs() -> str:
     except Exception:
         return ""
 
-
 MINER_CODE = getattr(_cfg, "MINER_CODE", "")
 VERSION = getattr(_cfg, "VERSION", "")
 GUI_VERSION = _guess_gui_version_from_fs()
@@ -114,7 +110,6 @@ POC_VERSION = getattr(_cfg, "POC_VERSION", VERSION)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("miner-online")
-_LOG_ONCE: dict[str, bool] = {}
 _CRIT_FAILURES: dict[str, int] = {}
 
 
@@ -137,10 +132,8 @@ def _record_critical_failure(key: str, msg: str, *, threshold: int = 2, exit_cod
     except Exception:
         pass
 
-
 def _reset_critical_failure(key: str) -> None:
     _CRIT_FAILURES.pop(key, None)
-
 
 def _write_stop_reason(reason: str, *, miner_key: Optional[str] = None) -> None:
     """Persist last stop reason for GUI consumption."""
@@ -154,18 +147,6 @@ def _write_stop_reason(reason: str, *, miner_key: Optional[str] = None) -> None:
         atomic_write_json(path, payload)
     except Exception:
         pass
-
-
-def _log_once(key: str, level: int, msg: str, *args: Any) -> None:
-    """Log a message once per key to avoid spam."""
-    if key in _LOG_ONCE:
-        return
-    _LOG_ONCE[key] = True
-    try:
-        log.log(level, msg, *args)
-    except Exception:
-        pass
-
 
 def _init_service_file_logging() -> None:
     """Attach a file handler under the ProgramData logs folder for service diagnostics."""
@@ -318,12 +299,10 @@ _POI_STATE: Dict[str, Any] = {
     "last_poi": None,
 }
 
-
 def _update_poi_state(**kwargs: Any) -> None:
     with _POI_STATE_LOCK:
         _POI_STATE.update(kwargs)
     _POI_STATE_READY.set()
-
 
 def _get_poi_state_snapshot(wait: bool = False, timeout: Optional[float] = None) -> Dict[str, Any]:
     if wait:
@@ -402,7 +381,6 @@ def _get_existing_hardware_doc(coll, miner_key: str) -> dict[str, Any]:
     except Exception:
         pass
     return {}
-
 
 def _extract_mac_fields(doc: dict[str, Any]) -> dict[str, Any]:
     info: dict[str, Any] = {"miner_mac": "", "mac_registered": "", "mac_match": False}
@@ -500,7 +478,6 @@ def _extract_software_fields(doc: dict[str, Any]) -> dict[str, Any]:
     _ingest(doc.get("software"))
     return info
 
-
 def _compose_hardware_doc(
     miner_key: str,
     *,
@@ -541,7 +518,6 @@ def _compose_hardware_doc(
         doc["PoI_slots"] = poi_slots
 
     return doc
-
 
 def _host_norms() -> tuple[str, str]:
     """Return (full_norm, base_norm) for the current host.
@@ -925,110 +901,6 @@ def _compute_rewards_multiplier(
     # Non-BM/AEM: gate passed -> full multiplier
     return 1.0
 
-def _compute_day_multiplier_avg(slots_by_hour: Dict[str, Any], day_prefix: str) -> Optional[float]:
-    """Average all numeric slot values for hours matching the given YYYYMMDD prefix."""
-    if not isinstance(slots_by_hour, dict):
-        return None
-    values: list[float] = []
-    for hk, entry in slots_by_hour.items():
-        if not isinstance(hk, str) or not hk.startswith(day_prefix):
-            continue
-        slots = entry.get("slots") if isinstance(entry, dict) else None
-        if not isinstance(slots, list):
-            continue
-        for v in slots:
-            if isinstance(v, (int, float)):
-                values.append(float(v))
-            else:
-                values.append(0.0)
-    if not values:
-        return None
-    return round(sum(values) / len(values), 3)
-
-def _rewards_multiplier_for_slot(
-    ts: dt.datetime,
-    interval_seconds: int,
-    miner_mac: Optional[str],
-    mac_registered: Optional[str],
-    poi_data: Optional[bool],
-) -> float:
-    """Best-effort rewards multiplier for current slot using local state."""
-    try:
-        hour, slot = hour_and_slot(ts, interval_seconds)
-        local_doc: dict[str, Any] = {}
-        try:
-            cache_doc = read_local_cache(cache_path_for(ts))
-            if isinstance(cache_doc, dict):
-                local_doc = cache_doc
-        except Exception:
-            local_doc = {}
-
-        poc_slot_ok = False
-        try:
-            hours_local = local_doc.get("hours") if isinstance(local_doc, dict) else {}
-            if isinstance(hours_local, dict):
-                h_entry = hours_local.get(str(hour))
-                slots = h_entry.get("slots") if isinstance(h_entry, dict) else None
-                if isinstance(slots, list) and slot < len(slots):
-                    poc_slot_ok = (slots[slot] == "online")
-        except Exception:
-            pass
-
-        pod_slot_ok = False
-        try:
-            pod_hours_local = local_doc.get("podHours") if isinstance(local_doc, dict) else {}
-            if isinstance(pod_hours_local, dict):
-                pod_entry = pod_hours_local.get(str(hour))
-                pod_slots_list = pod_entry.get("slots") if isinstance(pod_entry, dict) else None
-                if isinstance(pod_slots_list, list) and slot < len(pod_slots_list):
-                    pod_slot_ok = bool(pod_slots_list[slot])
-        except Exception:
-            pass
-
-        poi_slot_ok: Optional[bool] = None
-        if MINER_CODE == "AEM":
-            poi_slot_ok = bool(poi_data)
-
-        def _norm_mac(value: Optional[str]) -> str:
-            try:
-                return re.sub(r"[^0-9a-f]", "", (value or "").lower())
-            except Exception:
-                return ""
-
-        norm_miner = _norm_mac(miner_mac)
-        norm_registered = _norm_mac(mac_registered)
-        mac_match = bool(norm_miner and norm_registered and norm_miner == norm_registered)
-
-        bright_active = False
-        honeygain_active = False
-        mysterium_active = False
-        if MINER_CODE == "BM":
-            try:
-                bright_active = sdk_approved("bright")
-            except Exception:
-                bright_active = False
-            try:
-                honeygain_active = sdk_approved("honeygain")
-            except Exception:
-                honeygain_active = False
-            try:
-                mysterium_active = sdk_approved("mysterium")
-            except Exception:
-                mysterium_active = False
-
-        return _compute_rewards_multiplier(
-            MINER_CODE,
-            mac_match,
-            poc_slot_ok,
-            pod_slot_ok,
-            poi_slot_ok,
-            bright_active,
-            honeygain_active,
-            mysterium_active,
-        )
-    except Exception:
-        return 0.0
-
 def _get_boot_time_iso() -> Optional[str]:
     """Return system boot time as ISO string in UTC if available."""
     try:
@@ -1037,31 +909,6 @@ def _get_boot_time_iso() -> Optional[str]:
         return dt.datetime.fromtimestamp(bt, UTC).replace(microsecond=0).isoformat()
     except Exception:
         return None
-
-def _compute_uptime_24h_from_slots(poc_slots: Dict[str, Any], ts: dt.datetime, interval_seconds: int) -> tuple[float, float]:
-    """Compute uptime/downtime seconds over the last 24h window from PoC slots."""
-    if not isinstance(poc_slots, dict):
-        return 0.0, 0.0
-    window_start = ts - dt.timedelta(hours=24)
-    online_slots = 0
-    total_slots = 0
-    for hk, entry in poc_slots.items():
-        if not isinstance(hk, str) or not isinstance(entry, dict):
-            continue
-        try:
-            hour_start = dt.datetime.strptime(hk, "%Y%m%d%H").replace(tzinfo=UTC)
-        except Exception:
-            continue
-        if hour_start < window_start or hour_start > ts:
-            continue
-        slots = entry.get("slots")
-        if not isinstance(slots, list):
-            continue
-        online_slots += sum(1 for s in slots if bool(s))
-        total_slots += len(slots)
-    uptime_seconds = float(online_slots * max(1, interval_seconds))
-    downtime_seconds = float(max(0, (total_slots - online_slots)) * max(1, interval_seconds))
-    return uptime_seconds, downtime_seconds
 
 def get_miner_type_offset() -> int:
     """Return the time offset in seconds for this miner type to stagger API calls.
@@ -2554,7 +2401,6 @@ def _start_poi_local_loop(miner_key: str, interval_seconds: int, poll_seconds: i
 
     threading.Thread(target=_loop, name="poi-week-monitor", daemon=True).start()
 
-
 def _maxmind_db_path() -> pathlib.Path:
     env = os.getenv("MAXMIND_DB_PATH")
     if isinstance(env, str) and env.strip():
@@ -2589,7 +2435,6 @@ def _maxmind_db_path() -> pathlib.Path:
     # Fall back to the app directory even if the file is missing; caller will raise
     return pathlib.Path(app_dir()) / "GeoLite2-Country.mmdb"
 
-
 def _download_once(url: str, dest: pathlib.Path) -> None:
     if dest.exists():
         return
@@ -2609,7 +2454,6 @@ def _download_once(url: str, dest: pathlib.Path) -> None:
         except Exception:
             pass
         raise
-
 
 def _ensure_countries() -> List[Tuple[str, Any]]:
     global _COUNTRIES
@@ -2657,7 +2501,6 @@ def _ensure_countries() -> List[Tuple[str, Any]]:
     _COUNTRIES = out
     return _COUNTRIES
 
-
 def _get_geoip_reader():
     global _GEOIP_READER, _GEOIP_LOG_STATE
     if _GEOIP_READER is not None:
@@ -2688,7 +2531,6 @@ def _get_geoip_reader():
         _GEOIP_READER = None
     return _GEOIP_READER
 
-
 def _public_ip(timeout: float = 4.0) -> Optional[str]:
     try:
         resp = requests.get("https://api.ipify.org", params={"format": "json"}, timeout=timeout)
@@ -2700,7 +2542,6 @@ def _public_ip(timeout: float = 4.0) -> Optional[str]:
     except Exception:
         pass
     return None
-
 
 def _ip_to_country(ip: str) -> Tuple[Optional[str], Optional[str], bool]:
     reader = _get_geoip_reader()
@@ -2723,7 +2564,6 @@ def _ip_to_country(ip: str) -> Tuple[Optional[str], Optional[str], bool]:
         except Exception:
             pass
     return None, None, False
-
 
 def _h3_to_country(h3_index: Optional[str], area_threshold: float = COUNTRY_AREA_THRESHOLD) -> Tuple[Optional[str], Optional[float], bool]:
     if not (h3_index and HAVE_H3 and HAVE_SHAPELY and h3):
@@ -2779,7 +2619,6 @@ def _h3_to_country(h3_index: Optional[str], area_threshold: float = COUNTRY_AREA
         return None, best_share, True
     return None, None, True
 
-
 def check_country_once(h3_index: Optional[str], *, area_threshold: float = COUNTRY_AREA_THRESHOLD, ip: Optional[str] = None) -> Dict[str, Any]:
     ip_value = ip if isinstance(ip, str) and ip else None
     if not ip_value:
@@ -2807,7 +2646,6 @@ def check_country_once(h3_index: Optional[str], *, area_threshold: float = COUNT
         "country_dataset_ready": dataset_ready,
     }
 
-
 def registered_hexid_from_devices(client: MongoProxyClient, miner_key: str) -> Optional[str]:
     """Return hexId (res7) from main.devices for this miner_key."""
     try:
@@ -2831,7 +2669,6 @@ def registered_hexid_from_devices(client: MongoProxyClient, miner_key: str) -> O
     except Exception as e:
         _record_critical_failure(f"hexid-error-{miner_key}", f"Failed to fetch hexId for {miner_key}: {e}", miner_key=miner_key)
     return None
-
 
 def write_location_daily(
     coll,
@@ -2921,7 +2758,6 @@ def write_location_daily(
         )
     except Exception:
         pass
-
 
 def registered_mac_from_devices(client: MongoProxyClient, miner_key: str) -> Optional[str]:
     """Return the registered MAC for a miner_key from creds.hardware.miner_mac.
