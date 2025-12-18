@@ -500,84 +500,12 @@ def _extract_software_fields(doc: dict[str, Any]) -> dict[str, Any]:
     _ingest(doc.get("software"))
     return info
 
-def _extract_poc_map(doc: dict[str, Any]) -> dict[str, float]:
-    result: dict[str, float] = {}
-    if not isinstance(doc, dict):
-        return result
-    poc_obj = doc.get("PoC")
-    if isinstance(poc_obj, dict):
-        for key, value in poc_obj.items():
-            date_key = key
-            percent_val = value
-            if isinstance(value, dict):
-                if isinstance(value.get("date"), str) and value.get("date"):
-                    date_key = value["date"]
-                percent_val = value.get("OnlinePercentDay")
-            try:
-                if isinstance(date_key, str) and date_key:
-                    if isinstance(percent_val, (int, float)):
-                        result[date_key] = float(percent_val)
-                    elif isinstance(percent_val, str):
-                        result[date_key] = float(percent_val)
-            except (TypeError, ValueError):
-                continue
-    return result
-
-def _extract_pod_map(doc: dict[str, Any]) -> dict[str, float]:
-    result: dict[str, float] = {}
-    if not isinstance(doc, dict):
-        return result
-    pod_obj = doc.get("PoD")
-    if isinstance(pod_obj, dict):
-        for key, value in pod_obj.items():
-            date_key = key
-            percent_val = value
-            if isinstance(value, dict):
-                if isinstance(value.get("date"), str) and value.get("date"):
-                    date_key = value["date"]
-                percent_val = value.get("Percent")
-                if percent_val is None:
-                    percent_val = value.get("PoDPercent")
-            try:
-                if isinstance(date_key, str) and date_key:
-                    if isinstance(percent_val, (int, float)):
-                        result[date_key] = float(percent_val)
-                    elif isinstance(percent_val, str):
-                        result[date_key] = float(percent_val)
-            except (TypeError, ValueError):
-                continue
-    return result
-
-
-def _extract_pol_map(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    result: dict[str, dict[str, Any]] = {}
-    if not isinstance(doc, dict):
-        return result
-    pol_obj = doc.get("PoL")
-    if isinstance(pol_obj, dict):
-        for key, value in pol_obj.items():
-            if isinstance(value, dict):
-                entry: dict[str, Any] = {
-                    "ip": value.get("ip"),
-                    "hexID_registered": value.get("hexID_registered") or value.get("hexId") or value.get("hexId_registered"),
-                    "ipCountry": value.get("ipCountry"),
-                    "hexCountry": value.get("hexCountry"),
-                    "country_match": value.get("country_match") if isinstance(value.get("country_match"), bool) else None,
-                }
-                if entry["country_match"] is None and isinstance(value.get("sameCountry"), bool):
-                    entry["country_match"] = value.get("sameCountry")
-                result[str(key)] = entry
-    return result
 
 def _compose_hardware_doc(
     miner_key: str,
     *,
     miner_type: Optional[str],
-    mac: dict[str, Any],
     software: dict[str, Any],
-    poc: dict[str, float],
-    pod: Optional[dict[str, float]],
-    pol: dict[str, dict[str, Any]],
     last_updated: dt.datetime,
     poi: Optional[bool] = None,
     poi_slots: Optional[dict[str, Any]] = None,
@@ -585,59 +513,34 @@ def _compose_hardware_doc(
     doc: dict[str, Any] = {}
     doc["miner_key"] = miner_key
     doc["miner_type"] = (miner_type or MINER_CODE)
-    def _format_mac_display(value: Optional[str]) -> str:
-        try:
-            if not isinstance(value, str) or not value:
-                return ""
-            # strip non-hex chars
-            norm = re.sub(r"[^0-9a-fA-F]", "", value)
-            if len(norm) != 12:
-                # fallback: return original string unchanged
-                return value
-            norm = norm.upper()
-            return ":".join(norm[i : i + 2] for i in range(0, 12, 2))
-        except Exception:
-            return value or ""
 
-    doc["mac"] = {
-        "miner_mac": _format_mac_display(mac.get("miner_mac") or ""),
-        "mac_registered": _format_mac_display(mac.get("mac_registered") or ""),
-        "mac_match": bool(mac.get("mac_match")),
-    }
     host_os = "windows" if platform.system().lower().startswith("win") else "linux"
     doc["software"] = {
         "os": software.get("os") if isinstance(software.get("os"), str) and software.get("os") else host_os,
-        "software_version_installed": software.get("software_version_installed") if isinstance(software.get("software_version_installed"), str) and software.get("software_version_installed") else SOFTWARE_VERSION,
-        "software_version_needed": software.get("software_version_needed") if isinstance(software.get("software_version_needed"), str) and software.get("software_version_needed") else None,
+        "software_version_installed": software.get("software_version_installed")
+        if isinstance(software.get("software_version_installed"), str) and software.get("software_version_installed")
+        else SOFTWARE_VERSION,
+        "software_version_needed": software.get("software_version_needed")
+        if isinstance(software.get("software_version_needed"), str) and software.get("software_version_needed")
+        else None,
         "software_uptodate": software.get("software_uptodate") if isinstance(software.get("software_uptodate"), bool) else None,
         "poc_version_installed": software.get("poc_version_installed") or POC_VERSION,
-        "poc_version_needed": software.get("poc_version_needed") if isinstance(software.get("poc_version_needed"), str) and software.get("poc_version_needed") else None,
+        "poc_version_needed": software.get("poc_version_needed")
+        if isinstance(software.get("poc_version_needed"), str) and software.get("poc_version_needed")
+        else None,
         "poc_uptodate": software.get("poc_uptodate") if isinstance(software.get("poc_uptodate"), bool) else None,
-        "is_uptodate": software.get("is_uptodate") if isinstance(software.get("is_uptodate"), bool) else None
+        "is_uptodate": software.get("is_uptodate") if isinstance(software.get("is_uptodate"), bool) else None,
     }
 
-    doc["PoC"] = {str(k): float(v) for k, v in poc.items()}
-    if pod is not None:
-        doc["PoD"] = {str(k): float(v) for k, v in pod.items()}
-    pol_compact: dict[str, dict[str, Any]] = {}
-    for key in sorted(pol.keys()):
-        value = pol[key] or {}
-        pol_compact[str(key)] = {
-            "ip": value.get("ip"),
-            "hexID_registered": value.get("hexID_registered") or value.get("hexId") or value.get("hexId_registered"),
-            "ipCountry": value.get("ipCountry"),
-            "hexCountry": value.get("hexCountry"),
-            "country_match": value.get("country_match") if isinstance(value.get("country_match"), bool) else None,
-        }
-    doc["PoL"] = pol_compact
+    # IMPORTANT: lastUpdated = slot activity only (write_status controls this)
     doc["lastUpdated"] = last_updated.isoformat()
-    # Add PoI only for AEM miners when state is known
-    if (doc.get("miner_type") == "AEM" or (miner_type == "AEM")) and poi is not None:
+
+    if (doc.get("miner_type") == "AEM" or miner_type == "AEM") and poi is not None:
         doc["PoI"] = bool(poi)
     if poi_slots is not None:
         doc["PoI_slots"] = poi_slots
-    return doc
 
+    return doc
 
 
 def _host_norms() -> tuple[str, str]:
@@ -995,32 +898,6 @@ def hour_and_slot(ts: dt.datetime, interval_seconds: int) -> tuple[int, int]:
     """
     sec_in_hour = ts.minute * 60 + ts.second
     return ts.hour, sec_in_hour // max(1, interval_seconds)
-
-def _ensure_slot_entry(container: Dict[str, Any], hour_key: str, slots_per_hour: int, fill: Any) -> Dict[str, Any]:
-    """Ensure a slot entry exists for an hour, padded/truncated to slots_per_hour."""
-    entry = container.get(hour_key)
-    if not isinstance(entry, dict):
-        entry = {}
-    slots = entry.get("slots")
-    if not isinstance(slots, list):
-        slots = []
-    if len(slots) < slots_per_hour:
-        slots = (slots + [fill] * slots_per_hour)[:slots_per_hour]
-    else:
-        slots = slots[:slots_per_hour]
-    entry["slots"] = slots
-    container[hour_key] = entry
-    return entry
-
-def _prune_slot_hours(container: Dict[str, Any], keep_hours: int = 336) -> Dict[str, Any]:
-    """Return a new dict keeping only the most recent keep_hours keys (sorted). Default ~14 days @1h keys."""
-    if not isinstance(container, dict):
-        return {}
-    keys = sorted([k for k in container.keys() if isinstance(k, str)])
-    if len(keys) <= keep_hours:
-        return {k: container[k] for k in keys}
-    keep = keys[-keep_hours:]
-    return {k: container[k] for k in keep}
 
 def _compute_rewards_multiplier(
     miner_type: str,
@@ -1529,7 +1406,11 @@ def verify_or_acquire_installation_lease(client: MongoProxyClient, miner_key: st
     log.error("Failed to verify or acquire lease after %d attempts", max_retries)
     return False
 
+def _as_dict(v: Any) -> Dict[str, Any]:
+    return v if isinstance(v, dict) else {}
 
+def _as_list(v: Any) -> List[Any]:
+    return v if isinstance(v, list) else []
 
 def write_status(
     coll,
@@ -1543,27 +1424,21 @@ def write_status(
     mac_registered: Optional[str] = None,
     poi_data: Optional[bool] = None,
 ) -> None:
-    day = day_iso(ts)
+    # --- time / slot basics ---
+    day = day_iso(ts)  # "YYYY-MM-DD"
     hour, slot = hour_and_slot(ts, interval_seconds)
-
     slots_per_hour = max(1, 3600 // max(1, interval_seconds))
     day_total_full = 24 * slots_per_hour
 
-    existing_doc = _get_existing_hardware_doc(coll, miner_key)
-    miner_type_val = existing_doc.get("miner_type") if isinstance(existing_doc.get("miner_type"), str) else MINER_CODE
-    existing_poc = _extract_poc_map(existing_doc)
-    existing_pod = _extract_pod_map(existing_doc)
-    existing_pol = _extract_pol_map(existing_doc)
-    mac_slots = cast(Dict[str, Any], existing_doc.get("mac_slots") if isinstance(existing_doc.get("mac_slots"), dict) else {})
-    poc_slots = cast(Dict[str, Any], existing_doc.get("PoC_slots") if isinstance(existing_doc.get("PoC_slots"), dict) else {})
-    pod_slots = cast(Dict[str, Any], existing_doc.get("PoD_slots") if isinstance(existing_doc.get("PoD_slots"), dict) else {})
-    bandwidth_tools_slots = cast(Dict[str, Any], existing_doc.get("bandwidth_tools_slots") if isinstance(existing_doc.get("bandwidth_tools_slots"), dict) else {})
-    rewards_multiplier_slots = cast(Dict[str, Any], existing_doc.get("rewards_multiplier_slots") if isinstance(existing_doc.get("rewards_multiplier_slots"), dict) else {})
-    uptime_info_existing = existing_doc.get("uptime") if isinstance(existing_doc.get("uptime"), dict) else {}
-    boot_time_existing = existing_doc.get("boot_time")
-    mac_info = _extract_mac_fields(existing_doc)
-    software_info = _extract_software_fields(existing_doc)
+    checked_at_iso = ts.isoformat()
 
+    # --- read existing doc safely ---
+    existing_doc_raw = _get_existing_hardware_doc(coll, miner_key)
+    existing_doc: Dict[str, Any] = existing_doc_raw if isinstance(existing_doc_raw, dict) else {}
+
+    miner_type_val = existing_doc.get("miner_type") if isinstance(existing_doc.get("miner_type"), str) else MINER_CODE
+
+    # --- local cache ---
     local_doc: dict[str, Any] = {}
     try:
         cache_doc = read_local_cache(cache_path_for(ts))
@@ -1572,53 +1447,30 @@ def write_status(
     except Exception:
         local_doc = {}
 
+    # --- compute elapsed slots + uptime counters (Option A: so-far-today) ---
     slots_elapsed = hour * slots_per_hour + (slot + 1)
+    slots_elapsed = max(1, min(day_total_full, slots_elapsed))
+
     day_online_so_far = 0
     local_online = local_doc.get("onlineCountDay") if isinstance(local_doc, dict) else None
     local_total = local_doc.get("totalSlotsDay") if isinstance(local_doc, dict) else None
+
     if isinstance(local_online, int) and isinstance(local_total, int) and local_total > 0:
         slots_elapsed = max(1, min(day_total_full, local_total))
         day_online_so_far = max(0, min(local_online, slots_elapsed))
     elif isinstance(local_online, int):
         day_online_so_far = max(0, min(local_online, slots_elapsed))
 
-    local_percent = local_doc.get("onlinePercentDay") if isinstance(local_doc, dict) else None
-    day_percent: Optional[float] = None
-    if isinstance(local_percent, (int, float)):
-        day_percent = round(float(local_percent), 1)
-    elif isinstance(local_total, int) and local_total > 0:
-        day_percent = round(100.0 * day_online_so_far / max(1, local_total), 1)
-
-    poc_percent: Optional[float] = float(day_percent) if isinstance(day_percent, (int, float)) else None
-
-    pod_count = local_doc.get("podCountDay") if isinstance(local_doc, dict) else None
-    pod_total = local_doc.get("podTotalSlotsDay") if isinstance(local_doc, dict) else None
-    pod_percent_local = local_doc.get("podPercentDay") if isinstance(local_doc, dict) else None
-    pod_percent: Optional[float] = None
-    if isinstance(pod_percent_local, (int, float)):
-        pod_percent = round(float(pod_percent_local), 1)
-    elif isinstance(pod_count, int) and isinstance(pod_total, int) and pod_total > 0:
-        pod_percent = round(100.0 * max(0, min(pod_count, pod_total)) / max(1, pod_total), 1)
-
-    if pod_percent is not None:
-        existing_pod[day] = float(pod_percent)
-    pod_keys = sorted(existing_pod.keys())[-MAX_POC_DAYS:]
-    pod_compact = {key: float(existing_pod[key]) for key in pod_keys}
-    if poc_percent is not None:
-        poc_value = round(float(apply_bm_sdk_cap(poc_percent)), 1)
-        existing_poc[day] = poc_value
-    poc_keys = sorted(existing_poc.keys())[-MAX_POC_DAYS:]
-    poc_compact = {key: float(existing_poc[key]) for key in poc_keys}
-    # For AEM, PoD is redundant; drop it so UI shows PoC + PoI only.
-    if miner_type_val == "AEM":
-        pod_compact = None
-
-    # PoI slots (AEM only): include percentDay plus per-hour slots
+    # --- AEM PoI slots (keep existing format) ---
     poi_slots: Optional[dict[str, Any]] = None
+    poi_slot_ok: Optional[bool] = None
     if miner_type_val == "AEM":
+        poi_slot_ok = bool(poi_data)
+
         poi_count = local_doc.get("poiCountDay") if isinstance(local_doc, dict) else None
         poi_total = local_doc.get("poiTotalSlotsDay") if isinstance(local_doc, dict) else None
         poi_percent_local = local_doc.get("poiPercentDay") if isinstance(local_doc, dict) else None
+
         if isinstance(poi_percent_local, (int, float)):
             poi_percent = round(float(poi_percent_local), 1)
         elif isinstance(poi_count, int) and isinstance(poi_total, int) and poi_total > 0:
@@ -1626,7 +1478,6 @@ def write_status(
         else:
             poi_percent = None
 
-        slots_per_hour = max(1, 3600 // max(1, interval_seconds))
         poi_hours_clean: dict[str, list[bool]] = {}
         poi_hours_raw = local_doc.get("poiHours") if isinstance(local_doc, dict) else None
         if isinstance(poi_hours_raw, dict):
@@ -1638,14 +1489,21 @@ def write_status(
                 slots_val = entry.get("slots") or []
                 if not isinstance(slots_val, list):
                     continue
-                slots_clean = [bool(v) for v in slots_val[:slots_per_hour] if isinstance(v, bool)]
-                poi_hours_clean[key] = slots_clean
+                clean: list[bool] = []
+                for v in slots_val[:slots_per_hour]:
+                    if isinstance(v, bool):
+                        clean.append(bool(v))
+                if clean:
+                    poi_hours_clean[key] = clean
+
         if poi_percent is not None or poi_hours_clean:
             poi_slots = {
                 "percentDay": float(poi_percent) if poi_percent is not None else None,
                 "hours": poi_hours_clean,
             }
 
+    # --- MAC: compute mac_match + build mac_block (new structure) ---
+    mac_info = _extract_mac_fields(existing_doc)
     if isinstance(miner_mac, str) and miner_mac:
         mac_info["miner_mac"] = miner_mac
     if isinstance(mac_registered, str) and mac_registered:
@@ -1657,15 +1515,58 @@ def write_status(
         except Exception:
             return ""
 
-    norm_miner = _norm_mac(mac_info.get("miner_mac"))
-    norm_registered = _norm_mac(mac_info.get("mac_registered"))
-    mac_info["mac_match"] = bool(norm_miner and norm_registered and norm_miner == norm_registered)
+    norm_miner = _norm_mac(cast(Optional[str], mac_info.get("miner_mac")))
+    norm_registered = _norm_mac(cast(Optional[str], mac_info.get("mac_registered")))
+    mac_match = bool(norm_miner and norm_registered and norm_miner == norm_registered)
 
-    needed_value = software_version_needed.strip() if isinstance(software_version_needed, str) and software_version_needed.strip() else software_info.get("software_version_needed")
-    poc_needed_value = poc_version_needed.strip() if isinstance(poc_version_needed, str) and poc_version_needed.strip() else software_info.get("poc_version_needed")
+    existing_mac_raw = existing_doc.get("mac")
+    existing_mac: dict[str, Any] = existing_mac_raw if isinstance(existing_mac_raw, dict) else {}
+
+    mac_status_old = existing_mac.get("status") if isinstance(existing_mac.get("status"), bool) else None
+    last_changed_at = existing_mac.get("last_changed_at") if isinstance(existing_mac.get("last_changed_at"), str) else None
+    if mac_status_old is None or mac_status_old != mac_match:
+        last_changed_at = checked_at_iso
+    elif not last_changed_at:
+        last_changed_at = checked_at_iso
+
+    mac_block = {
+        "status": mac_match,
+        "last_changed_at": last_changed_at,
+        "last_checked_at": checked_at_iso,
+        "evidence": {
+            "miner_mac": mac_info.get("miner_mac"),
+            "registered_mac": mac_info.get("mac_registered"),
+        },
+    }
+
+    # --- PoL: carry forward from write_location_daily() ---
+    existing_pol_raw = existing_doc.get("pol")
+    pol_block: dict[str, Any] = existing_pol_raw if isinstance(existing_pol_raw, dict) else {
+        "status": False,
+        "last_changed_at": checked_at_iso,
+        "last_checked_at": checked_at_iso,
+        "evidence": {},
+    }
+    pol_status = pol_block.get("status") if isinstance(pol_block.get("status"), bool) else False
+
+    # --- software info (same logic as before, but no legacy maps) ---
+    software_info = _extract_software_fields(existing_doc)
+
+    needed_value = (
+        software_version_needed.strip()
+        if isinstance(software_version_needed, str) and software_version_needed.strip()
+        else software_info.get("software_version_needed")
+    )
+    poc_needed_value = (
+        poc_version_needed.strip()
+        if isinstance(poc_version_needed, str) and poc_version_needed.strip()
+        else software_info.get("poc_version_needed")
+    )
+
     software_info["software_version"] = SOFTWARE_VERSION
     software_info["software_version_installed"] = SOFTWARE_VERSION
     software_info["software_version_needed"] = needed_value
+
     if isinstance(needed_value, str) and needed_value:
         try:
             cmp_res = cmp_ver(SOFTWARE_VERSION, needed_value)
@@ -1681,6 +1582,7 @@ def write_status(
 
     software_info["poc_version_installed"] = POC_VERSION
     software_info["poc_version_needed"] = poc_needed_value if isinstance(poc_needed_value, str) and poc_needed_value else None
+
     if isinstance(poc_needed_value, str) and poc_needed_value:
         try:
             poc_cmp = cmp_ver(POC_VERSION, poc_needed_value)
@@ -1696,123 +1598,194 @@ def write_status(
 
     has_requirements = bool((software_info.get("software_version_needed") or software_info.get("poc_version_needed")))
     if has_requirements:
-        any_outdated = bool(
-            (software_info.get("software_outdated") is True) or
-            (software_info.get("poc_outdated") is True)
-        )
+        any_outdated = bool((software_info.get("software_outdated") is True) or (software_info.get("poc_outdated") is True))
         software_info["is_outdated"] = any_outdated
         software_info["is_uptodate"] = not any_outdated
     else:
         software_info["is_outdated"] = None
         software_info["is_uptodate"] = None
 
-    # Slot-level tracking (testing mode; keep recent hours only)
-    hour_key_str = hour_key(ts)
-    day_prefix = ts.strftime("%Y%m%d")
+    # --- slot-level PoC from local cache ---
     poc_slot_ok = False
     try:
-        hours_local = local_doc.get("hours") if isinstance(local_doc, dict) else {}
-        if isinstance(hours_local, dict):
-            h_entry = hours_local.get(str(hour))
-            slots = h_entry.get("slots") if isinstance(h_entry, dict) else None
-            if isinstance(slots, list) and slot < len(slots):
-                poc_slot_ok = (slots[slot] == "online")
+        hours_local_raw = local_doc.get("hours")
+        hours_local: dict[str, Any] = hours_local_raw if isinstance(hours_local_raw, dict) else {}
+
+        h_entry_raw = hours_local.get(str(hour))
+        h_entry: dict[str, Any] = h_entry_raw if isinstance(h_entry_raw, dict) else {}
+
+        slots_list_raw = h_entry.get("slots")
+        slots_list: list[Any] = slots_list_raw if isinstance(slots_list_raw, list) else []
+
+        if slot < len(slots_list):
+            poc_slot_ok = (slots_list[slot] == "online")
     except Exception:
         poc_slot_ok = (status == "online")
 
+    # --- slot-level PoD from local cache ---
     pod_slot_ok = False
     try:
-        pod_hours_local = local_doc.get("podHours") if isinstance(local_doc, dict) else {}
-        if isinstance(pod_hours_local, dict):
-            pod_entry = pod_hours_local.get(str(hour))
-            pod_slots_list = pod_entry.get("slots") if isinstance(pod_entry, dict) else None
-            if isinstance(pod_slots_list, list) and slot < len(pod_slots_list):
-                pod_slot_ok = bool(pod_slots_list[slot])
+        pod_hours_local_raw = local_doc.get("podHours")
+        pod_hours_local: dict[str, Any] = pod_hours_local_raw if isinstance(pod_hours_local_raw, dict) else {}
+
+        pod_entry_raw = pod_hours_local.get(str(hour))
+        pod_entry: dict[str, Any] = pod_entry_raw if isinstance(pod_entry_raw, dict) else {}
+
+        pod_slots_list_raw = pod_entry.get("slots")
+        pod_slots_list: list[Any] = pod_slots_list_raw if isinstance(pod_slots_list_raw, list) else []
+
+        if slot < len(pod_slots_list):
+            pod_slot_ok = bool(pod_slots_list[slot])
     except Exception:
         pod_slot_ok = False
 
-    poi_slot_ok: Optional[bool] = None
-    if miner_type_val == "AEM":
-        poi_slot_ok = bool(poi_data)
-
-    # BM bandwidth tools state (selected/active)
+    # --- BM bandwidth tools ---
     bright_active = False
     honeygain_active = False
     mysterium_active = False
-    bandwidth_slot_entry: Optional[dict[str, Any]] = None
+    selected_tools: list[str] = []
+
     if miner_type_val == "BM":
         try:
-            bright_active = sdk_approved("bright")
+            bright_active = bool(sdk_approved("bright"))
         except Exception:
             bright_active = False
         try:
-            honeygain_active = sdk_approved("honeygain")
+            honeygain_active = bool(sdk_approved("honeygain"))
         except Exception:
             honeygain_active = False
         try:
-            mysterium_active = sdk_approved("mysterium")
+            mysterium_active = bool(sdk_approved("mysterium"))
         except Exception:
             mysterium_active = False
-        selected_tools = [name for name, active in (("bright", bright_active), ("honeygain", honeygain_active), ("mysterium", mysterium_active)) if active]
-        bandwidth_slot_entry = {
-            "selected": selected_tools,
-            "active": selected_tools,
-        }
 
+        selected_tools = [name for name, active in (
+            ("bright", bright_active),
+            ("honeygain", honeygain_active),
+            ("mysterium", mysterium_active),
+        ) if active]
+
+    # --- compute multiplier ---
     rewards_multiplier_value = _compute_rewards_multiplier(
         miner_type_val if isinstance(miner_type_val, str) and miner_type_val else MINER_CODE,
-        bool(mac_info.get("mac_match")),
-        poc_slot_ok,
-        pod_slot_ok,
+        mac_match,
+        bool(poc_slot_ok),
+        bool(pod_slot_ok),
         poi_slot_ok,
         bright_active,
         honeygain_active,
         mysterium_active,
     )
 
-    mac_entry = _ensure_slot_entry(mac_slots, hour_key_str, slots_per_hour, None)
-    mac_entry["slots"][slot] = bool(mac_info.get("mac_match"))
-    poc_entry = _ensure_slot_entry(poc_slots, hour_key_str, slots_per_hour, False)
-    poc_entry["slots"][slot] = bool(poc_slot_ok)
-    pod_entry = _ensure_slot_entry(pod_slots, hour_key_str, slots_per_hour, False)
-    pod_entry["slots"][slot] = bool(pod_slot_ok)
-    if miner_type_val == "BM":
-        bw_entry = _ensure_slot_entry(bandwidth_tools_slots, hour_key_str, slots_per_hour, None)
-        bw_slots = bw_entry.get("slots", [])
-        if isinstance(bw_slots, list) and slot < len(bw_slots):
-            bw_slots[slot] = bandwidth_slot_entry or {}
-        bw_entry["slots"] = bw_slots
-        bandwidth_tools_slots[hour_key_str] = bw_entry
-    else:
-        bandwidth_tools_slots = {}
+    # --- unified slot snapshot for the graph ---
+    slot_obj: dict[str, Any] = {
+        "gates": {
+            "data": True,
+            "online": (status == "online"),
+            "mac_match": mac_match,
+            "pol": bool(pol_status),
+            "poc": bool(poc_slot_ok),
+            "pod": bool(pod_slot_ok),
+            "poi": (bool(poi_slot_ok) if miner_type_val == "AEM" else None),
+        },
+        "tools_active": (selected_tools if miner_type_val == "BM" else []),
+        "tools_count": (len(selected_tools) if miner_type_val == "BM" else 0),
+        "multiplier": rewards_multiplier_value,
+    }
 
-    reward_entry = _ensure_slot_entry(rewards_multiplier_slots, hour_key_str, slots_per_hour, None)
-    reward_slots_list = reward_entry.get("slots", [])
-    if isinstance(reward_slots_list, list) and slot < len(reward_slots_list):
-        reward_slots_list[slot] = rewards_multiplier_value
-    reward_entry["slots"] = reward_slots_list
-    rewards_multiplier_slots[hour_key_str] = reward_entry
+    # --- Update rewards structure: rewards[day][hour].slots[slot] ---
+    rewards_root_raw = existing_doc.get("rewards")
+    rewards_root: dict[str, Any] = rewards_root_raw if isinstance(rewards_root_raw, dict) else {}
 
-    mac_slots = _prune_slot_hours(mac_slots)
-    poc_slots = _prune_slot_hours(poc_slots)
-    pod_slots = _prune_slot_hours(pod_slots)
-    bandwidth_tools_slots = _prune_slot_hours(bandwidth_tools_slots)
-    rewards_multiplier_slots = _prune_slot_hours(rewards_multiplier_slots)
-    rewards_multiplier_day = _compute_day_multiplier_avg(rewards_multiplier_slots, day_prefix)
+    day_bucket_raw = rewards_root.get(day)
+    day_bucket: dict[str, Any] = day_bucket_raw if isinstance(day_bucket_raw, dict) else {}
 
-    uptime_info_existing = uptime_info_existing if isinstance(uptime_info_existing, dict) else {}
-    prev_status = uptime_info_existing.get("status") if isinstance(uptime_info_existing.get("status"), str) else None
-    last_online_at = uptime_info_existing.get("last_online_at") if isinstance(uptime_info_existing.get("last_online_at"), str) else None
-    last_offline_at = uptime_info_existing.get("last_offline_at") if isinstance(uptime_info_existing.get("last_offline_at"), str) else None
-    current_run_started_at = uptime_info_existing.get("current_run_started_at") if isinstance(uptime_info_existing.get("current_run_started_at"), str) else None
+    hour_key = str(hour)
+    hour_bucket_raw = day_bucket.get(hour_key)
+    hour_bucket: dict[str, Any] = hour_bucket_raw if isinstance(hour_bucket_raw, dict) else {}
+
+    slots_list_raw = hour_bucket.get("slots")
+    slots_list: list[Any] = slots_list_raw if isinstance(slots_list_raw, list) else []
+    if len(slots_list) < slots_per_hour:
+        slots_list = slots_list + [None] * (slots_per_hour - len(slots_list))
+    slots_list[slot] = slot_obj
+
+    hour_bucket["slots"] = slots_list
+    day_bucket[hour_key] = hour_bucket
+    rewards_root[day] = day_bucket
+
+    # --- keep only last 30 days of rewards ---
+    MAX_REWARDS_DAYS = 30
+    reward_days = sorted([k for k in rewards_root.keys() if isinstance(k, str)])
+    if len(reward_days) > MAX_REWARDS_DAYS:
+        drop = reward_days[: len(reward_days) - MAX_REWARDS_DAYS]
+        for d in drop:
+            rewards_root.pop(d, None)
+
+    # --- Compute Option A daily avg (so far today): only count filled slots ---
+    total = 0.0
+    count = 0
+    for _, h_val in day_bucket.items():
+        if not isinstance(h_val, dict):
+            continue
+        h_slots = h_val.get("slots")
+        if not isinstance(h_slots, list):
+            continue
+        for s in h_slots:
+            if isinstance(s, dict):
+                m = s.get("multiplier")
+                if isinstance(m, (int, float)):
+                    total += float(m)
+                    count += 1
+
+    rewards_multiplier_day = (total / count) if count > 0 else 0.0
+
+    # --- rewards_multiplier_history (array, last 30 days) ---
+    hist_raw = existing_doc.get("rewards_multiplier_history")
+    hist = _as_list(hist_raw)
+
+    entry = {
+        "day": day,
+        "avg": float(round(rewards_multiplier_day, 6)),
+        "counted_slots": int(count),
+    }
+
+    updated = False
+    new_hist: list[dict[str, Any]] = []
+    for item in hist:
+        it = _as_dict(item)
+        if it.get("day") == day:
+            new_hist.append(entry)
+            updated = True
+        else:
+            if isinstance(it.get("day"), str) and isinstance(it.get("avg"), (int, float)) and isinstance(it.get("counted_slots"), int):
+                new_hist.append(it)
+
+    if not updated:
+        new_hist.append(entry)
+
+    new_hist_sorted = sorted(new_hist, key=lambda x: cast(str, x.get("day", "")))
+    if len(new_hist_sorted) > 30:
+        new_hist_sorted = new_hist_sorted[-30:]
+
+    # --- uptime info (Option A: so far today) ---
+    uptime_raw = existing_doc.get("uptime")
+    uptime_existing: Dict[str, Any] = uptime_raw if isinstance(uptime_raw, dict) else {}
+    prev_status = uptime_existing.get("status") if isinstance(uptime_existing.get("status"), str) else None
+
+    last_online_at = uptime_existing.get("last_online_at") if isinstance(uptime_existing.get("last_online_at"), str) else None
+    last_offline_at = uptime_existing.get("last_offline_at") if isinstance(uptime_existing.get("last_offline_at"), str) else None
+    current_run_started_at = uptime_existing.get("current_run_started_at") if isinstance(uptime_existing.get("current_run_started_at"), str) else None
+
     if status == "online":
-        last_online_at = ts.isoformat()
+        last_online_at = checked_at_iso
         if prev_status != "online" or not current_run_started_at:
-            current_run_started_at = ts.isoformat()
+            current_run_started_at = checked_at_iso
     else:
-        last_offline_at = ts.isoformat()
+        last_offline_at = checked_at_iso
 
-    uptime_seconds_24h, downtime_seconds_24h = _compute_uptime_24h_from_slots(poc_slots, ts, interval_seconds)
+    uptime_seconds_24h = max(0, int(day_online_so_far * interval_seconds))
+    downtime_seconds_24h = max(0, int(max(0, slots_elapsed - day_online_so_far) * interval_seconds))
 
     uptime_info_new = {
         "status": status,
@@ -1823,29 +1796,34 @@ def write_status(
         "downtime_seconds_24h": downtime_seconds_24h,
     }
 
+    boot_time_existing = existing_doc.get("boot_time")
     boot_time_val = _get_boot_time_iso() or (boot_time_existing if isinstance(boot_time_existing, str) else None)
 
+    # --- compose base doc (NEW signature) ---
     new_doc = _compose_hardware_doc(
         miner_key,
         miner_type=miner_type_val,
-        mac=mac_info,
         software=software_info,
-        poc=poc_compact,
-        pod=pod_compact,
-        pol=existing_pol,
-        last_updated=now_utc(),
+        last_updated=now_utc(),  # lastUpdated = slot activity only
         poi=poi_data if (miner_type_val == "AEM") else None,
         poi_slots=poi_slots if (miner_type_val == "AEM") else None,
     )
-    new_doc["mac_slots"] = mac_slots
-    new_doc["PoC_slots"] = poc_slots
-    new_doc["PoD_slots"] = pod_slots
-    new_doc["bandwidth_tools_slots"] = bandwidth_tools_slots
-    new_doc["rewards_multiplier_slots"] = rewards_multiplier_slots
-    new_doc["rewards_multiplier_day"] = rewards_multiplier_day
+
+    # --- inject simplified fields ---
+    new_doc["mac"] = mac_block
+    new_doc["pol"] = pol_block
+    new_doc["rewards"] = rewards_root
+    new_doc["rewards_multiplier_day"] = float(round(rewards_multiplier_day, 6))
+    new_doc["rewards_multiplier_day_counted_slots"] = int(count)
+    new_doc["rewards_multiplier_history"] = new_hist_sorted
     new_doc["uptime"] = uptime_info_new
+
     if boot_time_val:
         new_doc["boot_time"] = boot_time_val
+
+    # Optional query helpers
+    new_doc["tz"] = "UTC"
+    new_doc["day"] = day
 
     try:
         coll.replace_one({"miner_key": miner_key}, new_doc, upsert=True)  # type: ignore[attr-defined]
@@ -1857,7 +1835,6 @@ def write_status(
     except Exception:
         pass
 
-
 def data_dir() -> str:
     if sys.platform.startswith("win"):
         base = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
@@ -1868,7 +1845,6 @@ def data_dir() -> str:
 def read_selected_miner_mac() -> str:
     p = os.path.join(data_dir(), "miner_mac.txt")
     return read_text_optional(p)
-
 
 def _parse_bool_flag(value: Any) -> Optional[bool]:
     if isinstance(value, bool):
@@ -1884,7 +1860,6 @@ def _parse_bool_flag(value: Any) -> Optional[bool]:
         if val in _FALSE_SET:
             return False
     return None
-
 
 def read_encrypted_sdk_config() -> Dict[str, Any]:
     """Read SDK approval config from encrypted file (installer-managed)."""
@@ -1916,7 +1891,6 @@ def read_encrypted_sdk_config() -> Dict[str, Any]:
     except Exception:
         pass
     return {}
-
 
 def read_sdk_approval_state() -> Dict[str, bool]:
     """Read SDK approval flags from encrypted config only."""
@@ -1950,7 +1924,6 @@ def read_sdk_approval_state() -> Dict[str, bool]:
         pass
     return state
 
-
 def sdk_approved(name: str) -> bool:
     """Return True if the given SDK (Bright, Honeygain, etc.) is approved by the user."""
     if not isinstance(name, str) or not name:
@@ -1970,7 +1943,6 @@ def sdk_approved(name: str) -> bool:
             return parsed
     state = read_sdk_approval_state()
     return bool(state.get(key, False))
-
 
 def apply_bm_sdk_cap(percent: float) -> float:
     """Cap BM PoC depending on SDK approvals (Bright, Olostep)."""
@@ -2011,7 +1983,6 @@ def apply_bm_sdk_cap(percent: float) -> float:
             pass
         return cap
     return percent
-
 
 def detect_local_mac() -> str:
     """Try to detect a sensible local MAC address.
@@ -2169,400 +2140,379 @@ class _CacheLock:
             except Exception:
                 pass
 
-def _lc_write_slot(doc: dict, ts: dt.datetime, status: str, interval_seconds: int):
-    hour, slot = hour_and_slot(ts, interval_seconds)
-    hours = doc.setdefault("hours", {})
-    h = hours.get(str(hour)) if isinstance(hours, dict) else None
-    if not isinstance(h, dict):
-        h = {}
-    slots = h.get("slots")
-    if not isinstance(slots, list):
-        slots = []
-    if len(slots) <= slot:
-        slots = (slots + [None] * (slot + 1 - len(slots)))
-    slots[slot] = status
-    known_slots = [s for s in slots if s in ("online", "offline")]
-    h["slots"] = slots
-    h["onlineCount"] = sum(1 for s in known_slots if s == "online")
-    h["totalSlots"] = len(known_slots)
-    hours[str(hour)] = h
+def _week_bounds_for_rewards(ts: dt.datetime) -> Tuple[dt.datetime, dt.datetime]:
+    t = ts.astimezone(UTC)
+    start_of_day = t.replace(hour=0, minute=0, second=0, microsecond=0)
+    days_since_friday = (start_of_day.weekday() - 4) % 7
+    week_start = start_of_day - dt.timedelta(days=days_since_friday)
+    week_end = week_start + dt.timedelta(days=7)
+    return week_start, week_end
 
-def _lc_write_mac_slot(doc: dict, ts: dt.datetime, mac_ok: Optional[bool], interval_seconds: int):
-    """Record MAC match state for a slot; leave prior slots untouched."""
-    hour, slot = hour_and_slot(ts, interval_seconds)
-    mac_hours = doc.setdefault("macHours", {})
-    entry = mac_hours.get(str(hour))
-    if not isinstance(entry, dict):
-        entry = {}
-    slots = entry.get("slots", [])
-    if not isinstance(slots, list):
-        slots = []
-    if len(slots) <= slot:
-        slots = slots + [None] * (slot + 1 - len(slots))
-    slots[slot] = (bool(mac_ok) if mac_ok is not None else None)
-    entry["slots"] = slots
-    known = [s for s in slots if isinstance(s, bool)]
-    entry["matchCount"] = sum(1 for s in known if s)
-    entry["totalSlots"] = len(known)
-    mac_hours[str(hour)] = entry
+def _iso_z(x: dt.datetime) -> str:
+    return x.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def _lc_write_pod_slot(doc: dict, ts: dt.datetime, delivered: Optional[bool], interval_seconds: int):
-    hour, slot = hour_and_slot(ts, interval_seconds)
-    pod_hours = doc.setdefault("podHours", {})
-    entry = pod_hours.get(str(hour))
-    if not isinstance(entry, dict):
-        entry = {}
-    slots = entry.get("slots", [])
-    if not isinstance(slots, list):
-        slots = []
-    if len(slots) <= slot:
-        slots = (slots + [None] * (slot + 1 - len(slots)))
-    slots[slot] = (bool(delivered) if delivered is not None else None)
-    entry["slots"] = slots
-    entry["deliveredCount"] = sum(1 for s in slots if s is True)
-    entry["totalSlots"] = sum(1 for s in slots if isinstance(s, bool))
-    pod_hours[str(hour)] = entry
+def _date_iso(x: dt.datetime) -> str:
+    return x.astimezone(UTC).strftime("%Y-%m-%d")
 
-def _lc_write_poi_slot(doc: dict, ts: dt.datetime, installed: Optional[bool], interval_seconds: int):
-    """Write a PoI slot (installed = True/False) for the given interval."""
-    hour, slot = hour_and_slot(ts, interval_seconds)
-    poi_hours = doc.setdefault("poiHours", {})
-    entry = poi_hours.get(str(hour))
-    if not isinstance(entry, dict):
-        entry = {}
-    slots = entry.get("slots", [])
-    if not isinstance(slots, list):
-        slots = []
-    if len(slots) <= slot:
-        slots = (slots + [None] * (slot + 1 - len(slots)))
-    slots[slot] = (bool(installed) if installed is not None else None)
-    entry["slots"] = slots
-    entry["installedCount"] = sum(1 for s in slots if s is True)
-    entry["totalSlots"] = sum(1 for s in slots if isinstance(s, bool))
-    poi_hours[str(hour)] = entry
+def _week_file_path(week_start: dt.datetime) -> str:
+    # one file per week, keyed by Friday date
+    # e.g. status-week-20251212.json
+    fname = f"status-week-{week_start.astimezone(UTC).strftime('%Y%m%d')}.json"
+    return os.path.join(data_dir(), "status", fname)
 
-def _tool_states_for_hour() -> tuple[bool, bool, bool]:
-    """Return (bright, honeygain, mysterium) active states."""
+def _safe_dict(v: Any) -> Dict[str, Any]:
+    return v if isinstance(v, dict) else {}
+
+def _safe_list(v: Any) -> List[Any]:
+    return v if isinstance(v, list) else []
+
+def _tool_states_for_slot() -> Tuple[bool, bool, bool]:
     bright_active = False
     honeygain_active = False
     mysterium_active = False
     try:
-        bright_active = sdk_approved("bright")
+        bright_active = bool(sdk_approved("bright"))
     except Exception:
         bright_active = False
     try:
-        honeygain_active = sdk_approved("honeygain")
+        honeygain_active = bool(sdk_approved("honeygain"))
     except Exception:
         honeygain_active = False
     try:
-        mysterium_active = sdk_approved("mysterium")
+        mysterium_active = bool(sdk_approved("mysterium"))
     except Exception:
         mysterium_active = False
     return bright_active, honeygain_active, mysterium_active
 
-def _inject_gui_status_slots(doc: dict, ts: dt.datetime, interval_seconds: int) -> None:
-    """Compute GUI-facing rewards_multiplier_slots and place on the current cache doc."""
-    try:
-        slots_per_hour = max(1, 3600 // max(1, interval_seconds))
-        hours_doc = doc.get("hours") if isinstance(doc, dict) else {}
-        mac_hours_doc = doc.get("macHours") if isinstance(doc, dict) else {}
-        pod_hours = doc.get("podHours") if isinstance(doc, dict) else {}
-        poi_hours = doc.get("poiHours") if isinstance(doc, dict) else {}
-        try:
-            last_written_str = doc.get("lastSlotWritten")
-            if isinstance(last_written_str, str):
-                last_written = dt.datetime.strptime(last_written_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
-                max_hour = min(23, last_written.hour)
-            else:
-                max_hour = min(23, hour_and_slot(ts, interval_seconds)[0])
-        except Exception:
-            max_hour = min(23, hour_and_slot(ts, interval_seconds)[0])
-        bright_active, honeygain_active, mysterium_active = _tool_states_for_hour()
-        tools_list: list[str] = []
-        if MINER_CODE == "BM":
-            if bright_active:
-                tools_list.append("Bright")
-            if honeygain_active:
-                tools_list.append("Honeygain")
-            if mysterium_active:
-                tools_list.append("Mysterium")
-        slots_out: dict[str, dict[str, Any]] = {}
-        for h in range(max_hour + 1):
-            hour_key = str(h)
-            mac_ok: Optional[bool] = None
-            try:
-                mac_entry = mac_hours_doc.get(hour_key) if isinstance(mac_hours_doc, dict) else None
-                mac_slots = mac_entry.get("slots") if isinstance(mac_entry, dict) else None
-                if isinstance(mac_slots, list):
-                    candidates = [s for s in mac_slots[:slots_per_hour] if isinstance(s, bool)]
-                    if candidates:
-                        mac_ok = candidates[-1]
-            except Exception:
-                mac_ok = None
-            if mac_ok is None:
-                mac_ok = not bool(doc.get("mac_mismatch"))
-            poc_ok: Optional[bool] = None
-            try:
-                h_entry = hours_doc.get(hour_key) if isinstance(hours_doc, dict) else None
-                slots = h_entry.get("slots") if isinstance(h_entry, dict) else None
-                if isinstance(slots, list):
-                    known_slots = [s for s in slots[:slots_per_hour] if s in ("online", "offline")]
-                    if known_slots:
-                        poc_ok = any(s == "online" for s in known_slots)
-            except Exception:
-                poc_ok = None
-            pod_ok: Optional[bool] = None
-            try:
-                pod_entry = pod_hours.get(hour_key) if isinstance(pod_hours, dict) else None
-                pod_slots = pod_entry.get("slots") if isinstance(pod_entry, dict) else None
-                if isinstance(pod_slots, list):
-                    known_pod = [s for s in pod_slots[:slots_per_hour] if isinstance(s, bool)]
-                    if known_pod:
-                        pod_ok = any(bool(s) for s in known_pod)
-            except Exception:
-                pod_ok = None
-            poi_ok: Optional[bool] = None
-            if MINER_CODE == "AEM":
-                try:
-                    poi_entry = poi_hours.get(hour_key) if isinstance(poi_hours, dict) else None
-                    poi_slots = poi_entry.get("slots") if isinstance(poi_entry, dict) else None
-                    if isinstance(poi_slots, list):
-                        known_poi = [s for s in poi_slots[:slots_per_hour] if isinstance(s, bool)]
-                        if known_poi:
-                            poi_ok = any(bool(s) for s in known_poi)
-                except Exception:
-                    poi_ok = None
-            ready_for_multiplier = False
-            if MINER_CODE == "AEM":
-                ready_for_multiplier = (poc_ok is not None) and (poi_ok is not None)
-            else:
-                ready_for_multiplier = (poc_ok is not None) and (pod_ok is not None)
-            multiplier: Optional[float] = None
-            if ready_for_multiplier:
-                multiplier = _compute_rewards_multiplier(
-                    MINER_CODE,
-                    bool(mac_ok),
-                    bool(poc_ok),
-                    bool(pod_ok),
-                    poi_ok,
-                    bright_active,
-                    honeygain_active,
-                    mysterium_active,
-                )
-            hour_entry: dict[str, Any] = {
-                "multiplier": float(multiplier) if isinstance(multiplier, (int, float)) else None,
-                "mac_match": int(bool(mac_ok)),
-                "PoC": (int(bool(poc_ok)) if poc_ok is not None else None),
-                "PoD": (int(bool(pod_ok)) if pod_ok is not None else None),
-                "tools": tools_list if MINER_CODE == "BM" else [],
-            }
-            if MINER_CODE == "AEM":
-                hour_entry["PoI"] = (int(bool(poi_ok)) if poi_ok is not None else None)
-            slots_out[hour_key] = hour_entry
-        doc["rewards_multiplier_slots"] = slots_out
-    except Exception:
-        pass
+def _compute_day_aggregates(day_doc: Dict[str, Any]) -> None:
+    """
+    Fill/refresh:
+      - avg_multiplier
+      - counted_slots
+      - issue_counts (tools/data/online/mac)
+      - tools_active (union)
+    based on hours[*].slots[*]
+    """
+    total = 0.0
+    count = 0
 
-def write_status_local(
+    issue_counts = {"tools": 0, "data": 0, "online": 0, "mac": 0}
+    tools_union: set[str] = set()
+
+    hours = _safe_dict(day_doc.get("hours"))
+    for _, hdoc_any in hours.items():
+        hdoc = _safe_dict(hdoc_any)
+        slots = _safe_list(hdoc.get("slots"))
+        for s_any in slots:
+            s = _safe_dict(s_any)
+            m = s.get("multiplier")
+            if isinstance(m, (int, float)):
+                total += float(m)
+                count += 1
+
+            gates = _safe_dict(s.get("gates"))
+            # count failures PER SLOT
+            if gates.get("tools") is False:
+                issue_counts["tools"] += 1
+            if gates.get("data") is False:
+                issue_counts["data"] += 1
+            if gates.get("online") is False:
+                issue_counts["online"] += 1
+            if gates.get("mac") is False:
+                issue_counts["mac"] += 1
+
+            ta = s.get("tools_active")
+            if isinstance(ta, list):
+                for name in ta:
+                    if isinstance(name, str) and name:
+                        tools_union.add(name)
+
+    day_doc["counted_slots"] = int(count)
+    day_doc["avg_multiplier"] = float(round((total / count) if count > 0 else 0.0, 6))
+    day_doc["issue_counts"] = issue_counts
+    day_doc["tools_active"] = sorted(tools_union)
+
+def _compute_week_so_far(doc: Dict[str, Any]) -> Dict[str, Any]:
+    days = _safe_dict(doc.get("days"))
+    total = 0.0
+    count = 0
+    issue_counts = {"tools": 0, "data": 0, "online": 0, "mac": 0}
+
+    for _, day_doc_any in days.items():
+        day_doc = _safe_dict(day_doc_any)
+        # prefer the stored aggregates if present; else compute from slots
+        avg = day_doc.get("avg_multiplier")
+        c = day_doc.get("counted_slots")
+        if isinstance(avg, (int, float)) and isinstance(c, int) and c > 0:
+            total += float(avg) * float(c)
+            count += int(c)
+        else:
+            # fall back to scan
+            _compute_day_aggregates(day_doc)
+            avg2 = day_doc.get("avg_multiplier")
+            c2 = day_doc.get("counted_slots")
+            if isinstance(avg2, (int, float)) and isinstance(c2, int) and c2 > 0:
+                total += float(avg2) * float(c2)
+                count += int(c2)
+
+        ic = _safe_dict(day_doc.get("issue_counts"))
+        for k in ("tools", "data", "online", "mac"):
+            v = ic.get(k)
+            if isinstance(v, int):
+                issue_counts[k] += int(v)
+
+    return {
+        "avg_multiplier": float(round((total / count) if count > 0 else 0.0, 6)),
+        "counted_slots": int(count),
+        "issue_counts": issue_counts,
+    }
+
+def _hour_summary_from_slots(hour_slots: List[Any]) -> Dict[str, Any]:
+    """
+    Build the per-hour object the GUI expects:
+      - gates: bools (True only if ALL known slots pass)
+      - tools_active: union across slots
+      - number_of_tools: len(tools_active)
+      - multiplier: avg across slots with numeric multiplier
+    Keeps it robust with partial/missing slots.
+    """
+    gates_all = {"online": True, "mac": True, "data": True, "tools": True}
+    tools_union: set[str] = set()
+    total = 0.0
+    count = 0
+
+    seen_any_slot = False
+    for s_any in hour_slots:
+        if not isinstance(s_any, dict):
+            continue
+        seen_any_slot = True
+
+        gates = s_any.get("gates")
+        if isinstance(gates, dict):
+            for k in ("online", "mac", "data", "tools"):
+                v = gates.get(k)
+                if isinstance(v, bool):
+                    gates_all[k] = gates_all[k] and v
+
+        ta = s_any.get("tools_active")
+        if isinstance(ta, list):
+            for name in ta:
+                if isinstance(name, str) and name:
+                    tools_union.add(name)
+
+        m = s_any.get("multiplier")
+        if isinstance(m, (int, float)):
+            total += float(m)
+            count += 1
+
+    # If hour has no known slots yet, don’t claim it’s “all green”
+    if not seen_any_slot:
+        gates_all = {"online": False, "mac": False, "data": False, "tools": False}
+
+    tools_sorted = sorted(tools_union)
+    avg = (total / count) if count > 0 else 0.0
+
+    return {
+        "gates": gates_all,
+        "tools_active": tools_sorted,
+        "number_of_tools": int(len(tools_sorted)),
+        "multiplier": float(round(avg, 6)),
+    }
+
+def write_week_local(
     miner_key: str,
     ts: dt.datetime,
     status: str,
     interval_seconds: int,
-    pod_status: Optional[bool] = None,
+    *,
+    pod_status: Optional[bool] = None,     # "data" gate for BM
     mac_registered: Optional[str] = None,
     mac_mismatch: Optional[bool] = None,
-    poi_data: Optional[bool] = None,
-):
+    poi_data: Optional[bool] = None,       # AEM only
+    gui_version: Optional[str] = None,
+) -> None:
+    """
+    One file per rewards-week (Fri 00:00 UTC → next Fri 00:00 UTC).
+    Keeps slot objects so GUI can render detailed view from slot data.
+    """
+
     ensure_dirs()
-    cur_day_path = cache_path_for(ts)
-    cur_lock_path = cache_lock_path_for(ts)
-    day_iso = ts.strftime("%Y-%m-%d")
-    with _CacheLock(cur_lock_path):
-        doc = read_local_cache(cur_day_path)
-    if not doc or doc.get("date") != day_iso:
-        doc = {
-            "miner_key": miner_key,
-            "minerCode": MINER_CODE,
-            "agentVersion": SOFTWARE_VERSION,
-            "date": day_iso,
-            "hours": {},
-            "macHours": {},
-            "podHours": {},
-            "poiHours": {},
-            "lastSlotWritten": None
-        }
 
-    def floor_slot(x: dt.datetime) -> dt.datetime:
-        # Floor to interval boundary
-        secs = x.hour*3600 + x.minute*60 + x.second
-        floored = (secs // max(1, interval_seconds)) * max(1, interval_seconds)
-        return x.replace(hour=0, minute=0, second=0) + dt.timedelta(seconds=floored)
+    ts_utc = ts.astimezone(UTC)
+    week_start, week_end = _week_bounds_for_rewards(ts_utc)
+    path = _week_file_path(week_start)
+    lock_path = path + ".lock"
 
-    cur_slot = floor_slot(ts)
-    last_str = doc.get("lastSlotWritten")
-    last_ts = None
-    if last_str:
-        try:
-            last_ts = dt.datetime.strptime(last_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
-        except Exception: last_ts = None
+    # Load existing weekly doc
+    with _CacheLock(lock_path):
+        doc_raw = read_local_cache(path)
+    doc: Dict[str, Any] = doc_raw if isinstance(doc_raw, dict) else {}
 
-    if last_ts and last_ts.date() != ts.date():
-        last_day_path = cache_path_for(last_ts)
-        last_lock_path = cache_lock_path_for(last_ts)
-        with _CacheLock(last_lock_path):
-            last_doc = read_local_cache(last_day_path)
-            if isinstance(last_doc, dict) and last_doc:
-                last_doc["lastUpdated"] = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
-                # Attach GUI view + signature and write
-                try:
-                    _inject_gui_status_slots(last_doc, last_ts, interval_seconds)
-                except Exception:
-                    pass
-                try:
-                    sig = compute_cache_signature(last_doc)
-                    if isinstance(sig, str):
-                        last_doc["sig"] = sig
-                except Exception:
-                    pass
-                atomic_write_json(last_day_path, last_doc)
-                # Clean up legacy underscore file name for the finalized day
-                try:
-                    legacy_path = os.path.join(data_dir(), "status", f"status_{last_ts.strftime('%Y%m%d')}.json")
-                    if os.path.exists(legacy_path):
-                        os.remove(legacy_path)
-                except Exception:
-                    pass
-        last_ts = None
+    # Initialize if wrong week / empty
+    if doc.get("week_start") != _iso_z(week_start) or doc.get("week_end") != _iso_z(week_end):
+        doc = {}
 
-    _lc_write_slot(doc, cur_slot, status, interval_seconds)
-    _lc_write_mac_slot(doc, cur_slot, (not bool(mac_mismatch) if mac_mismatch is not None else None), interval_seconds)
-    _lc_write_pod_slot(doc, cur_slot, pod_status, interval_seconds)
-    _lc_write_poi_slot(doc, cur_slot, poi_data, interval_seconds)
-    slots_per_hour = max(1, 3600 // max(1, interval_seconds))
-    hour, slot = hour_and_slot(ts, interval_seconds)
-    slots_elapsed = hour * slots_per_hour + (slot + 1)
-    # Ensure hour-level aggregates treat unknown slots as offline for percent calculations
-    day_online = 0
-    day_total = 0
-    hours_map = doc.setdefault("hours", {})
-    pod_hours = doc.setdefault("podHours", {})
-    poi_hours = doc.setdefault("poiHours", {})
-    for h in range(hour + 1):
-        key = str(h)
-        hdoc = hours_map.get(key) if isinstance(hours_map, dict) else None
-        if isinstance(hdoc, dict):
-            slots = hdoc.get("slots") or []
-            if not isinstance(slots, list):
-                slots = []
-            hour_slots_expected = slots_per_hour if h < hour else (slot + 1)
-            slots = (slots + [None] * hour_slots_expected)[:hour_slots_expected]
-            online_count = sum(1 for s in slots if s == "online")
-            hdoc["slots"] = slots
-            hdoc["onlineCount"] = online_count
-            hdoc["totalSlots"] = hour_slots_expected
-            hours_map[key] = hdoc
-            day_online += online_count
-            day_total += hour_slots_expected
-        else:
-            hour_slots_expected = slots_per_hour if h < hour else (slot + 1)
-            day_total += hour_slots_expected
-        ph = pod_hours.get(key)
-        if isinstance(ph, dict):
-            pslots = ph.get("slots") or []
-            if not isinstance(pslots, list):
-                pslots = []
-            hour_slots_expected = slots_per_hour if h < hour else (slot + 1)
-            pslots = (pslots + [None] * hour_slots_expected)[:hour_slots_expected]
-            delivered = sum(1 for v in pslots if v is True)
-            ph["slots"] = pslots
-            ph["deliveredCount"] = delivered
-            ph["totalSlots"] = hour_slots_expected
-            pod_hours[key] = ph
-        poi_entry = poi_hours.get(key)
-        if isinstance(poi_entry, dict):
-            poislots = poi_entry.get("slots") or []
-            if not isinstance(poislots, list):
-                poislots = []
-            hour_slots_expected = slots_per_hour if h < hour else (slot + 1)
-            poislots = (poislots + [None] * hour_slots_expected)[:hour_slots_expected]
-            installed = sum(1 for v in poislots if v is True)
-            poi_entry["slots"] = poislots
-            poi_entry["installedCount"] = installed
-            poi_entry["totalSlots"] = hour_slots_expected
-            poi_hours[key] = poi_entry
-
-    doc["onlineCountDay"] = day_online
-    doc["totalSlotsDay"] = slots_elapsed
-    doc["onlinePercentDay"] = round(100.0 * day_online / max(1, slots_elapsed), 1)
-
-    pod_day = sum(ph.get("deliveredCount", 0) for ph in pod_hours.values() if isinstance(ph, dict))
-    pod_total_slots = slots_elapsed
-    doc["podCountDay"] = pod_day
-    doc["podTotalSlotsDay"] = pod_total_slots
-    doc["podPercentDay"] = round(100.0 * pod_day / max(1, pod_total_slots), 1)
-
-    poi_day = sum(pe.get("installedCount", 0) for pe in poi_hours.values() if isinstance(pe, dict))
-    poi_total_slots = slots_elapsed
-    doc["poiCountDay"] = poi_day
-    doc["poiTotalSlotsDay"] = poi_total_slots
-    doc["poiPercentDay"] = round(100.0 * poi_day / max(1, poi_total_slots), 1)
-
+    # Base fields (match your schema)
+    doc["miner_key"] = miner_key
+    doc["minerCode"] = MINER_CODE
     if isinstance(mac_registered, str) and mac_registered.strip():
         doc["mac_registered"] = mac_registered.strip()
     else:
         doc["mac_registered"] = doc.get("mac_registered", "")
-    if mac_mismatch is not None:
-        doc["mac_mismatch"] = bool(mac_mismatch)
-    else:
-        doc["mac_mismatch"] = bool(doc.get("mac_mismatch", False))
-    if poi_data is not None:
-        doc["PoI"] = bool(poi_data)
+    doc["mac_mismatch"] = bool(mac_mismatch) if mac_mismatch is not None else bool(doc.get("mac_mismatch", False))
 
-    doc["lastUpdated"] = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
-    doc["lastSlotWritten"] = cur_slot.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if isinstance(gui_version, str) and gui_version.strip():
+        doc["GUI_version"] = gui_version.strip()
+    else:
+        doc["GUI_version"] = doc.get("GUI_version", "")
+
+    doc["date"] = _date_iso(ts_utc)
+    doc["week_start"] = _iso_z(week_start)
+    doc["week_end"] = _iso_z(week_end)
+
+    # Ensure days dict exists
+    days = _safe_dict(doc.get("days"))
+    doc["days"] = days
+
+    day_key = _date_iso(ts_utc)
+    day_doc = _safe_dict(days.get(day_key))
+    if not day_doc:
+        day_doc = {
+            "avg_multiplier": 0.0,
+            "counted_slots": 0,
+            "issue_counts": {"tools": 0, "data": 0, "online": 0, "mac": 0},
+            "tools_active": [],
+            "hours": {},
+        }
+
+    hours = _safe_dict(day_doc.get("hours"))
+    day_doc["hours"] = hours
+
+    # Slot address
+    hour, slot = hour_and_slot(ts_utc, interval_seconds)
+    slots_per_hour = max(1, 3600 // max(1, interval_seconds))
+
+    hour_key = str(hour)
+    hour_doc = _safe_dict(hours.get(hour_key))
+    if not hour_doc:
+        hour_doc = {}
+
+    slots_list = _safe_list(hour_doc.get("slots"))
+    if len(slots_list) < slots_per_hour:
+        slots_list = slots_list + [None] * (slots_per_hour - len(slots_list))
+    else:
+        slots_list = slots_list[:slots_per_hour]
+
+    # Gates + tools
+    online_ok = (status == "online")
+    mac_ok = not bool(doc.get("mac_mismatch"))
+    data_ok = bool(pod_status) if pod_status is not None else None  # BM: PoD delivered (data)
+    poi_ok = bool(poi_data) if (MINER_CODE == "AEM" and poi_data is not None) else None
+
+    bright_active, honeygain_active, mysterium_active = _tool_states_for_slot()
+    tools_active: list[str] = []
+    if MINER_CODE == "BM":
+        if bright_active:
+            tools_active.append("bright")
+        if honeygain_active:
+            tools_active.append("honeygain")
+        if mysterium_active:
+            tools_active.append("mysterium")
+
+    # Tools gate policy (BM):
+    # - If BM and zero tools selected => fail tools gate
+    tools_ok: Optional[bool]
+    if MINER_CODE == "BM":
+        tools_ok = (len(tools_active) > 0)
+    else:
+        tools_ok = None
+
+    # "data" gate: BM uses pod_status; if unknown, treat as False for multiplier gating
+    data_gate_for_multiplier = bool(data_ok) if isinstance(data_ok, bool) else False
+
+    multiplier: Optional[float] = None
     try:
-        _inject_gui_status_slots(doc, ts, interval_seconds)
+        if MINER_CODE == "AEM":
+            # AEM multiplier: typically depends on PoC + PoI (+ mac)
+            multiplier = _compute_rewards_multiplier(
+                MINER_CODE,
+                bool(mac_ok),
+                bool(online_ok),     # PoC in your system is basically online gate
+                True,               # pod_ok irrelevant for AEM
+                poi_ok,
+                bright_active,
+                honeygain_active,
+                mysterium_active,
+            )
+        else:
+            multiplier = _compute_rewards_multiplier(
+                MINER_CODE,
+                bool(mac_ok),
+                bool(online_ok),             # PoC
+                bool(data_gate_for_multiplier),  # PoD/data
+                None,
+                bright_active,
+                honeygain_active,
+                mysterium_active,
+            )
     except Exception:
-        pass
-    # Guarantee rewards_multiplier_slots exists so the GUI can render it even if the helper failed
-    if "rewards_multiplier_slots" not in doc:
-        try:
-            _inject_gui_status_slots(doc, ts, interval_seconds)
-        except Exception:
-            doc["rewards_multiplier_slots"] = {}
-    # Sign the payload if a signing key is configured
+        multiplier = None
+
+    slot_obj: Dict[str, Any] = {
+        "gates": {
+            "online": bool(online_ok),
+            "mac": bool(mac_ok),
+            "data": bool(data_gate_for_multiplier),
+            "tools": (bool(tools_ok) if tools_ok is not None else True),
+        },
+        "tools_active": tools_active,
+        "number_of_tools": len(tools_active),
+        "multiplier": float(multiplier) if isinstance(multiplier, (int, float)) else None,
+    }
+
+    # Write slot
+    if 0 <= slot < slots_per_hour:
+        slots_list[slot] = slot_obj
+
+    # Store slots (optional but recommended for detailed view)
+    hour_doc["slots"] = slots_list
+
+    # Compute hour summary fields the GUI expects
+    hour_doc.update(_hour_summary_from_slots(slots_list))
+    hours[hour_key] = hour_doc
+
+    # Store back day
+    day_doc["hours"] = hours
+    days[day_key] = day_doc
+    doc["days"] = days
+
+    # Refresh aggregates for THIS day + week so far
+    _compute_day_aggregates(days[day_key])
+    doc["week_so_far"] = _compute_week_so_far(doc)
+
+    # Update timestamps
+    # lastSlotWritten = floored boundary
+    secs = ts_utc.hour * 3600 + ts_utc.minute * 60 + ts_utc.second
+    floored = (secs // max(1, interval_seconds)) * max(1, interval_seconds)
+    slot_floor = ts_utc.replace(hour=0, minute=0, second=0, microsecond=0) + dt.timedelta(seconds=floored)
+
+    doc["lastSlotWritten"] = _iso_z(slot_floor)
+    doc["lastUpdated"] = _iso_z(now_utc())
+
+    # Optional signature
     try:
         sig = compute_cache_signature(doc)
-        if isinstance(sig, str):
+        if isinstance(sig, str) and sig:
             doc["sig"] = sig
     except Exception:
         pass
-    with _CacheLock(cur_lock_path):
-        atomic_write_json(cur_day_path, doc)
-        # Remove legacy underscore-named file for the same day if present
-        try:
-            legacy_path = os.path.join(data_dir(), "status", f"status_{ts.strftime('%Y%m%d')}.json")
-            if os.path.exists(legacy_path):
-                os.remove(legacy_path)
-        except Exception:
-            pass
-    _update_rolling7_summary(miner_key, ts)
 
-
-def _update_rolling7_summary(miner_key: str, ts: dt.datetime) -> None:
-    """Best-effort rolling7 update; failure should not interrupt status writes."""
-    try:
-        from rolling_days import update_rolling_7_days
-    except Exception:
-        return
-    try:
-        update_rolling_7_days(miner_key, ts=ts)
-    except Exception:
-        pass
-
+    # Write atomically
+    with _CacheLock(lock_path):
+        atomic_write_json(path, doc)
 
 def _start_poi_local_loop(miner_key: str, interval_seconds: int, poll_seconds: int) -> None:
-    """Launch a background loop that refreshes PoI in the local cache more frequently."""
+    """Launch a background loop that refreshes PoI in the WEEKLY local cache more frequently (AEM only)."""
     if poll_seconds <= 0:
         return
 
@@ -2573,27 +2523,36 @@ def _start_poi_local_loop(miner_key: str, interval_seconds: int, poll_seconds: i
                 installed = monitor_poi_for_aem()
             except Exception:
                 installed = None
+
             try:
                 snap = _get_poi_state_snapshot()
-                if snap.get("pod_status") is None:
-                    time.sleep(max(1, poll_seconds))
-                    continue
-                write_status_local(
+
+                # For weekly cache we only need enough to write the current slot
+                status = snap.get("status", "offline")
+                interval = int(snap.get("interval", interval_seconds))
+                mac_registered = snap.get("mac_registered")
+                mac_mismatch = snap.get("mac_mismatch")
+
+                # AEM: "data" gate isn’t relevant; pass pod_status=None
+                write_week_local(
                     miner_key,
                     now_utc(),
-                    snap.get("status", "offline"),
-                    int(snap.get("interval", interval_seconds)),
-                    pod_status=snap.get("pod_status"),
-                    mac_registered=snap.get("mac_registered"),
-                    mac_mismatch=snap.get("mac_mismatch"),
+                    status,
+                    interval,
+                    pod_status=None,
+                    mac_registered=mac_registered,
+                    mac_mismatch=mac_mismatch,
                     poi_data=installed,
+                    gui_version=snap.get("GUI_version"),
                 )
+
                 _update_poi_state(last_poi=installed)
             except Exception:
                 pass
+
             time.sleep(max(1, poll_seconds))
 
-    threading.Thread(target=_loop, name="poi-local-monitor", daemon=True).start()
+    threading.Thread(target=_loop, name="poi-week-monitor", daemon=True).start()
 
 
 def _maxmind_db_path() -> pathlib.Path:
@@ -2874,67 +2833,95 @@ def registered_hexid_from_devices(client: MongoProxyClient, miner_key: str) -> O
     return None
 
 
+def write_location_daily(
+    coll,
+    client: MongoProxyClient,
+    miner_key: str,
+    ts: dt.datetime,
+) -> None:
+    """
+    Evaluate Proof of Location once per day and store:
+    - pol.status
+    - pol.last_changed_at
+    - pol.last_checked_at
+    - pol.evidence (latest)
 
+    IMPORTANT:
+    - Must NOT update lastUpdated (slot activity only)
+    - Must NOT create a partial doc on upsert
+    """
 
-
-def write_location_daily(coll, client: MongoProxyClient, miner_key: str, ts: dt.datetime):
-    """Record a daily country consistency proof keyed by day."""
     area_threshold = COUNTRY_AREA_THRESHOLD
     hex7 = registered_hexid_from_devices(client, miner_key)
+
     try:
         country_check = check_country_once(hex7, area_threshold=area_threshold)
     except Exception:
         country_check = {}
-    if not isinstance(country_check, dict):
-        country_check = {}
 
-    checked_at = now_utc()
-    day = day_iso(ts)
+    country_check = country_check if isinstance(country_check, dict) else {}
+    checked_at_iso = now_utc().isoformat()
 
     ip_value = country_check.get("ip") if isinstance(country_check.get("ip"), str) else None
     ip_country = country_check.get("ip_country") if isinstance(country_check.get("ip_country"), str) else None
     hex_country = country_check.get("h3_country") if isinstance(country_check.get("h3_country"), str) else None
-    same_country_val = country_check.get("same_country") if isinstance(country_check.get("same_country"), bool) else None
 
-    pol_entry: dict[str, Any] = {
-        "ip": ip_value,
-        "hexID_registered": hex7 if isinstance(hex7, str) and hex7 else None,
-        "ipCountry": ip_country,
-        "hexCountry": hex_country,
-        "country_match": same_country_val,
+    same_country_val = country_check.get("same_country")
+    country_match = same_country_val if isinstance(same_country_val, bool) else None
+    pol_status_new = bool(country_match) if isinstance(country_match, bool) else False
+
+    existing_doc_raw = _get_existing_hardware_doc(coll, miner_key)
+    existing_doc: Dict[str, Any] = existing_doc_raw if isinstance(existing_doc_raw, dict) else {}
+
+    existing_pol_raw = existing_doc.get("pol")
+    existing_pol: Dict[str, Any] = existing_pol_raw if isinstance(existing_pol_raw, dict) else {}
+
+    pol_status_old = existing_pol.get("status") if isinstance(existing_pol.get("status"), bool) else None
+    last_changed_at = existing_pol.get("last_changed_at") if isinstance(existing_pol.get("last_changed_at"), str) else None
+
+    if pol_status_old is None or pol_status_old != pol_status_new:
+        last_changed_at = checked_at_iso
+    elif not last_changed_at:
+        last_changed_at = checked_at_iso
+
+    pol_block: Dict[str, Any] = {
+        "status": pol_status_new,
+        "last_changed_at": last_changed_at,
+        "last_checked_at": checked_at_iso,
+        "evidence": {
+            "ip": ip_value,
+            "hexID_registered": hex7 if isinstance(hex7, str) and hex7 else None,
+            "ipCountry": ip_country,
+            "hexCountry": hex_country,
+            "country_match": country_match,
+        },
     }
 
-    existing_doc = _get_existing_hardware_doc(coll, miner_key)
-    mac_info = _extract_mac_fields(existing_doc)
+    # On insert only, initialize a consistent doc skeleton (but do not “refresh” lastUpdated here).
+    miner_type_val = existing_doc.get("miner_type") if isinstance(existing_doc.get("miner_type"), str) else MINER_CODE
     software_info = _extract_software_fields(existing_doc)
-    poc_map = _extract_poc_map(existing_doc)
-    pod_map = _extract_pod_map(existing_doc)
-    pol_map = _extract_pol_map(existing_doc)
 
-    pol_map[day] = pol_entry
-    pol_keys = sorted(pol_map.keys())[-MAX_POC_DAYS:]
-    pol_compact = {key: pol_map[key] for key in pol_keys}
-
-    new_doc = _compose_hardware_doc(
+    base_on_insert = _compose_hardware_doc(
         miner_key,
-        miner_type=existing_doc.get("miner_type") if isinstance(existing_doc.get("miner_type"), str) else MINER_CODE,
-        mac=mac_info,
+        miner_type=miner_type_val,
         software=software_info,
-        poc=poc_map,
-        pod=pod_map,
-        pol=pol_compact,
-        last_updated=checked_at,
+        last_updated=now_utc(),   # only used if doc does not exist yet
+        poi=None,
+        poi_slots=None,
     )
 
     try:
-        coll.replace_one({"miner_key": miner_key}, new_doc, upsert=True)
+        coll.update_one(
+            {"miner_key": miner_key},
+            {
+                "$set": {"pol": pol_block},
+                "$setOnInsert": base_on_insert,
+            },
+            upsert=True,
+        )
     except Exception:
         pass
 
-    try:
-        coll.delete_many({"miner_key": miner_key, "date": {"$exists": True}})
-    except Exception:
-        pass
 
 def registered_mac_from_devices(client: MongoProxyClient, miner_key: str) -> Optional[str]:
     """Return the registered MAC for a miner_key from creds.hardware.miner_mac.
@@ -3025,16 +3012,19 @@ def _release_service_lock() -> None:
     finally:
         _LOCK_FH = None
 
-def main():
-    # Remove check-only modes since installer handles miner key validation and initial lease acquisition
+def main() -> None:
+    # Installer handles miner key validation + initial lease acquisition
     _init_service_file_logging()
+
+    # Exit silently in virtualized environments (policy)
     try:
         vm_info = _detect_virtual_machine()
-        if vm_info.get("vm") is True:
+        if isinstance(vm_info, dict) and vm_info.get("vm") is True:
             sys.exit(0)
     except Exception:
         pass
 
+    # Single instance lock
     try:
         acquire_service_lock()
     except Exception:
@@ -3046,13 +3036,12 @@ def main():
         pass
 
     miner_key = read_miner_key()
-
     cfg = load_config()
 
     api_base = require_api_base(cfg)
     api_health_backoff = ApiHealthBackoff()
-    
-    # Validate that we have embedded credentials from 1Password build process
+
+    # Validate embedded credentials
     if not cfg.get("api_token") and not cfg.get("api_key"):
         log.error("No API token found. This executable was not built with embedded credentials.")
         log.error("Build process required: python build_with_embedded_config.py <1password_config> <output_dir>")
@@ -3084,70 +3073,105 @@ def main():
     except Exception:
         pass
 
-    client: Optional[MongoProxyClient] = None
-    coll = None
-    
     # Read install_id from installer-created config (REQUIRED)
     install_id = read_encrypted_install_config()
     if not install_id:
         log.error("install_config.enc not found or invalid")
         log.error("The installer must create install_config.enc before starting the service")
         time.sleep(2)
-        sys.exit(3)  # Exit code 3: not found
-    
+        sys.exit(3)
+
+    client: Optional[MongoProxyClient] = None
+    coll = None
+
     required_versions: Dict[str, str] = {}
+
     # miner_mac selected in GUI (persisted to shared data dir)
     miner_mac_local: Optional[str] = read_selected_miner_mac() or None
     mac_registered: Optional[str] = None
-    _update_poi_state(
-        interval=interval,
-        mac_registered=mac_registered,
-        mac_mismatch=None,
-        pod_status=None,
-        status="offline",
-        last_poi=None,
-    )
+
+    # Seed local state (best-effort)
+    try:
+        _update_poi_state(
+            interval=interval,
+            mac_registered=mac_registered,
+            mac_mismatch=None,
+            pod_status=None,
+            status="offline",
+            last_poi=None,
+        )
+    except Exception:
+        pass
+
+    # AEM: start fast PoI polling loop (UPDATED to weekly writer inside)
     if MINER_CODE == "AEM":
         try:
             _start_poi_local_loop(miner_key, interval, poi_poll_seconds)
         except Exception:
             pass
+
+    # ----------------------------
+    # Connect + lease + bootstrap doc
+    # ----------------------------
     while client is None:
         try:
             client = connect_mongo(api_base, tlsCAFile, cfg)
             coll = client["PoC"]["hardware"]
-            
-            # Verify that we hold the lease for this miner_key (or acquire if API was down during install)
-            if not verify_or_acquire_installation_lease(client, miner_key, install_id, lease_seconds=lease_seconds):
-                log.error("Installation lease verification/acquisition failed for %s (install_id: %s)", miner_key, install_id)
-                log.error("Cannot start service without valid lease. Check that:")
-                log.error("  1. The External API is reachable")
-                log.error("  2. No other instance is running for this miner_key")
+
+            # Ensure lease is valid
+            if not verify_or_acquire_installation_lease(
+                client, miner_key, install_id, lease_seconds=lease_seconds
+            ):
+                log.error(
+                    "Installation lease verification/acquisition failed for %s (install_id: %s)",
+                    miner_key,
+                    install_id,
+                )
+                log.error("Cannot start service without valid lease.")
                 time.sleep(2)
-                sys.exit(9)  # Exit code 9: lease verification failed
-            # Update this installation record (per-machine)
-            upsert_installation_record(client, miner_key, install_id)
-            # Check required versions and warn (do not exit; backend can enforce rewards policy)
+                sys.exit(9)
+
+            # Upsert installation record (per-machine)
+            try:
+                upsert_installation_record(client, miner_key, install_id)
+            except Exception:
+                pass
+
+            # Fetch required versions (best-effort)
             try:
                 required_versions = required_versions_from_db(client)
                 software_required = required_versions.get("software_version")
                 poc_required = required_versions.get("poc_version")
-                
-                # Check if software version is outdated
+
                 is_software_outdated = False
-                if isinstance(software_required, str) and cmp_ver(SOFTWARE_VERSION, software_required) < 0:
-                    log.warning("Service version %s is below required %s; continuing (rewards may be paused)", SOFTWARE_VERSION, software_required)
-                    is_software_outdated = True
-                
-                # Check if PoC version is outdated (using same VERSION since hardware PoC service version = PoC version)
                 is_poc_outdated = False
-                if isinstance(poc_required, str) and cmp_ver(POC_VERSION, poc_required) < 0:
-                    log.warning("PoC version %s is below required %s; continuing (rewards may be paused)", POC_VERSION, poc_required)
-                    is_poc_outdated = True
-                
-                is_outdated = is_software_outdated or is_poc_outdated
-                
-                # Update installations with version requirements and status
+
+                if isinstance(software_required, str) and software_required:
+                    try:
+                        if cmp_ver(SOFTWARE_VERSION, software_required) < 0:
+                            log.warning(
+                                "Service version %s is below required %s; continuing (rewards may be paused)",
+                                SOFTWARE_VERSION,
+                                software_required,
+                            )
+                            is_software_outdated = True
+                    except Exception:
+                        pass
+
+                if isinstance(poc_required, str) and poc_required:
+                    try:
+                        if cmp_ver(POC_VERSION, poc_required) < 0:
+                            log.warning(
+                                "PoC version %s is below required %s; continuing (rewards may be paused)",
+                                POC_VERSION,
+                                poc_required,
+                            )
+                            is_poc_outdated = True
+                    except Exception:
+                        pass
+
+                is_outdated = bool(is_software_outdated or is_poc_outdated)
+
                 try:
                     upsert_installation_record(
                         client,
@@ -3161,91 +3185,149 @@ def main():
                 except Exception:
                     pass
             except Exception:
-                # If we cannot read requirement, proceed; next loop will try again
                 pass
 
-            # Also capture the registered MAC (best-effort), even if version fetch failed
+            # Registered MAC (best-effort)
             try:
-                mac_registered = registered_mac_from_devices(client, miner_key)
+                mac_registered = registered_mac_from_devices(client, miner_key) or None
             except Exception:
                 mac_registered = mac_registered or None
 
-            # Populate hardware document immediately so UI shows registered values
+            # Bootstrap DB doc so UI sees everything immediately
             try:
-                hex_registered = None
-                try:
-                    hex_registered = registered_hexid_from_devices(client, miner_key)
-                except Exception:
-                    hex_registered = None
-                try:
-                    existing_doc = _get_existing_hardware_doc(coll, miner_key)
-                    mac_info = _extract_mac_fields(existing_doc)
-                    software_info = _extract_software_fields(existing_doc)
-                    poc_map = _extract_poc_map(existing_doc)
-                    pod_map = _extract_pod_map(existing_doc)
-                    pol_map = _extract_pol_map(existing_doc)
-                    # update registered values if present
-                    # prefer the local selected miner MAC when available so the UI can show a match immediately
-                    if isinstance(miner_mac_local, str) and miner_mac_local:
-                        mac_info["miner_mac"] = miner_mac_local
-                    if isinstance(mac_registered, str) and mac_registered:
-                        mac_info["mac_registered"] = mac_registered
-                    # compute mac_match using the same normalization rules as write_status
-                    try:
-                        def _norm_mac_start(v: Optional[str]) -> str:
-                            try:
-                                return re.sub(r"[^0-9a-f]", "", (v or "").lower())
-                            except Exception:
-                                return ""
-                        norm_miner_start = _norm_mac_start(mac_info.get("miner_mac"))
-                        norm_registered_start = _norm_mac_start(mac_info.get("mac_registered"))
-                        mac_info["mac_match"] = bool(norm_miner_start and norm_registered_start and norm_miner_start == norm_registered_start)
-                    except Exception:
-                        pass
-                    day = day_iso(now_utc())
-                    pol_entry = pol_map.get(day) or {}
-                    if isinstance(hex_registered, str) and hex_registered:
-                        pol_entry["hexID_registered"] = hex_registered
-                    pol_map[day] = pol_entry
-                    # Ensure software requirement fields are present immediately so the UI shows them
-                    try:
-                        software_required = required_versions.get("software_version")
-                        if isinstance(software_required, str) and software_required:
-                            software_info["software_version_needed"] = software_required
-                            try:
-                                software_info["software_uptodate"] = (cmp_ver(SOFTWARE_VERSION, software_required) >= 0)
-                            except Exception:
-                                software_info["software_uptodate"] = None
-                        else:
-                            if not isinstance(software_info.get("software_uptodate"), bool):
-                                software_info["software_uptodate"] = None
-                    except Exception:
-                        pass
+                existing_doc_raw = _get_existing_hardware_doc(coll, miner_key)
+                existing_doc: Dict[str, Any] = existing_doc_raw if isinstance(existing_doc_raw, dict) else {}
 
-                    # For AEM miners, add PoI (Proof of Installed)
-                    miner_type_val = existing_doc.get("miner_type") if isinstance(existing_doc.get("miner_type"), str) else MINER_CODE
-                    poi_data = None
-                    if miner_type_val == "AEM":
-                        poi_data = monitor_poi_for_aem()
-                        pod_map = None
-                    new_doc = _compose_hardware_doc(
-                        miner_key,
-                        miner_type=miner_type_val,
-                        mac=mac_info,
-                        software=software_info,
-                        poc=poc_map,
-                        pod=pod_map,
-                        pol=pol_map,
-                        last_updated=now_utc(),
-                        poi=poi_data,
-                        poi_slots=None,
-                    )
+                miner_type_val = (
+                    existing_doc.get("miner_type")
+                    if isinstance(existing_doc.get("miner_type"), str)
+                    else MINER_CODE
+                )
+
+                # software
+                software_info = _extract_software_fields(existing_doc)
+                software_required = required_versions.get("software_version")
+                poc_required = required_versions.get("poc_version")
+
+                if isinstance(software_required, str) and software_required:
+                    software_info["software_version_needed"] = software_required
                     try:
-                        coll.replace_one({"miner_key": miner_key}, new_doc, upsert=True)
+                        software_info["software_uptodate"] = (cmp_ver(SOFTWARE_VERSION, software_required) >= 0)
                     except Exception:
-                        pass
-                except Exception:
-                    pass
+                        software_info["software_uptodate"] = None
+                else:
+                    if not isinstance(software_info.get("software_uptodate"), bool):
+                        software_info["software_uptodate"] = None
+
+                if isinstance(poc_required, str) and poc_required:
+                    software_info["poc_version_needed"] = poc_required
+                    try:
+                        software_info["poc_uptodate"] = (cmp_ver(POC_VERSION, poc_required) >= 0)
+                    except Exception:
+                        software_info["poc_uptodate"] = None
+                else:
+                    if not isinstance(software_info.get("poc_uptodate"), bool):
+                        software_info["poc_uptodate"] = None
+
+                has_req = bool(software_info.get("software_version_needed") or software_info.get("poc_version_needed"))
+                if has_req:
+                    sw_bad = (software_info.get("software_uptodate") is False)
+                    poc_bad = (software_info.get("poc_uptodate") is False)
+                    software_info["is_uptodate"] = not (sw_bad or poc_bad)
+                else:
+                    software_info["is_uptodate"] = None
+
+                # MAC block init/update
+                mac_info = _extract_mac_fields(existing_doc)
+                if isinstance(miner_mac_local, str) and miner_mac_local:
+                    mac_info["miner_mac"] = miner_mac_local
+                if isinstance(mac_registered, str) and mac_registered:
+                    mac_info["mac_registered"] = mac_registered
+
+                def _norm_mac_boot(v: Optional[str]) -> str:
+                    try:
+                        return re.sub(r"[^0-9a-f]", "", (v or "").lower())
+                    except Exception:
+                        return ""
+
+                norm_miner = _norm_mac_boot(mac_info.get("miner_mac"))
+                norm_reg = _norm_mac_boot(mac_info.get("mac_registered"))
+                mac_match = bool(norm_miner and norm_reg and norm_miner == norm_reg)
+
+                boot_checked_at = now_utc().isoformat()
+                existing_mac_raw = existing_doc.get("mac")
+                existing_mac: Dict[str, Any] = existing_mac_raw if isinstance(existing_mac_raw, dict) else {}
+
+                mac_status_old = existing_mac.get("status") if isinstance(existing_mac.get("status"), bool) else None
+                last_changed_at = existing_mac.get("last_changed_at") if isinstance(existing_mac.get("last_changed_at"), str) else None
+                if mac_status_old is None or mac_status_old != mac_match:
+                    last_changed_at = boot_checked_at
+                elif not last_changed_at:
+                    last_changed_at = boot_checked_at
+
+                mac_block = {
+                    "status": mac_match,
+                    "last_changed_at": last_changed_at,
+                    "last_checked_at": boot_checked_at,
+                    "evidence": {
+                        "miner_mac": mac_info.get("miner_mac"),
+                        "registered_mac": mac_info.get("mac_registered"),
+                    },
+                }
+
+                # PoL placeholder (write_location_daily fills later)
+                existing_pol_raw = existing_doc.get("pol")
+                pol_block: Dict[str, Any] = existing_pol_raw if isinstance(existing_pol_raw, dict) else {
+                    "status": False,
+                    "last_changed_at": boot_checked_at,
+                    "last_checked_at": boot_checked_at,
+                    "evidence": {},
+                }
+
+                # AEM PoI bootstrap (optional)
+                poi_boot: Optional[bool] = None
+                if miner_type_val == "AEM":
+                    try:
+                        poi_boot = monitor_poi_for_aem()
+                    except Exception:
+                        poi_boot = None
+
+                new_doc = _compose_hardware_doc(
+                    miner_key,
+                    miner_type=miner_type_val,
+                    software=software_info,
+                    last_updated=now_utc(),
+                    poi=poi_boot,
+                    poi_slots=None,
+                )
+
+                new_doc["mac"] = mac_block
+                new_doc["pol"] = pol_block
+
+                # Preserve rewards/history if any exist
+                rewards_raw = existing_doc.get("rewards")
+                new_doc["rewards"] = rewards_raw if isinstance(rewards_raw, dict) else {}
+
+                hist_raw = existing_doc.get("rewards_multiplier_history")
+                new_doc["rewards_multiplier_history"] = hist_raw if isinstance(hist_raw, list) else []
+
+                rmd = existing_doc.get("rewards_multiplier_day")
+                new_doc["rewards_multiplier_day"] = float(rmd) if isinstance(rmd, (int, float)) else 0.0
+                rmcs = existing_doc.get("rewards_multiplier_day_counted_slots")
+                new_doc["rewards_multiplier_day_counted_slots"] = int(rmcs) if isinstance(rmcs, int) else 0
+
+                uptime_raw = existing_doc.get("uptime")
+                if isinstance(uptime_raw, dict):
+                    new_doc["uptime"] = uptime_raw
+
+                boot_raw = existing_doc.get("boot_time")
+                if isinstance(boot_raw, str) and boot_raw:
+                    new_doc["boot_time"] = boot_raw
+
+                new_doc["tz"] = "UTC"
+                new_doc["day"] = day_iso(now_utc())
+
+                coll.replace_one({"miner_key": miner_key}, new_doc, upsert=True)
             except Exception:
                 pass
 
@@ -3253,6 +3335,7 @@ def main():
                 api_health_backoff.reset()
             except Exception:
                 pass
+
         except Exception as e:
             log.error("Initial API connect failed: %s", e)
             try:
@@ -3262,18 +3345,25 @@ def main():
                 pass
             time.sleep(1)
 
+    # ----------------------------
+    # Main monitoring loop
+    # ----------------------------
     warned_version = False
     last_location_day: Optional[str] = None
     last_version_check_hour: Optional[dt.datetime] = None
-    # Begin monitoring immediately so MAC registration/PoI reach the GUI without waiting for the first interval boundary.
+
     while True:
         slot_ts = now_utc()
-        # Determine online status first
+
         status_raw = "online" if is_internet_up(timeout=4) else "offline"
+
         poi_snapshot: Optional[bool] = None
         if MINER_CODE == "AEM":
-            snap = _get_poi_state_snapshot()
-            poi_snapshot = snap.get("last_poi")
+            try:
+                snap = _get_poi_state_snapshot()
+                poi_snapshot = snap.get("last_poi")
+            except Exception:
+                poi_snapshot = None
             if poi_snapshot is None:
                 try:
                     poi_snapshot = monitor_poi_for_aem()
@@ -3283,10 +3373,11 @@ def main():
                 _update_poi_state(last_poi=poi_snapshot)
             except Exception:
                 pass
+
         expected_groups = expected_measurement_groups()
         pod_slot_ok = False if expected_groups else True
         delivered_groups: List[str] = []
-        rewards_multiplier_value = _rewards_multiplier_for_slot(slot_ts, interval, miner_mac_local, mac_registered, poi_snapshot)
+
         if expected_groups:
             if status_raw == "online":
                 try:
@@ -3301,6 +3392,7 @@ def main():
                     pod_slot_ok = False
             else:
                 pod_slot_ok = False
+
         if expected_groups and not pod_slot_ok:
             try:
                 log.debug(
@@ -3311,18 +3403,19 @@ def main():
                 )
             except Exception:
                 pass
+
         status = status_raw
         if MINER_CODE == "AEM":
-            poi_ok = bool(poi_snapshot)
-            if status_raw == "online" and poi_ok:
-                status = "online"
-            else:
-                status = "offline"
-        # Always write the local rolling 24h cache, regardless of DB connectivity
+            status = "online" if (status_raw == "online" and bool(poi_snapshot)) else "offline"
+
+        # ----------------------------
+        # Local weekly cache (ALWAYS)
+        # ----------------------------
         try:
-            norm_active = re.sub(r'[^0-9a-f]', '', (miner_mac_local or '').lower())
-            norm_registered = re.sub(r'[^0-9a-f]', '', (mac_registered or '').lower())
+            norm_active = re.sub(r"[^0-9a-f]", "", (miner_mac_local or "").lower())
+            norm_registered = re.sub(r"[^0-9a-f]", "", (mac_registered or "").lower())
             local_mismatch = bool(norm_active and norm_registered and norm_active != norm_registered)
+
             try:
                 update_kwargs = {
                     "status": status,
@@ -3336,7 +3429,9 @@ def main():
                 _update_poi_state(**update_kwargs)
             except Exception:
                 pass
-            write_status_local(
+
+            # NEW: weekly writer replaces write_status_local
+            write_week_local(
                 miner_key,
                 slot_ts,
                 status,
@@ -3345,53 +3440,58 @@ def main():
                 mac_registered=mac_registered,
                 mac_mismatch=local_mismatch,
                 poi_data=poi_snapshot,
+                gui_version=cfg.get("gui_version") if isinstance(cfg, dict) else None,
             )
         except Exception:
             pass
+
+        # ----------------------------
+        # DB work
+        # ----------------------------
         try:
-            # Refresh required versions at most once per UTC hour
+            # Refresh required versions once per UTC hour
             try:
-                hour_start_for_check = slot_ts.replace(minute=0, second=0, microsecond=0)
-                if (last_version_check_hour is None) or (hour_start_for_check > last_version_check_hour):
+                hour_start = slot_ts.replace(minute=0, second=0, microsecond=0)
+                if (last_version_check_hour is None) or (hour_start > last_version_check_hour):
                     required_versions = required_versions_from_db(client)
-                    last_version_check_hour = hour_start_for_check
+                    last_version_check_hour = hour_start
             except Exception:
                 pass
-            
-            # Check if either software or PoC version is outdated
+
             software_required = required_versions.get("software_version")
             poc_required = required_versions.get("poc_version")
-            outdated: bool = False
-            
+
+            outdated = False
             try:
-                is_software_outdated = isinstance(software_required, str) and software_required and (cmp_ver(SOFTWARE_VERSION, software_required) < 0)
-                is_poc_outdated = isinstance(poc_required, str) and poc_required and (cmp_ver(POC_VERSION, poc_required) < 0)
-                outdated = bool(is_software_outdated or is_poc_outdated)
+                is_sw_out = bool(isinstance(software_required, str) and software_required and (cmp_ver(SOFTWARE_VERSION, software_required) < 0))
+                is_poc_out = bool(isinstance(poc_required, str) and poc_required and (cmp_ver(POC_VERSION, poc_required) < 0))
+                outdated = bool(is_sw_out or is_poc_out)
             except Exception:
                 outdated = False
-            
-                # Warn the user once if this install is behind the required versions
-                try:
-                    if outdated and not warned_version:
-                        if isinstance(software_required, str) and software_required and cmp_ver(SOFTWARE_VERSION, software_required) < 0:
-                            log.warning("Software version %s is below required %s; please update.", SOFTWARE_VERSION, software_required)
-                        if isinstance(poc_required, str) and poc_required and cmp_ver(POC_VERSION, poc_required) < 0:
-                            log.warning("PoC version %s is below required %s; please update.", POC_VERSION, poc_required)
-                        warned_version = True
-                except Exception:
-                    pass
-            # Refresh miner_mac from disk (if GUI selection changed)
+
+            # Warn once if outdated
+            try:
+                if outdated and not warned_version:
+                    if isinstance(software_required, str) and software_required and cmp_ver(SOFTWARE_VERSION, software_required) < 0:
+                        log.warning("Software version %s is below required %s; please update.", SOFTWARE_VERSION, software_required)
+                    if isinstance(poc_required, str) and poc_required and cmp_ver(POC_VERSION, poc_required) < 0:
+                        log.warning("PoC version %s is below required %s; please update.", POC_VERSION, poc_required)
+                    warned_version = True
+            except Exception:
+                pass
+
+            # Refresh miner_mac from disk (GUI selection) or fallback to detect
             try:
                 mm = read_selected_miner_mac()
                 if mm:
                     miner_mac_local = mm
                 else:
-                    # fallback to auto-detection when user hasn't selected a MAC
                     detected = detect_local_mac()
                     if detected:
                         miner_mac_local = detected
             except Exception:
                 pass
+
             # Refresh registered MAC opportunistically
             try:
                 mr = registered_mac_from_devices(client, miner_key)
@@ -3399,25 +3499,32 @@ def main():
                     mac_registered = mr
             except Exception:
                 pass
-            
-            # For AEM miners, reuse PoI snapshot or fetch if missing
+
+            # AEM: if snapshot missing, fetch PoI
             poi_data = poi_snapshot
             if MINER_CODE == "AEM" and poi_data is None:
                 try:
                     poi_data = monitor_poi_for_aem()
                 except Exception:
                     poi_data = None
-            
-            # Write to DB (day/hour aggregates)
-            write_status(coll, miner_key, slot_ts, status, interval,
-                         software_version_needed=software_required,
-                         poc_version_needed=poc_required,
-                         miner_mac=miner_mac_local,
-                         mac_registered=mac_registered,
-                         poi_data=poi_data)
-            # Refresh installation heartbeat each cycle (and mark version state)
+
+            # Write slot snapshot to DB
+            write_status(
+                coll,
+                miner_key,
+                slot_ts,
+                status,
+                interval,
+                software_version_needed=software_required,
+                poc_version_needed=poc_required,
+                miner_mac=miner_mac_local,
+                mac_registered=mac_registered,
+                poi_data=poi_data,
+            )
+
+            # Refresh installation heartbeat
             try:
-                has_requirements = software_required or poc_required
+                has_requirements = bool(software_required or poc_required)
                 upsert_installation_record(
                     client,
                     miner_key,
@@ -3429,43 +3536,40 @@ def main():
                 )
             except Exception:
                 pass
-            
-            # Renew our lease; if renewal fails, try to reacquire (API may have been down)
+
+            # Renew lease; reacquire if needed
             try:
                 renewed = renew_installation_lease(client, miner_key, install_id, lease_seconds=lease_seconds)
                 if not renewed:
                     log.warning("Lease renewal failed, attempting to reacquire...")
-                    # Try to reacquire the lease (handles case where API was down and lease expired)
-                    if not verify_or_acquire_installation_lease(client, miner_key, install_id, lease_seconds=lease_seconds, max_retries=5):
+                    if not verify_or_acquire_installation_lease(
+                        client, miner_key, install_id, lease_seconds=lease_seconds, max_retries=5
+                    ):
                         log.error("Lost global lease for %s and failed to reacquire; exiting.", miner_key)
                         time.sleep(2)
                         sys.exit(8)
-                    else:
-                        log.info("Successfully reacquired lease for %s", miner_key)
+                    log.info("Successfully reacquired lease for %s", miner_key)
             except Exception as e:
-                # API error during renewal - try to reacquire
-                error_msg = str(e)
-                is_api_down = any(x in error_msg.lower() for x in ["502", "503", "504", "bad gateway", "timeout", "connection"])
-                
+                msg = str(e)
+                is_api_down = any(x in msg.lower() for x in ["502", "503", "504", "bad gateway", "timeout", "connection"])
                 if is_api_down:
-                    log.warning("External API unreachable during lease renewal: %s", error_msg)
-                    log.info("Will retry lease acquisition...")
-                    if not verify_or_acquire_installation_lease(client, miner_key, install_id, lease_seconds=lease_seconds, max_retries=5):
+                    log.warning("External API unreachable during lease renewal: %s", msg)
+                    if not verify_or_acquire_installation_lease(
+                        client, miner_key, install_id, lease_seconds=lease_seconds, max_retries=5
+                    ):
                         log.error("Failed to reacquire lease for %s; exiting.", miner_key)
                         time.sleep(2)
                         sys.exit(8)
-                    else:
-                        log.info("Successfully reacquired lease for %s after API recovery", miner_key)
+                    log.info("Successfully reacquired lease for %s after API recovery", miner_key)
                 else:
                     log.error("Failed to renew lease for %s: %s; exiting.", miner_key, e)
                     time.sleep(2)
                     sys.exit(8)
 
-            # Record daily location once per day (res4 via IP) with hexId(res7) containment check
+            # Once-per-day location check (does NOT touch lastUpdated)
             try:
                 day = day_iso(slot_ts)
                 if last_location_day != day:
-                    # finalize yesterday's day TS for this miner
                     write_location_daily(coll, client, miner_key, slot_ts)
                     last_location_day = day
             except Exception:
@@ -3492,6 +3596,7 @@ def main():
                     pass
             except Exception as e2:
                 log.error("Reconnect failed: %s", e2)
+
         except Exception as e:
             log.error("Iteration failed: %s", e)
 
@@ -3499,7 +3604,7 @@ def main():
         while next_wake <= now_utc():
             next_wake += dt.timedelta(seconds=interval)
         time.sleep(int((next_wake - now_utc()).total_seconds()))
-    # exit after loop (conflict)
+
     sys.exit(8)
 
 if __name__ == "__main__":
