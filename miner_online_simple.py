@@ -2177,6 +2177,7 @@ def write_week_local(
     mac_mismatch: Optional[bool] = None,
     poi_data: Optional[bool] = None,       # AEM only
     gui_version: Optional[str] = None,
+    skip_slot: bool = False,
 ) -> None:
     """
     One file per rewards-week (Fri 00:00 UTC → next Fri 00:00 UTC).
@@ -2190,6 +2191,17 @@ def write_week_local(
     path = _week_file_path(week_start)
     lock_path = path + ".lock"
 
+    def _commit(doc_obj: Dict[str, Any]) -> None:
+        doc_obj["lastUpdated"] = _iso_z(now_utc())
+        try:
+            sig_val = compute_cache_signature(doc_obj)
+            if isinstance(sig_val, str) and sig_val:
+                doc_obj["sig"] = sig_val
+        except Exception:
+            pass
+        with _CacheLock(lock_path):
+            atomic_write_json(path, doc_obj)
+
     # Load existing weekly doc
     with _CacheLock(lock_path):
         doc_raw = read_local_cache(path)
@@ -2202,16 +2214,19 @@ def write_week_local(
     # Base fields (match your schema)
     doc["miner_key"] = miner_key
     doc["minerCode"] = MINER_CODE
+
     if isinstance(mac_registered, str) and mac_registered.strip():
         doc["mac_registered"] = mac_registered.strip()
     else:
         doc["mac_registered"] = doc.get("mac_registered", "")
+
     doc["mac_mismatch"] = bool(mac_mismatch) if mac_mismatch is not None else bool(doc.get("mac_mismatch", False))
 
-    if isinstance(gui_version, str) and gui_version.strip():
-        doc["GUI_version"] = gui_version.strip()
-    else:
-        doc["GUI_version"] = doc.get("GUI_version", "")
+    # Always populate GUI_version (prefer explicit arg, fallback to global)
+    gv = gui_version.strip() if isinstance(gui_version, str) and gui_version.strip() else ""
+    if not gv:
+        gv = GUI_VERSION.strip() if isinstance(GUI_VERSION, str) and GUI_VERSION.strip() else ""
+    doc["GUI_version"] = gv
 
     doc["date"] = _date_iso(ts_utc)
     doc["week_start"] = _iso_z(week_start)
@@ -2220,6 +2235,10 @@ def write_week_local(
     # Ensure days dict exists
     days = _safe_dict(doc.get("days"))
     doc["days"] = days
+
+    if skip_slot:
+        _commit(doc)
+        return
 
     day_key = _date_iso(ts_utc)
     day_doc = _safe_dict(days.get(day_key))
@@ -2344,19 +2363,7 @@ def write_week_local(
     slot_floor = ts_utc.replace(hour=0, minute=0, second=0, microsecond=0) + dt.timedelta(seconds=floored)
 
     doc["lastSlotWritten"] = _iso_z(slot_floor)
-    doc["lastUpdated"] = _iso_z(now_utc())
-
-    # Optional signature
-    try:
-        sig = compute_cache_signature(doc)
-        if isinstance(sig, str) and sig:
-            doc["sig"] = sig
-    except Exception:
-        pass
-
-    # Write atomically
-    with _CacheLock(lock_path):
-        atomic_write_json(path, doc)
+    _commit(doc)
 
 def _start_poi_local_loop(miner_key: str, interval_seconds: int, poll_seconds: int) -> None:
     """Launch a background loop that refreshes PoI in the WEEKLY local cache more frequently (AEM only)."""
@@ -2390,7 +2397,7 @@ def _start_poi_local_loop(miner_key: str, interval_seconds: int, poll_seconds: i
                     mac_registered=mac_registered,
                     mac_mismatch=mac_mismatch,
                     poi_data=installed,
-                    gui_version=snap.get("GUI_version"),
+                    gui_version=GUI_VERSION,
                 )
 
                 _update_poi_state(last_poi=installed)
@@ -3029,6 +3036,32 @@ def main() -> None:
             except Exception:
                 mac_registered = mac_registered or None
 
+            if mac_registered:
+                try:
+                    norm_active_boot = re.sub(r"[^0-9a-f]", "", (miner_mac_local or "").lower())
+                    norm_registered_boot = re.sub(r"[^0-9a-f]", "", mac_registered.lower())
+                    boot_mismatch = bool(norm_active_boot and norm_registered_boot and norm_active_boot != norm_registered_boot)
+                except Exception:
+                    boot_mismatch = False
+                try:
+                    _update_poi_state(mac_registered=mac_registered, mac_mismatch=boot_mismatch)
+                except Exception:
+                    pass
+                try:
+                    write_week_local(
+                        miner_key,
+                        now_utc(),
+                        "offline",
+                        interval,
+                        pod_status=None,
+                        mac_registered=mac_registered,
+                        mac_mismatch=boot_mismatch,
+                        gui_version=GUI_VERSION,
+                        skip_slot=True,
+                    )
+                except Exception:
+                    pass
+
             # Bootstrap DB doc so UI sees everything immediately
             try:
                 existing_doc_raw = _get_existing_hardware_doc(coll, miner_key)
@@ -3187,232 +3220,243 @@ def main() -> None:
     warned_version = False
     last_location_day: Optional[str] = None
     last_version_check_hour: Optional[dt.datetime] = None
+    next_slot_time: Optional[dt.datetime] = None
 
     while True:
-        slot_ts = now_utc()
+        now_loop = now_utc()
+        if next_slot_time is None:
+            next_slot_time = next_boundary(now_loop, interval)
+        if now_loop + dt.timedelta(seconds=1) < next_slot_time:
+            sleep_for = max(1.0, min(5.0, (next_slot_time - now_loop).total_seconds()))
+            time.sleep(sleep_for)
+            continue
+        slot_ts = next_slot_time
 
-        status_raw = "online" if is_internet_up(timeout=4) else "offline"
+        try:
+            status_raw = "online" if is_internet_up(timeout=4) else "offline"
 
-        poi_snapshot: Optional[bool] = None
-        if MINER_CODE == "AEM":
-            try:
-                snap = _get_poi_state_snapshot()
-                poi_snapshot = snap.get("last_poi")
-            except Exception:
-                poi_snapshot = None
-            if poi_snapshot is None:
+            poi_snapshot: Optional[bool] = None
+            if MINER_CODE == "AEM":
                 try:
-                    poi_snapshot = monitor_poi_for_aem()
+                    snap = _get_poi_state_snapshot()
+                    poi_snapshot = snap.get("last_poi")
                 except Exception:
                     poi_snapshot = None
+                if poi_snapshot is None:
+                    try:
+                        poi_snapshot = monitor_poi_for_aem()
+                    except Exception:
+                        poi_snapshot = None
+                try:
+                    _update_poi_state(last_poi=poi_snapshot)
+                except Exception:
+                    pass
+
+            expected_groups = expected_measurement_groups()
+            pod_slot_ok = False if expected_groups else True
+            delivered_groups: List[str] = []
+
+            if expected_groups:
+                if status_raw == "online":
+                    try:
+                        pod_slot_ok, delivered_groups = upload_measurements_for_slot(
+                            client,
+                            miner_key,
+                            install_id,
+                            expected_groups=expected_groups,
+                        )
+                    except Exception as e:
+                        log.error("Measurement upload error: %s", e)
+                        pod_slot_ok = False
+                else:
+                    pod_slot_ok = False
+
+            if expected_groups and not pod_slot_ok:
+                try:
+                    log.debug(
+                        "PoD incomplete for %s: expected %s delivered %s",
+                        miner_key,
+                        expected_groups,
+                        delivered_groups,
+                    )
+                except Exception:
+                    pass
+
+            status = status_raw
+            if MINER_CODE == "AEM":
+                status = "online" if (status_raw == "online" and bool(poi_snapshot)) else "offline"
+
+            # ----------------------------
+            # Local weekly cache (ALWAYS)
+            # ----------------------------
             try:
-                _update_poi_state(last_poi=poi_snapshot)
+                norm_active = re.sub(r"[^0-9a-f]", "", (miner_mac_local or "").lower())
+                norm_registered = re.sub(r"[^0-9a-f]", "", (mac_registered or "").lower())
+                local_mismatch = bool(norm_active and norm_registered and norm_active != norm_registered)
+
+                try:
+                    update_kwargs = {
+                        "status": status,
+                        "pod_status": pod_slot_ok,
+                        "mac_registered": mac_registered,
+                        "mac_mismatch": local_mismatch,
+                        "interval": interval,
+                    }
+                    if MINER_CODE == "AEM":
+                        update_kwargs["last_poi"] = poi_snapshot
+                    _update_poi_state(**update_kwargs)
+                except Exception:
+                    pass
+
+                # NEW: weekly writer replaces write_status_local
+                write_week_local(
+                    miner_key,
+                    slot_ts,
+                    status,
+                    interval,
+                    pod_status=pod_slot_ok,
+                    mac_registered=mac_registered,
+                    mac_mismatch=local_mismatch,
+                    poi_data=poi_snapshot,
+                    gui_version=GUI_VERSION,
+                )
             except Exception:
                 pass
 
-        expected_groups = expected_measurement_groups()
-        pod_slot_ok = False if expected_groups else True
-        delivered_groups: List[str] = []
-
-        if expected_groups:
-            if status_raw == "online":
+            # ----------------------------
+            # DB work
+            # ----------------------------
+            try:
+                # Refresh required versions once per UTC hour
                 try:
-                    pod_slot_ok, delivered_groups = upload_measurements_for_slot(
+                    hour_start = slot_ts.replace(minute=0, second=0, microsecond=0)
+                    if (last_version_check_hour is None) or (hour_start > last_version_check_hour):
+                        required_versions = required_versions_from_db(client)
+                        last_version_check_hour = hour_start
+                except Exception:
+                    pass
+
+                software_required = required_versions.get("software_version")
+                poc_required = required_versions.get("poc_version")
+
+                outdated = False
+                try:
+                    is_sw_out = bool(isinstance(software_required, str) and software_required and (cmp_ver(SOFTWARE_VERSION, software_required) < 0))
+                    is_poc_out = bool(isinstance(poc_required, str) and poc_required and (cmp_ver(POC_VERSION, poc_required) < 0))
+                    outdated = bool(is_sw_out or is_poc_out)
+                except Exception:
+                    outdated = False
+
+                # Warn once if outdated
+                try:
+                    if outdated and not warned_version:
+                        if isinstance(software_required, str) and software_required and cmp_ver(SOFTWARE_VERSION, software_required) < 0:
+                            log.warning("Software version %s is below required %s; please update.", SOFTWARE_VERSION, software_required)
+                        if isinstance(poc_required, str) and poc_required and cmp_ver(POC_VERSION, poc_required) < 0:
+                            log.warning("PoC version %s is below required %s; please update.", POC_VERSION, poc_required)
+                        warned_version = True
+                except Exception:
+                    pass
+
+                # Refresh miner_mac from disk (GUI selection) or fallback to detect
+                try:
+                    mm = read_selected_miner_mac()
+                    if mm:
+                        miner_mac_local = mm
+                    else:
+                        detected = detect_local_mac()
+                        if detected:
+                            miner_mac_local = detected
+                except Exception:
+                    pass
+
+                # Refresh registered MAC opportunistically
+                try:
+                    mr = registered_mac_from_devices(client, miner_key)
+                    if mr:
+                        mac_registered = mr
+                except Exception:
+                    pass
+
+                # AEM: if snapshot missing, fetch PoI
+                poi_data = poi_snapshot
+                if MINER_CODE == "AEM" and poi_data is None:
+                    try:
+                        poi_data = monitor_poi_for_aem()
+                    except Exception:
+                        poi_data = None
+
+                # Write slot snapshot to DB
+                write_status(
+                    coll,
+                    miner_key,
+                    slot_ts,
+                    status,
+                    interval,
+                    software_version_needed=software_required,
+                    poc_version_needed=poc_required,
+                    miner_mac=miner_mac_local,
+                    mac_registered=mac_registered,
+                    poi_data=poi_data,
+                )
+
+                # Refresh installation heartbeat
+                try:
+                    has_requirements = bool(software_required or poc_required)
+                    upsert_installation_record(
                         client,
                         miner_key,
                         install_id,
-                        expected_groups=expected_groups,
+                        software_version_needed=software_required,
+                        poc_version_needed=poc_required,
+                        is_uptodate=(False if (has_requirements and outdated) else (True if has_requirements else None)),
+                        is_outdated=outdated,
                     )
-                except Exception as e:
-                    log.error("Measurement upload error: %s", e)
-                    pod_slot_ok = False
-            else:
-                pod_slot_ok = False
-
-        if expected_groups and not pod_slot_ok:
-            try:
-                log.debug(
-                    "PoD incomplete for %s: expected %s delivered %s",
-                    miner_key,
-                    expected_groups,
-                    delivered_groups,
-                )
-            except Exception:
-                pass
-
-        status = status_raw
-        if MINER_CODE == "AEM":
-            status = "online" if (status_raw == "online" and bool(poi_snapshot)) else "offline"
-
-        # ----------------------------
-        # Local weekly cache (ALWAYS)
-        # ----------------------------
-        try:
-            norm_active = re.sub(r"[^0-9a-f]", "", (miner_mac_local or "").lower())
-            norm_registered = re.sub(r"[^0-9a-f]", "", (mac_registered or "").lower())
-            local_mismatch = bool(norm_active and norm_registered and norm_active != norm_registered)
-
-            try:
-                update_kwargs = {
-                    "status": status,
-                    "pod_status": pod_slot_ok,
-                    "mac_registered": mac_registered,
-                    "mac_mismatch": local_mismatch,
-                    "interval": interval,
-                }
-                if MINER_CODE == "AEM":
-                    update_kwargs["last_poi"] = poi_snapshot
-                _update_poi_state(**update_kwargs)
-            except Exception:
-                pass
-
-            # NEW: weekly writer replaces write_status_local
-            write_week_local(
-                miner_key,
-                slot_ts,
-                status,
-                interval,
-                pod_status=pod_slot_ok,
-                mac_registered=mac_registered,
-                mac_mismatch=local_mismatch,
-                poi_data=poi_snapshot,
-                gui_version=cfg.get("gui_version") if isinstance(cfg, dict) else None,
-            )
-        except Exception:
-            pass
-
-        # ----------------------------
-        # DB work
-        # ----------------------------
-        try:
-            # Refresh required versions once per UTC hour
-            try:
-                hour_start = slot_ts.replace(minute=0, second=0, microsecond=0)
-                if (last_version_check_hour is None) or (hour_start > last_version_check_hour):
-                    required_versions = required_versions_from_db(client)
-                    last_version_check_hour = hour_start
-            except Exception:
-                pass
-
-            software_required = required_versions.get("software_version")
-            poc_required = required_versions.get("poc_version")
-
-            outdated = False
-            try:
-                is_sw_out = bool(isinstance(software_required, str) and software_required and (cmp_ver(SOFTWARE_VERSION, software_required) < 0))
-                is_poc_out = bool(isinstance(poc_required, str) and poc_required and (cmp_ver(POC_VERSION, poc_required) < 0))
-                outdated = bool(is_sw_out or is_poc_out)
-            except Exception:
-                outdated = False
-
-            # Warn once if outdated
-            try:
-                if outdated and not warned_version:
-                    if isinstance(software_required, str) and software_required and cmp_ver(SOFTWARE_VERSION, software_required) < 0:
-                        log.warning("Software version %s is below required %s; please update.", SOFTWARE_VERSION, software_required)
-                    if isinstance(poc_required, str) and poc_required and cmp_ver(POC_VERSION, poc_required) < 0:
-                        log.warning("PoC version %s is below required %s; please update.", POC_VERSION, poc_required)
-                    warned_version = True
-            except Exception:
-                pass
-
-            # Refresh miner_mac from disk (GUI selection) or fallback to detect
-            try:
-                mm = read_selected_miner_mac()
-                if mm:
-                    miner_mac_local = mm
-                else:
-                    detected = detect_local_mac()
-                    if detected:
-                        miner_mac_local = detected
-            except Exception:
-                pass
-
-            # Refresh registered MAC opportunistically
-            try:
-                mr = registered_mac_from_devices(client, miner_key)
-                if mr:
-                    mac_registered = mr
-            except Exception:
-                pass
-
-            # AEM: if snapshot missing, fetch PoI
-            poi_data = poi_snapshot
-            if MINER_CODE == "AEM" and poi_data is None:
-                try:
-                    poi_data = monitor_poi_for_aem()
                 except Exception:
-                    poi_data = None
+                    pass
 
-            # Write slot snapshot to DB
-            write_status(
-                coll,
-                miner_key,
-                slot_ts,
-                status,
-                interval,
-                software_version_needed=software_required,
-                poc_version_needed=poc_required,
-                miner_mac=miner_mac_local,
-                mac_registered=mac_registered,
-                poi_data=poi_data,
-            )
-
-            # Refresh installation heartbeat
-            try:
-                has_requirements = bool(software_required or poc_required)
-                upsert_installation_record(
-                    client,
-                    miner_key,
-                    install_id,
-                    software_version_needed=software_required,
-                    poc_version_needed=poc_required,
-                    is_uptodate=(False if (has_requirements and outdated) else (True if has_requirements else None)),
-                    is_outdated=outdated,
-                )
-            except Exception:
-                pass
-
-            # Renew lease; reacquire if needed
-            try:
-                renewed = renew_installation_lease(client, miner_key, install_id, lease_seconds=lease_seconds)
-                if not renewed:
-                    log.warning("Lease renewal failed, attempting to reacquire...")
-                    if not verify_or_acquire_installation_lease(
-                        client, miner_key, install_id, lease_seconds=lease_seconds, max_retries=5
-                    ):
-                        log.error("Lost global lease for %s and failed to reacquire; exiting.", miner_key)
+                # Renew lease; reacquire if needed
+                try:
+                    renewed = renew_installation_lease(client, miner_key, install_id, lease_seconds=lease_seconds)
+                    if not renewed:
+                        log.warning("Lease renewal failed, attempting to reacquire...")
+                        if not verify_or_acquire_installation_lease(
+                            client, miner_key, install_id, lease_seconds=lease_seconds, max_retries=5
+                        ):
+                            log.error("Lost global lease for %s and failed to reacquire; exiting.", miner_key)
+                            time.sleep(2)
+                            sys.exit(8)
+                        log.info("Successfully reacquired lease for %s", miner_key)
+                except Exception as e:
+                    msg = str(e)
+                    is_api_down = any(x in msg.lower() for x in ["502", "503", "504", "bad gateway", "timeout", "connection"])
+                    if is_api_down:
+                        log.warning("External API unreachable during lease renewal: %s", msg)
+                        if not verify_or_acquire_installation_lease(
+                            client, miner_key, install_id, lease_seconds=lease_seconds, max_retries=5
+                        ):
+                            log.error("Failed to reacquire lease for %s; exiting.", miner_key)
+                            time.sleep(2)
+                            sys.exit(8)
+                        log.info("Successfully reacquired lease for %s after API recovery", miner_key)
+                    else:
+                        log.error("Failed to renew lease for %s: %s; exiting.", miner_key, e)
                         time.sleep(2)
                         sys.exit(8)
-                    log.info("Successfully reacquired lease for %s", miner_key)
-            except Exception as e:
-                msg = str(e)
-                is_api_down = any(x in msg.lower() for x in ["502", "503", "504", "bad gateway", "timeout", "connection"])
-                if is_api_down:
-                    log.warning("External API unreachable during lease renewal: %s", msg)
-                    if not verify_or_acquire_installation_lease(
-                        client, miner_key, install_id, lease_seconds=lease_seconds, max_retries=5
-                    ):
-                        log.error("Failed to reacquire lease for %s; exiting.", miner_key)
-                        time.sleep(2)
-                        sys.exit(8)
-                    log.info("Successfully reacquired lease for %s after API recovery", miner_key)
-                else:
-                    log.error("Failed to renew lease for %s: %s; exiting.", miner_key, e)
-                    time.sleep(2)
-                    sys.exit(8)
 
-            # Once-per-day location check (does NOT touch lastUpdated)
-            try:
-                day = day_iso(slot_ts)
-                if last_location_day != day:
-                    write_location_daily(coll, client, miner_key, slot_ts)
-                    last_location_day = day
-            except Exception:
-                pass
+                # Once-per-day location check (does NOT touch lastUpdated)
+                try:
+                    day = day_iso(slot_ts)
+                    if last_location_day != day:
+                        write_location_daily(coll, client, miner_key, slot_ts)
+                        last_location_day = day
+                except Exception:
+                    pass
 
-            try:
-                api_health_backoff.reset()
+                try:
+                    api_health_backoff.reset()
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -3435,11 +3479,11 @@ def main() -> None:
 
         except Exception as e:
             log.error("Iteration failed: %s", e)
-
-        next_wake = next_boundary(slot_ts, interval)
-        while next_wake <= now_utc():
-            next_wake += dt.timedelta(seconds=interval)
-        time.sleep(int((next_wake - now_utc()).total_seconds()))
+        finally:
+            try:
+                next_slot_time = next_boundary(slot_ts, interval)
+            except Exception:
+                next_slot_time = None
 
     sys.exit(8)
 
