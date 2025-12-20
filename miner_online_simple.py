@@ -2855,7 +2855,244 @@ def _release_service_lock() -> None:
     finally:
         _LOCK_FH = None
 
+# ============================================================================
+# CLI Utilities for Installers
+# ============================================================================
+
+def _create_cli_parser() -> argparse.ArgumentParser:
+    """Create argument parser for CLI utilities."""
+    parser = argparse.ArgumentParser(
+        prog=f"FRY_PoC_{MINER_CODE}",
+        description=f"FryNetworks {MINER_CODE} Miner PoC Service v{VERSION}",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+CLI Utilities for Installers:
+  --check-key KEY       Verify miner key exists in database
+  --check-version KEY   Check software version requirements
+  --check-concurrency KEY  Detect concurrent installations
+  --lease-dump KEY      Debug lease information
+
+Service Mode (no arguments):
+  Runs the monitoring service. Requires miner_config.enc and install_config.enc.
+"""
+    )
+
+    # CLI utility arguments (mutually exclusive)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        '--check-key', metavar='MINER_KEY',
+        help='Verify miner key exists in database. Exit: 0=exists, 3=not found, 2=bad format'
+    )
+    group.add_argument(
+        '--check-version', metavar='MINER_KEY',
+        help='Check software version requirements. Prints JSON. Exit: 0=up-to-date, 7=outdated'
+    )
+    group.add_argument(
+        '--check-concurrency', metavar='MINER_KEY',
+        help='Detect concurrent installations. Prints JSON. Exit: 0=clear, 8=conflict'
+    )
+    group.add_argument(
+        '--lease-dump', metavar='MINER_KEY',
+        help='Debug: dump lease information for this miner key'
+    )
+    group.add_argument(
+        '--version', action='store_true',
+        help='Print version information and exit'
+    )
+
+    return parser
+
+
+def _validate_miner_key_format(miner_key: str) -> bool:
+    """Validate miner key format: {MINER_CODE}-[A-Z0-9]{32}"""
+    valid_codes = {'BM', 'IDM', 'ODM', 'ISM', 'OSM', 'RDN', 'SDN', 'SVN', 'AEM', 'IRM'}
+    match = re.match(r'^([A-Z]{2,3})-[A-Z0-9]{32}$', miner_key)
+    if not match:
+        return False
+    return match.group(1) in valid_codes
+
+
+def _cli_check_key(miner_key: str) -> int:
+    """Verify miner key exists in database. Returns exit code."""
+    if not _validate_miner_key_format(miner_key):
+        print(json.dumps({"ok": False, "error": "Invalid miner key format", "miner_key": miner_key}))
+        return 2
+
+    try:
+        cfg = load_config()
+        api_base = require_api_base(cfg)
+        client = connect_mongo(api_base, None, cfg)
+
+        # Check if device exists
+        doc = client["main"]["devices"].find_one({"miner_key": miner_key})
+
+        if doc:
+            print(json.dumps({"ok": True, "exists": True, "miner_key": miner_key}))
+            return 0
+        else:
+            print(json.dumps({"ok": False, "exists": False, "miner_key": miner_key}))
+            return 3
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": str(e), "miner_key": miner_key}))
+        return 4
+
+
+def _cli_check_version(miner_key: str) -> int:
+    """Check software version requirements. Returns exit code."""
+    if not _validate_miner_key_format(miner_key):
+        print(json.dumps({"ok": False, "error": "Invalid miner key format"}))
+        return 2
+
+    try:
+        cfg = load_config()
+        api_base = require_api_base(cfg)
+        client = connect_mongo(api_base, None, cfg)
+
+        required = required_versions_from_db(client)
+        software_needed = required.get("software_version", "")
+        poc_needed = required.get("poc_version", "")
+
+        software_ok = True
+        poc_ok = True
+
+        if software_needed:
+            software_ok = cmp_ver(SOFTWARE_VERSION, software_needed) >= 0
+        if poc_needed:
+            poc_ok = cmp_ver(POC_VERSION, poc_needed) >= 0
+
+        is_ok = software_ok and poc_ok
+
+        result = {
+            "ok": is_ok,
+            "software_version_installed": SOFTWARE_VERSION,
+            "software_version_needed": software_needed or None,
+            "software_uptodate": software_ok,
+            "poc_version_installed": POC_VERSION,
+            "poc_version_needed": poc_needed or None,
+            "poc_uptodate": poc_ok,
+        }
+        print(json.dumps(result))
+        return 0 if is_ok else 7
+
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 4
+
+
+def _cli_check_concurrency(miner_key: str) -> int:
+    """Detect concurrent installations. Returns exit code."""
+    if not _validate_miner_key_format(miner_key):
+        print(json.dumps({"ok": False, "error": "Invalid miner key format"}))
+        return 2
+
+    try:
+        cfg = load_config()
+        api_base = require_api_base(cfg)
+        client = connect_mongo(api_base, None, cfg)
+
+        # Check lease status
+        status = client._api.lease_status(miner_key)
+
+        if not isinstance(status, dict):
+            print(json.dumps({"ok": True, "conflict": False, "active_lease": False}))
+            return 0
+
+        active = status.get("active", False)
+        holder = status.get("holder_install_id", "")
+        ttl = status.get("ttl_seconds")
+
+        if active and holder:
+            result = {
+                "ok": False,
+                "conflict": True,
+                "active_lease": True,
+                "holder_install_id": holder,
+                "ttl_seconds": ttl,
+            }
+            print(json.dumps(result))
+            return 8
+        else:
+            print(json.dumps({"ok": True, "conflict": False, "active_lease": False}))
+            return 0
+
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 4
+
+
+def _cli_lease_dump(miner_key: str) -> int:
+    """Debug: dump lease information for a miner key."""
+    if not _validate_miner_key_format(miner_key):
+        print(json.dumps({"ok": False, "error": "Invalid miner key format"}, indent=2))
+        return 2
+
+    try:
+        cfg = load_config()
+        api_base = require_api_base(cfg)
+        client = connect_mongo(api_base, None, cfg)
+
+        status = client._api.lease_status(miner_key)
+
+        result = {
+            "miner_key": miner_key,
+            "lease_status": status if isinstance(status, dict) else None,
+            "checked_at": now_utc().isoformat(),
+        }
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+        return 4
+
+
+def _cli_version() -> int:
+    """Print version information."""
+    info = {
+        "miner_code": MINER_CODE,
+        "version": VERSION,
+        "software_version": SOFTWARE_VERSION,
+        "poc_version": POC_VERSION,
+        "gui_version": GUI_VERSION or None,
+    }
+    print(json.dumps(info, indent=2))
+    return 0
+
+
+def _handle_cli_args() -> bool:
+    """Handle CLI arguments. Returns True if a CLI command was executed."""
+    parser = _create_cli_parser()
+
+    # If no arguments, return False to continue to service mode
+    if len(sys.argv) == 1:
+        return False
+
+    args = parser.parse_args()
+
+    if args.version:
+        sys.exit(_cli_version())
+
+    if args.check_key:
+        sys.exit(_cli_check_key(args.check_key))
+
+    if args.check_version:
+        sys.exit(_cli_check_version(args.check_version))
+
+    if args.check_concurrency:
+        sys.exit(_cli_check_concurrency(args.check_concurrency))
+
+    if args.lease_dump:
+        sys.exit(_cli_lease_dump(args.lease_dump))
+
+    # No CLI command matched, continue to service mode
+    return False
+
+
 def main() -> None:
+    # Check for CLI utility commands first
+    if _handle_cli_args():
+        return
+
     # Installer handles miner key validation + initial lease acquisition
     _init_service_file_logging()
 

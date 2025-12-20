@@ -463,8 +463,105 @@ Get-ChildItem "$env:PROGRAMDATA\FryNetworks\miner-BM\miner_config.enc"
 ## Future Enhancements
 
 - [ ] Key rotation support (coordinated miner_key updates)
-- [ ] Measurement queuing (retain last N measurements for resilience)
+- [x] Measurement queuing (retain last N measurements for resilience) - **Implemented in `measurement_manager.py`**
 - [ ] Compression for large payloads
-- [ ] Batch uploads for efficiency
-- [ ] Integrity hash (SHA-256) alongside ciphertext
-- [ ] Configurable upload intervals
+- [x] Batch uploads for efficiency - **Implemented in `measurement_manager.py`**
+- [x] Integrity hash (SHA-256) alongside ciphertext - **Implemented in `measurement_manager.py`**
+- [x] Configurable upload intervals - **Implemented in `measurement_manager.py`**
+
+---
+
+## New Features (measurement_manager.py)
+
+The `measurement_manager.py` module implements enhanced measurement handling with:
+
+### Measurement Queuing
+
+Retain last N measurements per group for resilience against transient upload failures:
+
+```python
+from measurement_manager import MeasurementManager
+
+# Initialize manager with 10-measurement queue per group
+manager = MeasurementManager(
+    miner_key="BM-ABC123...",
+    miner_code="BM",
+    data_dir="/var/lib/frynetworks/miner-BM",
+    queue_size=10,
+)
+
+# Add measurement to queue
+manager.add_measurement("Bandwidth", {"dl": 125.42, "ul": 23.15, "iface": "eth0"})
+
+# Get pending measurements
+pending = manager.get_pending_measurements()
+```
+
+### SHA-256 Integrity Hash
+
+Encrypted files now include integrity verification:
+
+```python
+# Encrypt with hash
+result = manager.encrypt_measurement(data)
+if result:
+    encrypted_bytes, sha256_hash = result
+
+# Decrypt with verification
+data = manager.decrypt_measurement(encrypted_bytes, expected_hash=sha256_hash)
+
+# Write file with hash sidecar
+manager.write_encrypted_file("Bandwidth", data, include_hash=True)
+# Creates: measurements-Bandwidth-latest.json.enc
+#          measurements-Bandwidth-latest.sha256
+```
+
+### Batch Uploads
+
+Upload multiple measurements efficiently:
+
+```python
+from measurement_manager import batch_upload_measurements
+
+# Prepare batch (removes from queue)
+batch, timestamps_map = manager.prepare_batch_upload(max_count=50)
+
+# Upload batch
+success, failure, delivered = batch_upload_measurements(
+    api_client, hex_id, batch, miner_code, install_id
+)
+
+# Mark successful uploads
+manager.mark_uploaded(timestamps_map)
+```
+
+### Configurable Upload Intervals
+
+Set per-group upload intervals:
+
+```python
+manager.set_upload_interval("Bandwidth", 600)   # 10 minutes
+manager.set_upload_interval("Radiation", 300)   # 5 minutes
+
+# Check if upload is due
+if manager.is_upload_due("Bandwidth"):
+    # Perform upload
+    manager.record_upload("Bandwidth")
+```
+
+### Queue Statistics
+
+Monitor queue health:
+
+```python
+stats = manager.get_queue_stats()
+# Returns: {
+#     "Bandwidth": {
+#         "size": 5,
+#         "max_size": 10,
+#         "upload_interval": 600,
+#         "last_upload": 1700000000.0,
+#         "upload_due": True
+#     }
+# }
+```

@@ -375,9 +375,15 @@ HardwarePoC/
 ├── external_api.py                 # HTTP API client
 ├── mongo_api_proxy.py              # MongoDB proxy client
 ├── cache_integrity.py              # Local cache signing/verification
-├── build_windows.ps1               # Windows build script
-├── build_with_embedded_config.py   # Alternative Python build script
+├── measurement_manager.py          # Enhanced measurement handling (NEW)
+├── poi_monitor_aem.py              # AEM Proof of Installation monitor
+├── build_PoC_windows.ps1           # Windows build script
+├── build_PoC_linux.sh              # Linux build script
+├── build_all_PoC_windows.ps1       # Build all miner types (Windows)
+├── build_all_PoC_linux.sh          # Build all miner types (Linux)
 ├── create_miner_config.py          # Miner config encryption utility
+├── create_install_config.py        # Install config encryption utility
+├── create_sdk_config.py            # SDK config encryption utility (NEW)
 ├── tools/
 │   ├── make_encrypted_config.py    # API credential encryption
 │   ├── make_profile.py             # Profile generation
@@ -387,6 +393,18 @@ HardwarePoC/
     ├── BUILD_GUIDE.md              # Detailed build instructions
     └── ENCRYPTED_MINER_CONFIG_SOLUTION.md  # Security architecture
 ```
+
+### New Modules
+
+**`measurement_manager.py`** - Enhanced measurement handling with:
+- Measurement queuing (retain last N for resilience)
+- SHA-256 integrity hashes alongside encrypted data
+- Batch uploads for efficiency
+- Configurable per-group upload intervals
+
+**`create_sdk_config.py`** - SDK approval configuration for BM miners:
+- Encrypts Bright/Honeygain/Mysterium approval settings
+- CLI: `python create_sdk_config.py create --bright true --honeygain true`
 
 ### Key Dependencies
 
