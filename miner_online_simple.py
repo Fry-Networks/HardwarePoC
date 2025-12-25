@@ -543,14 +543,44 @@ def read_text_optional(path: str) -> str:
     except Exception:
         return ""
 
+def _config_file_candidates(filename: str) -> List[str]:
+    """Return possible locations for encrypted config files."""
+    candidates: List[str] = []
+    try:
+        candidates.append(os.path.join(data_dir(), "config", filename))
+    except Exception:
+        pass
+    try:
+        candidates.append(os.path.join(data_dir(), filename))
+    except Exception:
+        pass
+    # Development fallback: repo-local config
+    try:
+        candidates.append(os.path.join(app_dir(), "config", filename))
+    except Exception:
+        pass
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    uniq: List[str] = []
+    for path in candidates:
+        if path and path not in seen:
+            seen.add(path)
+            uniq.append(path)
+    return uniq
+
 def read_encrypted_miner_config() -> Optional[str]:
     """Read miner key from encrypted config file if present."""
     try:
-        config_path = os.path.join(app_dir(), "config", "miner_config.enc")
-        if not os.path.exists(config_path):
+        config_data: Optional[dict[str, Any]] = None
+        for config_path in _config_file_candidates("miner_config.enc"):
+            if not os.path.exists(config_path):
+                continue
+            with open(config_path, 'r') as f:
+                encrypted_data = json.load(f)
+            config_data = encrypted_data
+            break
+        if not isinstance(config_data, dict):
             return None
-        with open(config_path, 'r') as f:
-            encrypted_data = json.load(f)
         # Decrypt using the same method as the API config
         # We'll use a simple key derivation for the miner config
         from cryptography.fernet import Fernet
@@ -570,7 +600,7 @@ def read_encrypted_miner_config() -> Optional[str]:
         key = base64.urlsafe_b64encode(kdf.derive(password))
         # Decrypt
         f = Fernet(key)
-        decrypted_data = f.decrypt(encrypted_data['data'].encode())
+        decrypted_data = f.decrypt(config_data['data'].encode())
         config_data = json.loads(decrypted_data)
         return config_data.get('miner_key')
     except Exception:
@@ -579,11 +609,16 @@ def read_encrypted_miner_config() -> Optional[str]:
 def read_encrypted_install_config() -> Optional[str]:
     """Read install_id from encrypted install config file created by installer."""
     try:
-        config_path = os.path.join(app_dir(), "config", "install_config.enc")
-        if not os.path.exists(config_path):
+        encrypted_data: Optional[dict[str, Any]] = None
+        for config_path in _config_file_candidates("install_config.enc"):
+            if not os.path.exists(config_path):
+                continue
+            with open(config_path, 'r') as f:
+                enc = json.load(f)
+            encrypted_data = enc
+            break
+        if not isinstance(encrypted_data, dict):
             return None
-        with open(config_path, 'r') as f:
-            encrypted_data = json.load(f)
         # Use same encryption scheme as miner_config
         from cryptography.fernet import Fernet
         from cryptography.hazmat.primitives import hashes
@@ -626,6 +661,30 @@ def expected_measurement_groups() -> List[str]:
             if val:
                 cleaned.append(val)
     return cleaned
+
+def _parse_measurement_timestamp(value: Any) -> Optional[dt.datetime]:
+    """Parse a measurement timestamp (ISO string, datetime, or epoch) into UTC."""
+    try:
+        if isinstance(value, dt.datetime):
+            ts = value
+        elif isinstance(value, (int, float)):
+            ts = dt.datetime.fromtimestamp(float(value), UTC)
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            ts = dt.datetime.fromisoformat(text)
+        else:
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        else:
+            ts = ts.astimezone(UTC)
+        return ts.replace(microsecond=0)
+    except Exception:
+        return None
 
 def _normalize_measurement_group(name: Optional[str]) -> str:
     try:
@@ -714,11 +773,20 @@ def upload_measurements_for_slot(
     install_id: str,
     *,
     expected_groups: Optional[List[str]] = None,
+    slot_ts: Optional[dt.datetime] = None,
+    interval_seconds: int = 0,
 ) -> Tuple[bool, List[str]]:
-    """Upload local measurement files and return (pod_met, delivered_groups)."""
+    """Upload local measurement files and return (pod_met, delivered_groups) for this slot."""
     delivered_groups: List[str] = []
     expected_set = {_normalize_measurement_group(g) for g in (expected_groups or []) if g}
     pod_required = bool(expected_set)
+    slot_end = slot_ts if isinstance(slot_ts, dt.datetime) else now_utc()
+    if slot_end.tzinfo is None:
+        slot_end = slot_end.replace(tzinfo=UTC)
+    else:
+        slot_end = slot_end.astimezone(UTC)
+    slot_length = max(1, int(interval_seconds)) if interval_seconds else 1
+    slot_start = slot_end - dt.timedelta(seconds=slot_length)
     if MINER_CODE == "AEM":
         # AEM uses PoI; PoD not enforced.
         return True, delivered_groups
@@ -741,21 +809,29 @@ def upload_measurements_for_slot(
         return (False if pod_required else True), delivered_groups
     for measurement_data in measurement_data_list:
         try:
-            timestamp = measurement_data.get("timestamp")
+            timestamp_raw = measurement_data.get("timestamp")
+            measurement_ts = _parse_measurement_timestamp(timestamp_raw)
+            measurement_in_slot = bool(
+                measurement_ts and slot_start <= measurement_ts < slot_end
+            )
             measurement_type_raw = measurement_data.get("group") or measurement_data.get("measurement_type")
             value = measurement_data.get("measurement", {})
             measurement_type = measurement_type_raw.strip() if isinstance(measurement_type_raw, str) else None
-            if timestamp and measurement_type and isinstance(value, dict) and value:
+            if measurement_ts and measurement_type and isinstance(value, dict) and value:
+                timestamp_payload = (
+                    timestamp_raw if isinstance(timestamp_raw, str) and timestamp_raw.strip()
+                    else measurement_ts.isoformat()
+                )
                 client._api.upload_measurement(
                     hex_id=hex_registered,
                     miner_code=MINER_CODE,
                     install_id=install_id,
-                    timestamp=str(timestamp),
+                    timestamp=str(timestamp_payload),
                     measurement_type=measurement_type,
                     value=value,
                 )
                 normalized = _normalize_measurement_group(measurement_type)
-                if normalized and normalized in expected_set and normalized not in delivered_groups:
+                if measurement_in_slot and normalized and normalized in expected_set and normalized not in delivered_groups:
                     delivered_groups.append(normalized)
             else:
                 log.debug("Skipping measurement upload; missing required fields: %s", measurement_data)
@@ -3264,6 +3340,8 @@ def main() -> None:
                             miner_key,
                             install_id,
                             expected_groups=expected_groups,
+                            slot_ts=slot_ts,
+                            interval_seconds=interval,
                         )
                     except Exception as e:
                         log.error("Measurement upload error: %s", e)
