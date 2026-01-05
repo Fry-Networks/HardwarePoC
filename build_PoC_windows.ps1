@@ -221,6 +221,7 @@ METRIC_LABEL = "$metricLabel"
 METRIC_UNIT = ""
 DEV = False
 VERSION_CHECK_SEC = $VersionCheckSec
+GEOIP_SHARED_SUBPATH = "FryNetworks/GeoLite2/GeoLite2-Country.mmdb"
 
 "@
 

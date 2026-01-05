@@ -67,6 +67,32 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 
 import config_profile as _cfg
 
+
+def _shared_geoip_default_path() -> pathlib.Path:
+    base_dir = pathlib.Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData"))
+    try:
+        sub = getattr(_cfg, "GEOIP_SHARED_SUBPATH", "")
+    except Exception:
+        sub = ""
+
+    try:
+        normalized = [part for part in str(sub).replace("\\", "/").split("/") if part]
+    except Exception:
+        normalized = []
+
+    if not normalized:
+        normalized = ["FryNetworks", "GeoLite2", "GeoLite2-Country.mmdb"]
+
+    for part in normalized:
+        base_dir = base_dir / part
+
+    return base_dir
+
+
+_SHARED_GEOIP_PATH = _shared_geoip_default_path()
+if not os.environ.get("MAXMIND_DB_PATH"):
+    os.environ["MAXMIND_DB_PATH"] = str(_SHARED_GEOIP_PATH)
+
 def _guess_gui_version_from_fs() -> str:
     """Best-effort: infer GUI/agent version from local binaries.
     Windows: FRY_<CODE>_vX.Y.Z*.exe in app_dir or miner_GUI/.
@@ -111,6 +137,34 @@ POC_VERSION = getattr(_cfg, "POC_VERSION", VERSION)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("miner-online")
 _CRIT_FAILURES: dict[str, int] = {}
+
+SOFTWARE_VERSION_REFRESH_SECONDS = 600
+_SOFTWARE_VERSION_LAST_REFRESH = 0.0
+
+def refresh_software_version(force: bool = False) -> str:
+    """Re-check GUI executable to detect updated software versions at runtime."""
+    global SOFTWARE_VERSION, GUI_VERSION, _SOFTWARE_VERSION_LAST_REFRESH
+    now = time.time()
+    if not force:
+        last = _SOFTWARE_VERSION_LAST_REFRESH
+        if last and (now - last) < SOFTWARE_VERSION_REFRESH_SECONDS:
+            return SOFTWARE_VERSION
+    new_guess = _guess_gui_version_from_fs()
+    fallback = getattr(_cfg, "SOFTWARE_VERSION", VERSION)
+    new_version = new_guess or fallback or SOFTWARE_VERSION
+    updated = False
+    if new_guess:
+        GUI_VERSION = new_guess
+    if new_version and new_version != SOFTWARE_VERSION:
+        SOFTWARE_VERSION = new_version
+        updated = True
+    _SOFTWARE_VERSION_LAST_REFRESH = now
+    if updated:
+        try:
+            log.info("Detected updated software version %s", SOFTWARE_VERSION)
+        except Exception:
+            pass
+    return SOFTWARE_VERSION
 
 
 def _record_critical_failure(key: str, msg: str, *, threshold: int = 2, exit_code: int = 12, miner_key: Optional[str] = None) -> None:
@@ -1346,6 +1400,8 @@ def write_status(
     miner_mac: Optional[str] = None,
     mac_registered: Optional[str] = None,
     poi_data: Optional[bool] = None,
+    hex_registered: Optional[str] = None,
+    pol_override: Optional[Dict[str, Any]] = None,
 ) -> None:
     # --- time / slot basics ---
     day = day_iso(ts)  # "YYYY-MM-DD"
@@ -1370,6 +1426,11 @@ def write_status(
     except Exception:
         local_doc = {}
 
+    weekly_cache_doc = _read_weekly_cache_doc(ts)
+    weekly_day_doc = _weekly_day_doc(ts, weekly_cache_doc)
+    weekly_slot_entry = _weekly_slot_entry(weekly_day_doc, hour, slot, slots_per_hour)
+    weekly_online_counts = _weekly_online_counts(weekly_day_doc, hour, slot, slots_per_hour)
+
     # --- compute elapsed slots + uptime counters (Option A: so-far-today) ---
     slots_elapsed = hour * slots_per_hour + (slot + 1)
     slots_elapsed = max(1, min(day_total_full, slots_elapsed))
@@ -1383,6 +1444,10 @@ def write_status(
         day_online_so_far = max(0, min(local_online, slots_elapsed))
     elif isinstance(local_online, int):
         day_online_so_far = max(0, min(local_online, slots_elapsed))
+    elif weekly_online_counts:
+        weekly_online, weekly_counted = weekly_online_counts
+        slots_elapsed = max(1, min(day_total_full, weekly_counted))
+        day_online_so_far = max(0, min(weekly_online, slots_elapsed))
 
     # --- AEM PoI slots (keep existing format) ---
     poi_slots: Optional[dict[str, Any]] = None
@@ -1470,6 +1535,28 @@ def write_status(
         "last_checked_at": checked_at_iso,
         "evidence": {},
     }
+    pol_evidence = pol_block.get("evidence")
+    if not isinstance(pol_evidence, dict):
+        pol_evidence = {}
+    if hex_registered and not pol_evidence.get("hexID_registered"):
+        pol_evidence["hexID_registered"] = hex_registered
+    pol_block["evidence"] = pol_evidence
+    if isinstance(pol_override, dict):
+        try:
+            status_override = pol_override.get("status")
+            if isinstance(status_override, bool):
+                pol_block["status"] = status_override
+            lc_over = pol_override.get("last_changed_at")
+            if isinstance(lc_over, str) and lc_over:
+                pol_block["last_changed_at"] = lc_over
+            lchk_over = pol_override.get("last_checked_at")
+            if isinstance(lchk_over, str) and lchk_over:
+                pol_block["last_checked_at"] = lchk_over
+            evid_over = pol_override.get("evidence")
+            if isinstance(evid_over, dict):
+                pol_evidence.update(evid_over)
+        except Exception:
+            pass
     pol_status = pol_block.get("status") if isinstance(pol_block.get("status"), bool) else False
 
     # --- software info (same logic as before, but no legacy maps) ---
@@ -1529,7 +1616,7 @@ def write_status(
         software_info["is_uptodate"] = None
 
     # --- slot-level PoC from local cache ---
-    poc_slot_ok = False
+    poc_slot_ok: Optional[bool] = None
     try:
         hours_local_raw = local_doc.get("hours")
         hours_local: dict[str, Any] = hours_local_raw if isinstance(hours_local_raw, dict) else {}
@@ -1543,10 +1630,17 @@ def write_status(
         if slot < len(slots_list):
             poc_slot_ok = (slots_list[slot] == "online")
     except Exception:
+        poc_slot_ok = None
+
+    if poc_slot_ok is None and isinstance(weekly_slot_entry, dict):
+        gates = _safe_dict(weekly_slot_entry.get("gates"))
+        poc_slot_ok = bool(gates.get("online")) if gates else None
+
+    if poc_slot_ok is None:
         poc_slot_ok = (status == "online")
 
     # --- slot-level PoD from local cache ---
-    pod_slot_ok = False
+    pod_slot_ok: Optional[bool] = None
     try:
         pod_hours_local_raw = local_doc.get("podHours")
         pod_hours_local: dict[str, Any] = pod_hours_local_raw if isinstance(pod_hours_local_raw, dict) else {}
@@ -1560,6 +1654,13 @@ def write_status(
         if slot < len(pod_slots_list):
             pod_slot_ok = bool(pod_slots_list[slot])
     except Exception:
+        pod_slot_ok = None
+
+    if pod_slot_ok is None and isinstance(weekly_slot_entry, dict):
+        gates = _safe_dict(weekly_slot_entry.get("gates"))
+        pod_slot_ok = bool(gates.get("data")) if gates else None
+
+    if pod_slot_ok is None:
         pod_slot_ok = False
 
     # --- BM bandwidth tools ---
@@ -1607,8 +1708,6 @@ def write_status(
             "online": (status == "online"),
             "mac_match": mac_match,
             "pol": bool(pol_status),
-            "poc": bool(poc_slot_ok),
-            "pod": bool(pod_slot_ok),
             "poi": (bool(poi_slot_ok) if miner_type_val == "AEM" else None),
         },
         "tools_active": (selected_tools if miner_type_val == "BM" else []),
@@ -2089,6 +2188,69 @@ def _safe_dict(v: Any) -> Dict[str, Any]:
 def _safe_list(v: Any) -> List[Any]:
     return v if isinstance(v, list) else []
 
+def _read_weekly_cache_doc(ts: dt.datetime) -> Dict[str, Any]:
+    week_start, _ = _week_bounds_for_rewards(ts)
+    path = _week_file_path(week_start)
+    doc = read_local_cache(path)
+    return doc if isinstance(doc, dict) else {}
+
+def _weekly_day_doc(ts: dt.datetime, weekly_doc: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    doc = weekly_doc or _read_weekly_cache_doc(ts)
+    days = _safe_dict(doc.get("days"))
+    return _safe_dict(days.get(_date_iso(ts)))
+
+def _weekly_slot_entry(
+    day_doc: Dict[str, Any],
+    hour: int,
+    slot: int,
+    slots_per_hour: int,
+) -> Optional[Dict[str, Any]]:
+    if not day_doc:
+        return None
+    hours = _safe_dict(day_doc.get("hours"))
+    hour_doc = _safe_dict(hours.get(str(hour)))
+    slots_list = _safe_list(hour_doc.get("slots"))
+    if not slots_list:
+        return None
+    if len(slots_list) < slots_per_hour:
+        slots_list = slots_list + [None] * (slots_per_hour - len(slots_list))
+    if 0 <= slot < len(slots_list):
+        entry = slots_list[slot]
+        if isinstance(entry, dict):
+            return entry
+    return None
+
+def _weekly_online_counts(
+    day_doc: Dict[str, Any],
+    hour: int,
+    slot: int,
+    slots_per_hour: int,
+) -> Optional[Tuple[int, int]]:
+    if not day_doc:
+        return None
+    hours = _safe_dict(day_doc.get("hours"))
+    online = 0
+    counted = 0
+    for h in range(0, hour + 1):
+        hour_doc = _safe_dict(hours.get(str(h)))
+        slots_list = _safe_list(hour_doc.get("slots"))
+        if not slots_list:
+            continue
+        if len(slots_list) < slots_per_hour:
+            slots_list = slots_list + [None] * (slots_per_hour - len(slots_list))
+        limit = slots_per_hour if h < hour else min(slot + 1, slots_per_hour)
+        limit = min(limit, len(slots_list))
+        for idx in range(limit):
+            entry = slots_list[idx]
+            if isinstance(entry, dict):
+                counted += 1
+                gates = _safe_dict(entry.get("gates"))
+                if gates.get("online") is True:
+                    online += 1
+    if counted == 0:
+        return None
+    return online, counted
+
 def _tool_states_for_slot() -> Tuple[bool, bool, bool]:
     bright_active = False
     honeygain_active = False
@@ -2494,6 +2656,15 @@ def _maxmind_db_path() -> pathlib.Path:
         return candidate
 
     candidates: list[pathlib.Path] = []
+    shared_candidate = _SHARED_GEOIP_PATH
+    if isinstance(shared_candidate, pathlib.Path):
+        try:
+            if shared_candidate.exists():
+                return shared_candidate
+        except Exception:
+            pass
+        candidates.append(shared_candidate)
+
     if getattr(sys, "frozen", False):
         if hasattr(sys, "_MEIPASS"):
             try:
@@ -2758,7 +2929,7 @@ def write_location_daily(
     client: MongoProxyClient,
     miner_key: str,
     ts: dt.datetime,
-) -> None:
+) -> Optional[Dict[str, Any]]:
     """
     Evaluate Proof of Location once per day and store:
     - pol.status
@@ -2830,17 +3001,38 @@ def write_location_daily(
         poi_slots=None,
     )
 
+    doc_to_write: Dict[str, Any]
+    if existing_doc:
+        doc_to_write = existing_doc
+    else:
+        doc_to_write = base_on_insert
+
+    if not isinstance(doc_to_write, dict):
+        doc_to_write = {}
+
+    if not doc_to_write:
+        doc_to_write = base_on_insert
+
+    if not isinstance(doc_to_write, dict):
+        doc_to_write = {"miner_key": miner_key}
+
+    if isinstance(doc_to_write, dict):
+        doc_to_write.pop("_id", None)
+        doc_to_write.setdefault("miner_key", miner_key)
+        if "lastUpdated" not in doc_to_write and isinstance(base_on_insert.get("lastUpdated"), str):
+            doc_to_write["lastUpdated"] = base_on_insert["lastUpdated"]
+        doc_to_write["pol"] = pol_block
+
     try:
-        coll.update_one(
+        coll.replace_one(
             {"miner_key": miner_key},
-            {
-                "$set": {"pol": pol_block},
-                "$setOnInsert": base_on_insert,
-            },
+            doc_to_write,
             upsert=True,
         )
+        return pol_block
     except Exception:
         pass
+    return None
 
 def registered_mac_from_devices(client: MongoProxyClient, miner_key: str) -> Optional[str]:
     """Return the registered MAC for a miner_key from creds.hardware.miner_mac.
@@ -2934,6 +3126,7 @@ def _release_service_lock() -> None:
 def main() -> None:
     # Installer handles miner key validation + initial lease acquisition
     _init_service_file_logging()
+    refresh_software_version(force=True)
 
     # Exit silently in virtualized environments (policy)
     try:
@@ -3290,15 +3483,26 @@ def main() -> None:
                 pass
             time.sleep(1)
 
+    last_pol_check: Optional[dt.datetime] = None
+    pending_pol_update: Optional[Dict[str, Any]] = None
+    try:
+        initial_pol_ts = now_utc()
+        pol_block_start = write_location_daily(coll, client, miner_key, initial_pol_ts)
+        if pol_block_start:
+            pending_pol_update = pol_block_start
+            last_pol_check = initial_pol_ts
+    except Exception:
+        pass
+
     # ----------------------------
     # Main monitoring loop
     # ----------------------------
     warned_version = False
-    last_location_day: Optional[str] = None
     last_version_check_hour: Optional[dt.datetime] = None
     next_slot_time: Optional[dt.datetime] = None
 
     while True:
+        refresh_software_version()
         now_loop = now_utc()
         if next_slot_time is None:
             next_slot_time = next_boundary(now_loop, interval)
@@ -3456,6 +3660,12 @@ def main() -> None:
                 except Exception:
                     pass
 
+                pol_hex_registered = None
+                try:
+                    pol_hex_registered = registered_hexid_from_devices(client, miner_key)
+                except Exception:
+                    pol_hex_registered = None
+
                 # AEM: if snapshot missing, fetch PoI
                 poi_data = poi_snapshot
                 if MINER_CODE == "AEM" and poi_data is None:
@@ -3463,6 +3673,19 @@ def main() -> None:
                         poi_data = monitor_poi_for_aem()
                     except Exception:
                         poi_data = None
+
+                try:
+                    due_pol = (
+                        last_pol_check is None
+                        or (slot_ts - last_pol_check).total_seconds() >= 600
+                    )
+                    if due_pol:
+                        pol_block_new = write_location_daily(coll, client, miner_key, slot_ts)
+                        if pol_block_new:
+                            pending_pol_update = pol_block_new
+                            last_pol_check = slot_ts
+                except Exception:
+                    pass
 
                 # Write slot snapshot to DB
                 write_status(
@@ -3476,7 +3699,10 @@ def main() -> None:
                     miner_mac=miner_mac_local,
                     mac_registered=mac_registered,
                     poi_data=poi_data,
+                    hex_registered=pol_hex_registered,
+                    pol_override=pending_pol_update,
                 )
+                pending_pol_update = None
 
                 # Refresh installation heartbeat
                 try:
@@ -3521,15 +3747,6 @@ def main() -> None:
                         log.error("Failed to renew lease for %s: %s; exiting.", miner_key, e)
                         time.sleep(2)
                         sys.exit(8)
-
-                # Once-per-day location check (does NOT touch lastUpdated)
-                try:
-                    day = day_iso(slot_ts)
-                    if last_location_day != day:
-                        write_location_daily(coll, client, miner_key, slot_ts)
-                        last_location_day = day
-                except Exception:
-                    pass
 
                 try:
                     api_health_backoff.reset()
