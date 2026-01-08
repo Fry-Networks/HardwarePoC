@@ -141,6 +141,13 @@ _CRIT_FAILURES: dict[str, int] = {}
 SOFTWARE_VERSION_REFRESH_SECONDS = 600
 _SOFTWARE_VERSION_LAST_REFRESH = 0.0
 
+# Firewall port constants for privileged operations
+MYST_TEQUILAPI_PORT = 4050
+MYST_WIREGUARD_PORT = 51820
+PRESEARCH_API_PORT = 80
+DIIISCO_API_PORT = 8080
+DEFAULT_RPC_PORT = 9944  # Default Substrate RPC port (Space Acres)
+
 def refresh_software_version(force: bool = False) -> str:
     """Re-check GUI executable to detect updated software versions at runtime."""
     global SOFTWARE_VERSION, GUI_VERSION, _SOFTWARE_VERSION_LAST_REFRESH
@@ -216,6 +223,178 @@ def _init_service_file_logging() -> None:
     except Exception:
         # Do not block startup if logging cannot initialize
         pass
+
+def log_step(step: str, data: Dict[str, Any]) -> None:
+    """Log a structured step with associated data for diagnostics.
+    
+    This provides structured logging for key service events, particularly
+    for IPC queue operations and privileged operations handling.
+    
+    Args:
+        step: Event identifier (e.g., "ops_daemon_start", "privileged_config_file_written")
+        data: Additional context data for the event
+    """
+    try:
+        log.info("STEP: %s | %s", step, json.dumps(data, default=str))
+    except Exception:
+        try:
+            log.info("STEP: %s | %s", step, str(data))
+        except Exception:
+            pass
+
+
+# ====================================================================
+# SERVICE CONFIGURATION MANAGEMENT
+# ====================================================================
+
+_service_config_cache: Dict[str, Any] = {}
+_service_config_lock = threading.Lock()
+
+def _read_service_config() -> Dict[str, Any]:
+    """Read all configuration files from config/ directory into memory.
+    
+    Reads:
+    - config/miner_config.json - Main miner configuration
+    - config/{poc_type}_config.json - PoC-specific configurations
+    
+    Returns:
+        Dictionary with all configuration data
+    """
+    config = {}
+    
+    try:
+        config_dir = os.path.join(data_dir(), "config")
+        
+        # Read main miner config
+        miner_config_path = os.path.join(config_dir, "miner_config.json")
+        if os.path.exists(miner_config_path):
+            try:
+                with open(miner_config_path, 'r', encoding='utf-8') as f:
+                    miner_config = json.load(f)
+                    if isinstance(miner_config, dict):
+                        config['miner_config'] = miner_config
+                        log.debug("Loaded miner_config.json")
+            except Exception as e:
+                log.warning("Failed to load miner_config.json: %s", e)
+        
+        # Read PoC-specific configs
+        poc_types = ['mysterium', 'presearch', 'diiisco', 'spaceacres', 'bright', 'honeygain']
+        for poc_type in poc_types:
+            poc_config_path = os.path.join(config_dir, f"{poc_type}_config.json")
+            if os.path.exists(poc_config_path):
+                try:
+                    with open(poc_config_path, 'r', encoding='utf-8') as f:
+                        poc_config = json.load(f)
+                        if isinstance(poc_config, dict):
+                            config[f'{poc_type}_config'] = poc_config
+                            log.debug("Loaded %s_config.json", poc_type)
+                except Exception as e:
+                    log.warning("Failed to load %s_config.json: %s", poc_type, e)
+    
+    except Exception as e:
+        log.error("Error reading service configuration: %s", e)
+    
+    return config
+
+
+def _load_service_config() -> Dict[str, Any]:
+    """Load service configuration with caching and thread safety.
+    
+    Returns:
+        Cached configuration dictionary
+    """
+    with _service_config_lock:
+        return dict(_service_config_cache)
+
+
+def _reload_service_config() -> None:
+    """Reload configuration from disk (called when GUI updates config)."""
+    try:
+        new_config = _read_service_config()
+        with _service_config_lock:
+            _service_config_cache.clear()
+            _service_config_cache.update(new_config)
+        
+        log_step("service_config_reloaded", {
+            "configs_loaded": list(new_config.keys()),
+            "timestamp": now_utc().isoformat()
+        })
+        log.info("Service configuration reloaded")
+    except Exception as e:
+        log.error("Failed to reload service configuration: %s", e)
+
+
+def _get_measurement_interval() -> int:
+    """Get measurement interval from config, default to 600 seconds (10 minutes)."""
+    try:
+        config = _load_service_config()
+        miner_config = config.get('miner_config', {})
+        if isinstance(miner_config, dict):
+            interval = miner_config.get('measurement_interval')
+            if isinstance(interval, (int, float)) and interval > 0:
+                return int(interval)
+    except Exception:
+        pass
+    
+    # Default: 600 seconds (10 minutes)
+    return 600
+
+
+def _get_enabled_pocs() -> List[str]:
+    """Get list of enabled PoCs from configuration.
+    
+    Only returns PoCs that are:
+    1. Enabled in the configuration
+    2. Supported by this miner type (BM only supports mysterium, etc.)
+    
+    Returns:
+        List of enabled PoC types (e.g., ['mysterium'])
+    """
+    enabled = []
+    
+    try:
+        config = _load_service_config()
+        miner_config = config.get('miner_config', {})
+        
+        if not isinstance(miner_config, dict):
+            return enabled
+        
+        # Define which PoCs are supported by each miner type
+        supported_pocs = {
+            'BM': ['mysterium', 'bright', 'honeygain'],     # Bandwidth Miner
+            'SDN': ['spaceacres'],                           # Storage/Data Node
+            'SVN': ['presearch', 'diiisco'],                 # Storage Verification Node
+            'AEM': [],                                       # Agent/Edge Miner (if any)
+        }
+        
+        # Get supported PoCs for this miner
+        allowed = supported_pocs.get(MINER_CODE, [])
+        
+        # Check each PoC type
+        poc_types = {
+            'mysterium': ['mysterium_enabled', 'enable_mysterium'],
+            'presearch': ['presearch_enabled', 'enable_presearch'],
+            'diiisco': ['diiisco_enabled', 'enable_diiisco'],
+            'spaceacres': ['spaceacres_enabled', 'enable_spaceacres'],
+            'bright': ['bright_enabled', 'enable_bright'],
+            'honeygain': ['honeygain_enabled', 'enable_honeygain'],
+        }
+        
+        for poc_type, config_keys in poc_types.items():
+            # Only include if supported by this miner type
+            if poc_type not in allowed:
+                continue
+                
+            for key in config_keys:
+                if miner_config.get(key) is True:
+                    enabled.append(poc_type)
+                    break
+    
+    except Exception as e:
+        log.warning("Error determining enabled PoCs: %s", e)
+    
+    return enabled
+
 
 def _detect_virtual_machine() -> Dict[str, Any]:
     """Best-effort virtual machine detection across major platforms."""
@@ -2041,6 +2220,15 @@ def ensure_dirs():
     if not sys.platform.startswith("win"):
         try: os.chmod(path, 0o755)
         except Exception: pass
+    
+    # Create IPC queue directories for privileged operations
+    try:
+        os.makedirs(os.path.join(path, "ops_queue"), exist_ok=True)
+        os.makedirs(os.path.join(path, "ops_processed"), exist_ok=True)
+        os.makedirs(os.path.join(path, "config"), exist_ok=True)
+        os.makedirs(os.path.join(path, "measurements"), exist_ok=True)
+    except Exception:
+        pass
 
 def cache_path_for(ts: dt.datetime) -> str:
     return os.path.join(data_dir(), "status", f"status-{ts.strftime('%Y%m%d')}.json")
@@ -3123,6 +3311,1207 @@ def _release_service_lock() -> None:
     finally:
         _LOCK_FH = None
 
+# --- IPC Queue Processing (Privileged Operations Daemon) ---
+
+def _sanitize_relative_path(relative_path: str) -> Optional[str]:
+    """Validate and sanitize a relative path to prevent directory traversal.
+    
+    Returns normalized path if safe, None otherwise.
+    """
+    if not relative_path or not isinstance(relative_path, str):
+        return None
+    
+    # Normalize and check for directory traversal attempts
+    try:
+        normalized = os.path.normpath(relative_path)
+        # Block absolute paths and parent directory references
+        if os.path.isabs(normalized) or normalized.startswith("..") or ".." in normalized.split(os.sep):
+            return None
+        return normalized
+    except Exception:
+        return None
+
+def _write_config_file(relative_path: str, content: str) -> bool:
+    """Write a config file to ProgramData config directory.
+    
+    Args:
+        relative_path: Path relative to config/ directory (e.g., "bright.json")
+        content: JSON string content to write
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Validate path
+        safe_path = _sanitize_relative_path(relative_path)
+        if not safe_path:
+            log.error("Invalid config file path: %s", relative_path)
+            return False
+        
+        # Build full path under config/
+        target_path = os.path.join(data_dir(), "config", safe_path)
+        
+        # Ensure parent directory exists
+        parent_dir = os.path.dirname(target_path)
+        os.makedirs(parent_dir, exist_ok=True)
+        
+        # Atomic write: temp file + rename
+        temp_path = f"{target_path}.tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(temp_path, target_path)
+            
+            log_step("privileged_config_file_written", {
+                "path": safe_path,
+                "size": len(content)
+            })
+            return True
+        except Exception as e:
+            log.error("Failed to write config file %s: %s", safe_path, e)
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+            log_step("privileged_config_file_write_failed", {
+                "path": safe_path,
+                "error": str(e)
+            })
+            return False
+    except Exception as e:
+        log.exception("Config file write error: %s", e)
+        return False
+
+def _write_measurement_file(group: str, encrypted_bytes: bytes) -> bool:
+    """Write an encrypted measurement file to ProgramData measurements directory.
+    
+    Args:
+        group: Measurement group (e.g., "Bandwidth", "Satellite")
+        encrypted_bytes: Encrypted measurement data
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Normalize group name
+        group_safe = "".join(c for c in group if c.isalnum() or c in "_ -")
+        if not group_safe:
+            log.error("Invalid measurement group: %s", group)
+            return False
+        
+        # Build filename
+        filename = f"measurements-{group_safe}-latest.json.enc"
+        target_path = os.path.join(data_dir(), "measurements", filename)
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        
+        # Atomic write: temp file + rename
+        temp_path = f"{target_path}.tmp"
+        try:
+            with open(temp_path, "wb") as f:
+                f.write(encrypted_bytes)
+            os.replace(temp_path, target_path)
+            
+            log_step("privileged_measurement_file_written", {
+                "group": group_safe,
+                "size": len(encrypted_bytes)
+            })
+            return True
+        except Exception as e:
+            log.error("Failed to write measurement file %s: %s", filename, e)
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+            log_step("privileged_measurement_file_write_failed", {
+                "group": group_safe,
+                "error": str(e)
+            })
+            return False
+    except Exception as e:
+        log.exception("Measurement file write error: %s", e)
+        return False
+
+def _detect_linux_firewall() -> Optional[str]:
+    """Detect which firewall system is active on Linux.
+    
+    Returns:
+        'ufw', 'firewalld', 'iptables', or None if none detected
+    """
+    try:
+        # Check for ufw
+        result = subprocess.run(["which", "ufw"], capture_output=True, timeout=2)
+        if result.returncode == 0:
+            # Verify ufw is active
+            result = subprocess.run(["ufw", "status"], capture_output=True, text=True, timeout=2)
+            if "Status: active" in result.stdout or "Status: inactive" in result.stdout:
+                return "ufw"
+        
+        # Check for firewalld
+        result = subprocess.run(["which", "firewall-cmd"], capture_output=True, timeout=2)
+        if result.returncode == 0:
+            # Verify firewalld is running
+            result = subprocess.run(["firewall-cmd", "--state"], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0:
+                return "firewalld"
+        
+        # Check for iptables (fallback)
+        result = subprocess.run(["which", "iptables"], capture_output=True, timeout=2)
+        if result.returncode == 0:
+            return "iptables"
+        
+        return None
+    except Exception:
+        return None
+
+def _add_firewall_rule_linux_ufw(port: int, protocol: str, direction: str) -> bool:
+    """Add firewall rule using ufw."""
+    try:
+        proto = protocol.lower()
+        cmd = ["ufw", "allow", f"{port}/{proto}"]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+def _add_firewall_rule_linux_firewalld(port: int, protocol: str, direction: str) -> bool:
+    """Add firewall rule using firewalld."""
+    try:
+        proto = protocol.lower()
+        cmd = ["firewall-cmd", f"--add-port={port}/{proto}", "--permanent"]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            # Reload to apply changes
+            subprocess.run(["firewall-cmd", "--reload"], capture_output=True, timeout=10)
+            return True
+        return False
+    except Exception:
+        return False
+
+def _add_firewall_rule_linux_iptables(port: int, protocol: str, direction: str) -> bool:
+    """Add firewall rule using iptables."""
+    try:
+        proto = protocol.upper()
+        chain = "INPUT" if direction == "in" else "OUTPUT"
+        
+        # Check if rule already exists
+        check_cmd = [
+            "iptables", "-C", chain,
+            "-p", proto, "--dport", str(port),
+            "-j", "ACCEPT"
+        ]
+        result = subprocess.run(check_cmd, capture_output=True, timeout=10)
+        if result.returncode == 0:
+            # Rule already exists
+            return True
+        
+        # Add rule
+        cmd = [
+            "iptables", "-A", chain,
+            "-p", proto, "--dport", str(port),
+            "-j", "ACCEPT"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        
+        if result.returncode == 0:
+            # Try to save (varies by distro)
+            for save_cmd in [["iptables-save"], ["service", "iptables", "save"], ["netfilter-persistent", "save"]]:
+                try:
+                    subprocess.run(save_cmd, capture_output=True, timeout=5)
+                    break
+                except Exception:
+                    continue
+            return True
+        return False
+    except Exception:
+        return False
+
+def _remove_firewall_rule_linux_ufw(port: int, protocol: str) -> bool:
+    """Remove firewall rule using ufw."""
+    try:
+        proto = protocol.lower()
+        cmd = ["ufw", "delete", "allow", f"{port}/{proto}"]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+def _remove_firewall_rule_linux_firewalld(port: int, protocol: str) -> bool:
+    """Remove firewall rule using firewalld."""
+    try:
+        proto = protocol.lower()
+        cmd = ["firewall-cmd", f"--remove-port={port}/{proto}", "--permanent"]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            # Reload to apply changes
+            subprocess.run(["firewall-cmd", "--reload"], capture_output=True, timeout=10)
+            return True
+        return False
+    except Exception:
+        return False
+
+def _remove_firewall_rule_linux_iptables(port: int, protocol: str, direction: str) -> bool:
+    """Remove firewall rule using iptables."""
+    try:
+        proto = protocol.upper()
+        chain = "INPUT" if direction == "in" else "OUTPUT"
+        
+        cmd = [
+            "iptables", "-D", chain,
+            "-p", proto, "--dport", str(port),
+            "-j", "ACCEPT"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        
+        if result.returncode == 0:
+            # Try to save
+            for save_cmd in [["iptables-save"], ["service", "iptables", "save"], ["netfilter-persistent", "save"]]:
+                try:
+                    subprocess.run(save_cmd, capture_output=True, timeout=5)
+                    break
+                except Exception:
+                    continue
+            return True
+        return False
+    except Exception:
+        return False
+
+def _add_firewall_rule(rule_name: str, port: int, protocol: str = "TCP", direction: str = "in", 
+                       program: Optional[str] = None) -> bool:
+    """Add a firewall rule (Windows or Linux).
+    
+    Args:
+        rule_name: Name for the firewall rule (Windows only, used for logging on Linux)
+        port: Port number (or 0 if program-based rule)
+        protocol: TCP or UDP
+        direction: in (inbound) or out (outbound)
+        program: Optional program path for program-based rules (Windows only)
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Validate inputs
+        protocol = protocol.upper()
+        if protocol not in ("TCP", "UDP"):
+            log.error("Invalid protocol: %s (must be TCP or UDP)", protocol)
+            return False
+        
+        direction = direction.lower()
+        if direction not in ("in", "out"):
+            log.error("Invalid direction: %s (must be in or out)", direction)
+            return False
+        
+        # Windows implementation
+        if sys.platform.startswith("win"):
+            # Build netsh command
+            cmd = [
+                "netsh", "advfirewall", "firewall", "add", "rule",
+                f"name={rule_name}",
+                f"dir={direction}",
+                "action=allow"
+            ]
+            
+            if program:
+                # Program-based rule
+                if not os.path.isabs(program):
+                    log.error("Program path must be absolute: %s", program)
+                    return False
+                cmd.append(f"program={program}")
+            elif port > 0:
+                # Port-based rule
+                cmd.append(f"protocol={protocol}")
+                cmd.append(f"localport={port}")
+            else:
+                log.error("Either port or program must be specified")
+                return False
+            
+            # Execute command
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0:
+                log_step("privileged_firewall_rule_added", {
+                    "rule_name": rule_name,
+                    "port": port,
+                    "protocol": protocol,
+                    "direction": direction,
+                    "program": program,
+                    "platform": "windows"
+                })
+                return True
+            else:
+                log.error("Failed to add firewall rule %s: %s", rule_name, result.stderr)
+                log_step("privileged_firewall_rule_add_failed", {
+                    "rule_name": rule_name,
+                    "error": result.stderr.strip(),
+                    "platform": "windows"
+                })
+                return False
+        
+        # Linux implementation
+        else:
+            if program:
+                log.warning("Program-based firewall rules not supported on Linux")
+                return False
+            
+            if port <= 0:
+                log.error("Port must be specified for Linux firewall rules")
+                return False
+            
+            # Detect firewall system
+            firewall = _detect_linux_firewall()
+            if not firewall:
+                log.error("No supported firewall system detected on Linux (ufw/firewalld/iptables)")
+                return False
+            
+            # Add rule based on detected system
+            success = False
+            if firewall == "ufw":
+                success = _add_firewall_rule_linux_ufw(port, protocol, direction)
+            elif firewall == "firewalld":
+                success = _add_firewall_rule_linux_firewalld(port, protocol, direction)
+            elif firewall == "iptables":
+                success = _add_firewall_rule_linux_iptables(port, protocol, direction)
+            
+            if success:
+                log_step("privileged_firewall_rule_added", {
+                    "rule_name": rule_name,
+                    "port": port,
+                    "protocol": protocol,
+                    "direction": direction,
+                    "platform": "linux",
+                    "firewall": firewall
+                })
+            else:
+                log_step("privileged_firewall_rule_add_failed", {
+                    "rule_name": rule_name,
+                    "error": f"Failed using {firewall}",
+                    "platform": "linux"
+                })
+            
+            return success
+            
+    except Exception as e:
+        log.exception("Firewall rule add error: %s", e)
+        log_step("privileged_firewall_rule_add_failed", {
+            "rule_name": rule_name,
+            "error": str(e)
+        })
+        return False
+
+def _remove_firewall_rule(rule_name: str, port: int = 0, protocol: str = "TCP", direction: str = "in") -> bool:
+    """Remove a firewall rule (Windows or Linux).
+    
+    Args:
+        rule_name: Name of the firewall rule to remove (Windows) or identifier for logging (Linux)
+        port: Port number (required for Linux)
+        protocol: TCP or UDP (required for Linux)
+        direction: in or out (required for Linux iptables)
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Windows implementation
+        if sys.platform.startswith("win"):
+            cmd = [
+                "netsh", "advfirewall", "firewall", "delete", "rule",
+                f"name={rule_name}"
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0:
+                log_step("privileged_firewall_rule_removed", {
+                    "rule_name": rule_name,
+                    "platform": "windows"
+                })
+                return True
+            else:
+                log.error("Failed to remove firewall rule %s: %s", rule_name, result.stderr)
+                log_step("privileged_firewall_rule_remove_failed", {
+                    "rule_name": rule_name,
+                    "error": result.stderr.strip(),
+                    "platform": "windows"
+                })
+                return False
+        
+        # Linux implementation
+        else:
+            if port <= 0:
+                log.error("Port must be specified for Linux firewall rule removal")
+                return False
+            
+            # Detect firewall system
+            firewall = _detect_linux_firewall()
+            if not firewall:
+                log.error("No supported firewall system detected on Linux")
+                return False
+            
+            # Remove rule based on detected system
+            success = False
+            if firewall == "ufw":
+                success = _remove_firewall_rule_linux_ufw(port, protocol)
+            elif firewall == "firewalld":
+                success = _remove_firewall_rule_linux_firewalld(port, protocol)
+            elif firewall == "iptables":
+                success = _remove_firewall_rule_linux_iptables(port, protocol, direction)
+            
+            if success:
+                log_step("privileged_firewall_rule_removed", {
+                    "rule_name": rule_name,
+                    "port": port,
+                    "protocol": protocol,
+                    "platform": "linux",
+                    "firewall": firewall
+                })
+            else:
+                log_step("privileged_firewall_rule_remove_failed", {
+                    "rule_name": rule_name,
+                    "error": f"Failed using {firewall}",
+                    "platform": "linux"
+                })
+            
+            return success
+            
+    except Exception as e:
+        log.exception("Firewall rule remove error: %s", e)
+        log_step("privileged_firewall_rule_remove_failed", {
+            "rule_name": rule_name,
+            "error": str(e)
+        })
+        return False
+
+def _setup_mysterium_firewall() -> bool:
+    """Setup firewall rules for Mysterium node.
+    
+    Returns:
+        True if all rules added successfully, False otherwise
+    """
+    success = True
+    
+    # Tequilapi port (API)
+    if not _add_firewall_rule("Mysterium_Tequilapi_TCP", MYST_TEQUILAPI_PORT, "TCP", "in"):
+        success = False
+    
+    # WireGuard port (VPN)
+    if not _add_firewall_rule("Mysterium_WireGuard_UDP", MYST_WIREGUARD_PORT, "UDP", "in"):
+        success = False
+    
+    log_step("privileged_mysterium_firewall_setup", {"success": success})
+    return success
+
+def _setup_presearch_firewall() -> bool:
+    """Setup firewall rules for Presearch node.
+    
+    Returns:
+        True if rule added successfully, False otherwise
+    """
+    success = _add_firewall_rule("Presearch_API_TCP", PRESEARCH_API_PORT, "TCP", "in")
+    log_step("privileged_presearch_firewall_setup", {"success": success})
+    return success
+
+def _setup_diiisco_firewall() -> bool:
+    """Setup firewall rules for Diiisco node.
+    
+    Returns:
+        True if rule added successfully, False otherwise
+    """
+    success = _add_firewall_rule("Diiisco_API_TCP", DIIISCO_API_PORT, "TCP", "in")
+    log_step("privileged_diiisco_firewall_setup", {"success": success})
+    return success
+
+def _setup_spaceacres_firewall() -> bool:
+    """Setup firewall rules for Space Acres (Substrate RPC).
+    
+    Returns:
+        True if rule added successfully, False otherwise
+    """
+    success = _add_firewall_rule("SpaceAcres_RPC_TCP", DEFAULT_RPC_PORT, "TCP", "in")
+    log_step("privileged_spaceacres_firewall_setup", {"success": success})
+    return success
+
+
+# IPC helper: write result marker for processed ops
+def _write_ops_result(request_id: str, op: Optional[str], success: bool, error_msg: Optional[str] = None) -> None:
+    try:
+        result = {
+            "id": request_id,
+            "op": op,
+            "success": success,
+            "processed_at": dt.datetime.now(UTC).isoformat(),
+        }
+        if error_msg:
+            result["error"] = error_msg
+        result_path = os.path.join(data_dir(), "ops_processed", f"{request_id}.done.json")
+        os.makedirs(os.path.dirname(result_path), exist_ok=True)
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(result, f)
+        
+        # Debug: log that result was written
+        log_step("ops_result_written", {
+            "request_id": request_id,
+            "op": op,
+            "success": success,
+            "result_path": result_path
+        })
+        
+        # Debug: write marker file to confirm execution
+        try:
+            marker_path = os.path.join(data_dir(), "ops_processed", f"{request_id}.result_written")
+            with open(marker_path, "w", encoding="utf-8") as m:
+                m.write(f"done.json written at {result_path}")
+        except Exception:
+            pass
+    except Exception as e:
+        # Debug: log write failure
+        try:
+            log_step("ops_result_write_failed", {
+                "request_id": request_id,
+                "op": op,
+                "error": str(e)
+            })
+        except Exception:
+            pass
+        
+        # Debug: write error marker
+        try:
+            error_marker_path = os.path.join(data_dir(), "ops_processed", f"{request_id}.result_error")
+            with open(error_marker_path, "w", encoding="utf-8") as m:
+                m.write(str(e))
+        except Exception:
+            pass
+
+def _process_ops_queue_request(request_path: str) -> None:
+    """Process a single IPC queue request file.
+    
+    Args:
+        request_path: Full path to the request JSON file
+    """
+    request_id = None
+    op: Optional[str] = None
+    
+    # DEBUG: Write marker file to confirm function is called
+    debug_marker = os.path.join(data_dir(), "ops_processed", "DEBUG_handler_called.txt")
+    try:
+        with open(debug_marker, "a", encoding="utf-8") as f:
+            f.write(f"{dt.datetime.now(UTC).isoformat()} handler called with path={request_path}\n")
+    except Exception:
+        pass
+    
+    try:
+        # Read request (try UTF-8 first, fall back to utf-8-sig if BOM present)
+        try:
+            with open(request_path, "r", encoding="utf-8") as f:
+                request = json.load(f)
+        except json.JSONDecodeError as e:
+            if "BOM" in str(e):
+                # Retry with UTF-8-sig to handle BOM
+                with open(request_path, "r", encoding="utf-8-sig") as f:
+                    request = json.load(f)
+            else:
+                raise
+        
+        # Validate required fields
+        if not isinstance(request, dict):
+            raise ValueError("Request must be a JSON object")
+        
+        request_id = request.get("id")
+        op = request.get("op")
+        
+        if not request_id or not op:
+            raise ValueError("Missing required fields: id, op")
+        
+        # DEBUG: Log that we received a valid request
+        log_step("ops_daemon_request_received", {
+            "request_id": request_id,
+            "op": op,
+            "request_path": request_path
+        })
+        
+        # Process operation
+        success = False
+        error_msg = None
+        
+        if op == "write_config":
+            relative_path = request.get("relative_path")
+            content = request.get("content")
+            
+            if not relative_path or not isinstance(content, str):
+                raise ValueError("write_config requires relative_path and content")
+            
+            success = _write_config_file(relative_path, content)
+            
+        elif op == "write_measurement":
+            group = request.get("group")
+            data_b64 = request.get("data_b64")
+            
+            if not group or not data_b64:
+                raise ValueError("write_measurement requires group and data_b64")
+            
+            # Decode base64
+            import base64
+            try:
+                encrypted_bytes = base64.b64decode(data_b64)
+            except Exception as e:
+                raise ValueError(f"Invalid base64 data: {e}")
+            
+            success = _write_measurement_file(group, encrypted_bytes)
+            
+        elif op == "add_firewall_rule":
+            rule_name = request.get("rule_name")
+            port = request.get("port", 0)
+            protocol = request.get("protocol", "TCP")
+            direction = request.get("direction", "in")
+            program = request.get("program")
+            
+            if not rule_name:
+                raise ValueError("add_firewall_rule requires rule_name")
+            
+            success = _add_firewall_rule(rule_name, port, protocol, direction, program)
+            
+        elif op == "remove_firewall_rule":
+            rule_name = request.get("rule_name")
+            
+            if not rule_name:
+                raise ValueError("remove_firewall_rule requires rule_name")
+            
+            success = _remove_firewall_rule(rule_name)
+            
+        elif op == "setup_mysterium_firewall":
+            success = _setup_mysterium_firewall()
+            
+        elif op == "setup_presearch_firewall":
+            success = _setup_presearch_firewall()
+            
+        elif op == "setup_diiisco_firewall":
+            success = _setup_diiisco_firewall()
+            
+        elif op == "setup_spaceacres_firewall":
+            success = _setup_spaceacres_firewall()
+            
+        elif op == "reload_config":
+            # Reload service configuration from config files
+            try:
+                _reload_service_config()
+                success = True
+            except Exception as e:
+                error_msg = str(e)
+                success = False
+            
+        else:
+            # Unknown operation: log and mark failure without raising to preserve result marker
+            error_msg = f"Unknown operation: {op}"
+            success = False
+            log_step("ops_daemon_unknown_op", {"request_id": request_id, "op": op})
+        
+        # Write result marker
+        if request_id:
+            _write_ops_result(request_id, op, success, error_msg)
+        
+        # Move processed file
+        processed_name = os.path.basename(request_path)
+        if success:
+            processed_path = os.path.join(data_dir(), "ops_processed", f"{processed_name}.processed")
+        else:
+            processed_path = os.path.join(data_dir(), "ops_processed", f"{processed_name}.error")
+        
+        try:
+            os.replace(request_path, processed_path)
+        except Exception:
+            try:
+                os.remove(request_path)
+            except Exception:
+                pass
+        
+        log_step("ops_daemon_processed", {
+            "op": op,
+            "success": success,
+            "request_id": request_id
+        })
+        
+    except Exception as e:
+        log.error("Failed to process queue request %s: %s", os.path.basename(request_path), e)
+        
+        # Write result marker on failure (best-effort)
+        if request_id:
+            _write_ops_result(request_id, op, False, str(e))
+
+        # Move to error
+        try:
+            error_name = os.path.basename(request_path)
+            error_path = os.path.join(data_dir(), "ops_processed", f"{error_name}.error")
+            os.replace(request_path, error_path)
+        except Exception:
+            try:
+                os.remove(request_path)
+            except Exception:
+                pass
+        
+        log_step("ops_daemon_handle_failed", {
+            "request_id": request_id,
+            "op": op,
+            "error": str(e)
+        })
+
+def _ops_queue_daemon_loop() -> None:
+    """Background daemon that processes IPC queue requests.
+    
+    Polls ops_queue directory every 500ms and processes pending requests.
+    """
+    log_step("ops_daemon_start", {"supported_ops": [
+        "write_config",
+        "write_measurement",
+        "add_firewall_rule",
+        "remove_firewall_rule",
+        "setup_mysterium_firewall",
+        "setup_presearch_firewall",
+        "setup_diiisco_firewall",
+        "setup_spaceacres_firewall",
+        "reload_config",
+    ]})
+    
+    request_count = 0
+    error_count = 0
+    last_health_update = dt.datetime.now(UTC)
+    
+    while True:
+        try:
+            queue_dir = os.path.join(data_dir(), "ops_queue")
+            
+            # Ensure queue directory exists
+            os.makedirs(queue_dir, exist_ok=True)
+            
+            # Get all .json files
+            try:
+                files = [f for f in os.listdir(queue_dir) if f.endswith(".json")]
+            except Exception:
+                files = []
+            
+            # Process each request
+            for filename in files:
+                request_path = os.path.join(queue_dir, filename)
+                try:
+                    _process_ops_queue_request(request_path)
+                    request_count += 1
+                except Exception as e:
+                    error_count += 1
+                    log.exception("Queue processing error for %s: %s", filename, e)
+                    log_step("ops_daemon_loop_error", {"error": str(e), "file": filename})
+            
+            # Update health marker every 60 seconds
+            now = dt.datetime.now(UTC)
+            if (now - last_health_update).total_seconds() >= 60:
+                try:
+                    health_path = os.path.join(data_dir(), "ops_processed", "health.json")
+                    health_data = {
+                        "last_poll": now.isoformat(),
+                        "daemon_status": "running",
+                        "requests_processed": request_count,
+                        "requests_failed": error_count
+                    }
+                    with open(health_path, "w", encoding="utf-8") as f:
+                        json.dump(health_data, f)
+                    last_health_update = now
+                except Exception:
+                    pass
+            
+            # Poll every 500ms
+            time.sleep(0.5)
+            
+        except Exception as e:
+            log.exception("Ops queue daemon loop error: %s", e)
+            log_step("ops_daemon_loop_error", {"error": str(e)})
+            time.sleep(1)  # Backoff on error
+
+
+# ====================================================================
+# MEASUREMENT COLLECTION DAEMON
+# ====================================================================
+
+_measurement_daemon_running = False
+
+def _collect_and_write_measurements() -> None:
+    """Collect current measurements and write to measurements/ directory.
+    
+    This function collects hardware stats, PoC status, and other measurements,
+    then writes them to the measurements/ directory as encrypted files.
+    The GUI reads these files for display.
+    
+    Also updates the local cache (podHours) with PoD status so that write_status()
+    can use it to set the "data" gate in rewards.
+    """
+    try:
+        config = _load_service_config()
+        enabled_pocs = _get_enabled_pocs()
+        
+        # Collect timestamp
+        now = now_utc()
+        
+        # Build measurement payload
+        measurements = {
+            "timestamp": now.isoformat(),
+            "software_version": SOFTWARE_VERSION,
+            "poc_version": POC_VERSION,
+            "miner_code": MINER_CODE,
+            "enabled_pocs": enabled_pocs,
+        }
+        
+        # Hardware measurements (CPU, RAM, Disk, Network)
+        try:
+            measurements["hardware"] = _collect_hardware_stats()
+        except Exception as e:
+            log.warning("Failed to collect hardware stats: %s", e)
+        
+        # PoC-specific measurements
+        for poc_type in enabled_pocs:
+            try:
+                if poc_type == "mysterium":
+                    measurements["mysterium"] = _collect_mysterium_stats(config)
+                elif poc_type == "presearch":
+                    measurements["presearch"] = _collect_presearch_stats(config)
+                elif poc_type == "diiisco":
+                    measurements["diiisco"] = _collect_diiisco_stats(config)
+                elif poc_type == "spaceacres":
+                    measurements["spaceacres"] = _collect_spaceacres_stats(config)
+                elif poc_type == "bright":
+                    measurements["bright"] = _collect_bright_stats(config)
+                elif poc_type == "honeygain":
+                    measurements["honeygain"] = _collect_honeygain_stats(config)
+            except Exception as e:
+                log.warning("Failed to collect %s stats: %s", poc_type, e)
+        
+        # Collect PoD status and update local cache
+        # This allows write_status() to set the "data" gate correctly
+        try:
+            pod_status = _collect_pod_status()
+            measurements["pod"] = {"status": pod_status}
+            _update_pod_hours_cache(now, pod_status)
+        except Exception as e:
+            log.warning("Failed to collect PoD status: %s", e)
+        
+        # Write measurements to file
+        try:
+            # Encrypt measurements (placeholder - use actual encryption logic)
+            import base64
+            measurements_json = json.dumps(measurements)
+            encrypted_data = base64.b64encode(measurements_json.encode('utf-8'))
+            
+            # Write to measurements directory
+            measurements_dir = os.path.join(data_dir(), "measurements")
+            os.makedirs(measurements_dir, exist_ok=True)
+            
+            filename = f"measurements_{now.strftime('%Y%m%d_%H%M%S')}.enc"
+            filepath = os.path.join(measurements_dir, filename)
+            
+            with open(filepath, "wb") as f:
+                f.write(encrypted_data)
+            
+            # Also write latest.json for easy GUI access
+            latest_path = os.path.join(measurements_dir, "latest.json")
+            with open(latest_path, "w", encoding="utf-8") as f:
+                json.dump(measurements, f, indent=2)
+            
+            log_step("measurements_collected", {
+                "timestamp": now.isoformat(),
+                "pocs": enabled_pocs,
+                "file": filename
+            })
+            
+        except Exception as e:
+            log.error("Failed to write measurements: %s", e)
+        
+    except Exception as e:
+        log.exception("Measurement collection error: %s", e)
+
+
+def _collect_hardware_stats() -> Dict[str, Any]:
+    """Collect hardware statistics (CPU, RAM, Disk, Network).
+    
+    Returns:
+        Dictionary with hardware stats
+    """
+    stats = {}
+    
+    try:
+        import psutil
+        
+        # CPU
+        stats["cpu_percent"] = psutil.cpu_percent(interval=1)
+        stats["cpu_count"] = psutil.cpu_count()
+        
+        # Memory
+        mem = psutil.virtual_memory()
+        stats["memory_percent"] = mem.percent
+        stats["memory_total_gb"] = round(mem.total / (1024**3), 2)
+        stats["memory_used_gb"] = round(mem.used / (1024**3), 2)
+        
+        # Disk
+        disk = psutil.disk_usage('/')
+        stats["disk_percent"] = disk.percent
+        stats["disk_total_gb"] = round(disk.total / (1024**3), 2)
+        stats["disk_used_gb"] = round(disk.used / (1024**3), 2)
+        
+        # Network (basic check)
+        net_io = psutil.net_io_counters()
+        stats["network_bytes_sent"] = net_io.bytes_sent
+        stats["network_bytes_recv"] = net_io.bytes_recv
+        
+    except Exception as e:
+        log.warning("psutil not available or error collecting stats: %s", e)
+        stats["error"] = str(e)
+    
+    return stats
+
+
+def _collect_mysterium_stats(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Collect Mysterium node statistics."""
+    stats = {"status": "unknown"}
+    
+    try:
+        # Call Tequilapi to get node status
+        response = requests.get(f"http://localhost:{MYST_TEQUILAPI_PORT}/healthcheck", timeout=5)
+        if response.status_code == 200:
+            stats["status"] = "online"
+            stats["health"] = response.json()
+        else:
+            stats["status"] = "offline"
+    except Exception as e:
+        stats["status"] = "offline"
+        stats["error"] = str(e)
+    
+    return stats
+
+
+def _collect_presearch_stats(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Collect Presearch node statistics."""
+    stats = {"status": "unknown"}
+    
+    try:
+        # TODO: Implement Presearch stats collection
+        # This would query the Presearch API or Docker container
+        stats["status"] = "not_implemented"
+    except Exception as e:
+        stats["error"] = str(e)
+    
+    return stats
+
+
+def _collect_diiisco_stats(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Collect Diiisco node statistics."""
+    stats = {"status": "unknown"}
+    
+    try:
+        # TODO: Implement Diiisco stats collection
+        stats["status"] = "not_implemented"
+    except Exception as e:
+        stats["error"] = str(e)
+    
+    return stats
+
+
+def _collect_spaceacres_stats(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Collect Space Acres statistics."""
+    stats = {"status": "unknown"}
+    
+    try:
+        # TODO: Implement Space Acres stats collection
+        # This would query the RPC endpoint
+        stats["status"] = "not_implemented"
+    except Exception as e:
+        stats["error"] = str(e)
+    
+    return stats
+
+
+def _collect_bright_stats(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Collect Bright Data statistics."""
+    stats = {"status": "unknown"}
+    
+    try:
+        # TODO: Implement Bright Data stats collection
+        stats["status"] = "not_implemented"
+    except Exception as e:
+        stats["error"] = str(e)
+    
+    return stats
+
+
+def _collect_honeygain_stats(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Collect Honeygain statistics."""
+    stats = {"status": "unknown"}
+    
+    try:
+        # TODO: Implement Honeygain stats collection
+        stats["status"] = "not_implemented"
+    except Exception as e:
+        stats["error"] = str(e)
+    
+    return stats
+
+
+def _collect_pod_status() -> bool:
+    """Collect Proof of Data (PoD) status for the current moment.
+    
+    Returns:
+        True if PoD is passing/working, False otherwise
+    """
+    try:
+        # Try to query PoD service/API
+        # This is a placeholder - actual implementation depends on PoD provider
+        
+        # Option 1: Query PoD HTTP endpoint if available
+        try:
+            response = requests.get("http://localhost:8080/pod/status", timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                return bool(data.get("passing", False))
+        except Exception:
+            pass
+        
+        # Option 2: Check file-based proof submission status
+        try:
+            pod_status_file = os.path.join(data_dir(), "status", "pod_status.json")
+            if os.path.exists(pod_status_file):
+                with open(pod_status_file, "r", encoding="utf-8") as f:
+                    status = json.load(f)
+                    return bool(status.get("passing", False))
+        except Exception:
+            pass
+        
+        # Default: assume PoD is working if we can't determine otherwise
+        return True
+        
+    except Exception as e:
+        log.warning("Failed to collect PoD status: %s", e)
+        # Benign failure - assume True for PoD
+        return True
+
+
+def _update_pod_hours_cache(now: dt.datetime, pod_status: bool) -> None:
+    """Update the local cache podHours structure with current PoD status.
+    
+    The service writes to this cache, and write_status() reads from it
+    to set the "data" gate in rewards.
+    
+    Args:
+        now: Current timestamp
+        pod_status: True if PoD is passing
+    """
+    try:
+        cache_path = cache_path_for(now)
+        cache_dir = os.path.dirname(cache_path)
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Read existing cache
+        cache_doc = read_local_cache(cache_path) if os.path.exists(cache_path) else {}
+        
+        # Ensure podHours structure exists
+        if "podHours" not in cache_doc:
+            cache_doc["podHours"] = {}
+        
+        # Get current hour and slot
+        hour = now.hour
+        day = day_iso(now)
+        interval = 600  # Default 10 minutes
+        
+        # Calculate slot within the hour
+        minute_of_hour = now.minute
+        slots_per_hour = max(1, 3600 // max(1, interval))
+        slot = min(slots_per_hour - 1, (minute_of_hour * slots_per_hour) // 60)
+        
+        # Ensure hour entry exists
+        hour_key = str(hour)
+        if hour_key not in cache_doc["podHours"]:
+            cache_doc["podHours"][hour_key] = {"slots": []}
+        
+        # Ensure slots list is long enough
+        slots_list = cache_doc["podHours"][hour_key].get("slots", [])
+        while len(slots_list) <= slot:
+            slots_list.append(None)
+        
+        # Update current slot
+        slots_list[slot] = bool(pod_status)
+        cache_doc["podHours"][hour_key]["slots"] = slots_list
+        
+        # Preserve existing data and metadata
+        if "date" not in cache_doc:
+            cache_doc["date"] = day
+        
+        # Write back to cache
+        atomic_write_json(cache_path, cache_doc)
+        
+        log.debug("Updated PoD cache: hour=%d, slot=%d, status=%s", hour, slot, pod_status)
+        
+    except Exception as e:
+        log.warning("Failed to update PoD cache: %s", e)
+
+
+def _measurement_collection_loop() -> None:
+    """Background daemon loop for periodic measurement collection."""
+    global _measurement_daemon_running
+    _measurement_daemon_running = True
+    
+    log_step("measurement_daemon_started", {"timestamp": now_utc().isoformat()})
+    
+    while _measurement_daemon_running:
+        try:
+            # Get measurement interval from config
+            interval = _get_measurement_interval()
+            
+            # Collect and write measurements
+            _collect_and_write_measurements()
+            
+            # Sleep until next interval
+            time.sleep(interval)
+            
+        except Exception as e:
+            log.exception("Measurement daemon loop error: %s", e)
+            log_step("measurement_daemon_loop_error", {"error": str(e)})
+            time.sleep(60)  # Backoff on error
+
+
+def _start_measurement_daemon() -> None:
+    """Start the measurement collection daemon in a background thread."""
+    try:
+        # Load initial configuration
+        _reload_service_config()
+        
+        # Start daemon thread
+        daemon_thread = threading.Thread(
+            target=_measurement_collection_loop,
+            name="measurement-daemon",
+            daemon=True
+        )
+        daemon_thread.start()
+        
+        log.info("Measurement collection daemon started | interval=%s seconds", _get_measurement_interval())
+        log_step("measurement_daemon_start", {
+            "interval": _get_measurement_interval(),
+            "enabled_pocs": _get_enabled_pocs()
+        })
+    except Exception as e:
+        log.error("Failed to start measurement daemon: %s", e)
+
+
+def _start_ops_queue_daemon() -> None:
+    """Start the privileged operations queue daemon in a background thread."""
+    try:
+        daemon_thread = threading.Thread(
+            target=_ops_queue_daemon_loop,
+            name="ops-queue-daemon",
+            daemon=True
+        )
+        daemon_thread.start()
+        log.info("IPC queue daemon started | queue_path=%s", os.path.join(data_dir(), "ops_queue"))
+    except Exception as e:
+        log.error("Failed to start ops queue daemon: %s", e)
+
 def main() -> None:
     # Installer handles miner key validation + initial lease acquisition
     _init_service_file_logging()
@@ -3221,6 +4610,22 @@ def main() -> None:
             _start_poi_local_loop(miner_key, interval, poi_poll_seconds)
         except Exception:
             pass
+
+    # ----------------------------
+    # Start IPC queue daemon for privileged operations
+    # ----------------------------
+    try:
+        _start_ops_queue_daemon()
+    except Exception as e:
+        log.warning("Failed to start IPC queue daemon: %s", e)
+
+    # ----------------------------
+    # Start measurement collection daemon
+    # ----------------------------
+    try:
+        _start_measurement_daemon()
+    except Exception as e:
+        log.warning("Failed to start measurement daemon: %s", e)
 
     # ----------------------------
     # Connect + lease + bootstrap doc
