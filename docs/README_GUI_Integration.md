@@ -49,22 +49,21 @@ The GUI role has shifted from **measurement collection** to **configuration mana
 ### Windows Paths
 ```
 %PROGRAMDATA%\FryNetworks\miner-{MINER_CODE}\
-├── config/                    # Configuration files (GUI writes, Service reads)
-│   ├── miner_config.json      # Main miner settings
-│   ├── mysterium_config.json
-│   ├── presearch_config.json
-│   ├── diiisco_config.json
-│   ├── spaceacres_config.json
-│   ├── bright_config.json
-│   └── honeygain_config.json
-├── measurements/              # Measurement files (Service writes, GUI reads)
-│   ├── latest.json            # Latest measurements (JSON format for debugging)
-│   ├── measurements_*.enc     # Encrypted historical measurements
+├── config/                       # Configuration files
+│   ├── miner_config.json         # Main settings: tool enable/disable flags
+│   ├── presearch_config.json     # Presearch operational settings (optional)
+│   ├── diiisco_config.json       # Diiisco operational settings (optional)
+│   ├── brd_config.json           # Bright operational settings (optional)
+│   ├── honeygain.json            # Honeygain operational settings (optional)
+│   └── install_config.json       # Installation paths, GeoIP data
+├── measurements/                 # Measurement files (Service writes, GUI reads)
+│   ├── latest.json               # Latest measurements (JSON format for debugging)
+│   ├── measurements_*.enc        # Encrypted historical measurements
 │   └── ...
-├── ops_queue/                 # IPC operation queue (GUI writes requests)
-│   ├── *.json                 # Request files
+├── ops_queue/                    # IPC operation queue (GUI writes requests)
+│   ├── *.json                    # Request files
 │   └── ...
-├── ops_processed/             # IPC operation results (Service writes)
+├── ops_processed/                # IPC operation results (Service writes)
 │   ├── *.done.json
 │   ├── *.processed
 │   ├── *.error
@@ -72,6 +71,12 @@ The GUI role has shifted from **measurement collection** to **configuration mana
 └── logs/
     └── service.err.log
 ```
+
+**IMPORTANT - Credential Security:**
+- **Tool credentials (API keys, registration codes, payout addresses, wallet addresses) are embedded at build time from 1Password** - not in config files
+- GUI writes **only operational settings** and **enable/disable flags** via `write_config` operations
+- GUI **does NOT** include or request any sensitive credentials
+- Service reads embedded credentials from encrypted config automatically
 
 ### Linux Paths
 ```
@@ -105,47 +110,82 @@ The GUI **does NOT** need to write PoD status anymore. The `"data"` flag will be
 
 ### 1. **Write Configuration Files**
 
-When user changes settings, GUI writes JSON files to `config/` directory.
+GUI writes config files to enable/disable tools and configure operational settings. **Sensitive credentials are embedded at build time and NOT written by the GUI.**
 
-#### Example: `miner_config.json`
+#### Primary: `miner_config.json` (Enable/Disable Flags)
 ```json
 {
-  "measurement_interval": 600,
-  "mysterium_enabled": true,
-  "presearch_enabled": false,
-  "diiisco_enabled": false,
-  "spaceacres_enabled": true,
-  "bright_enabled": false,
-  "honeygain_enabled": false
+  "mysterium": {
+    "enabled": true
+  },
+  "bright": {
+    "enabled": false
+  },
+  "honeygain": {
+    "enabled": true
+  },
+  "presearch": {
+    "enabled": false
+  },
+  "diiisco": {
+    "enabled": true
+  },
+  "spaceacres": {
+    "enabled": false
+  }
 }
 ```
 
-#### Example: `mysterium_config.json`
+#### Optional: Tool-Specific Configs (Operational Settings Only)
+
+**`presearch_config.json`** (credentials embedded at build time):
 ```json
 {
   "enabled": true,
-  "api_url": "http://localhost:4050",
-  "wireguard_port": 51820,
-  "identity": "0x123abc...",
-  "provider_min_price": 50000,
-  "provider_price_gib": 5000
+  "docker_container_name": "presearch-node"
 }
 ```
 
-#### Example: `presearch_config.json`
+**`diiisco_config.json`** (credentials embedded at build time):
 ```json
 {
   "enabled": true,
-  "api_port": 80,
-  "registration_code": "abc123def456",
-  "auto_update": true
+  "api_port": 8080,
+  "docker_container_name": "diiisco-node",
+  "network": "mainnet"
+}
+```
+
+**`brd_config.json`** (api_token embedded at build time):
+```json
+{
+  "enabled": true,
+  "app_id": "bright-app-id-123",
+  "app_name": "Fry Networks",
+  "logo_link": "https://example.com/logo.png",
+  "language": "en",
+  "consent": true
+}
+```
+
+**`honeygain.json`** (api_key embedded at build time):
+```json
+{
+  "enabled": true,
+  "sdk_root": "C:/ProgramData/FryNetworks/SDK/windows-honeygain-sdk",
+  "library_path": "C:/ProgramData/FryNetworks/SDK/windows-honeygain-sdk/x64/bin/hgsdk.dll",
+  "log_dir": "C:/ProgramData/FryNetworks/logs/honeygain",
+  "poll_seconds": 60
 }
 ```
 
 **Important:** 
 - Write atomically to avoid partial reads
 - Create parent directory if it doesn't exist
-- Use UTF-8 encoding
+- Use UTF-8 encoding without BOM
+- **DO NOT include credentials** (API keys, registration codes, wallet addresses) - these are embedded at build time
+- GUI provides **only enable/disable flags and operational settings**
+- GUI **never asks user for credentials** - these are set during service build
 
 ---
 
@@ -332,52 +372,49 @@ measurement = json.loads(decoded.decode('utf-8'))
 }
 ```
 
-### Full `mysterium_config.json`
+---
+
+## Configuration Schema Examples
+
+**DEPRECATED:** Tool-specific config files are no longer used. Critical credentials (API keys, payout addresses, wallet addresses) are embedded at build time from 1Password.
+
+### Full `miner_config.json`
 ```json
 {
-  "enabled": true,
-  "api_url": "http://localhost:4050",
-  "api_key": "your-api-key",
-  "wireguard_port": 51820,
-  "identity": "0x1234567890abcdef",
-  "provider_mode": false,
-  "minimum_stake": 1000000000000000000,
-  "provider_min_price": 50000000000,
-  "provider_price_gib": 5000000000,
-  "auto_register": true,
-  "country_whitelist": ["US", "CA", "GB"],
-  "country_blacklist": []
+  "measurement_interval": 600,
+  "mysterium_enabled": true,
+  "mysterium_provider": false,
+  "presearch_enabled": true,
+  "diiisco_enabled": false,
+  "spaceacres_enabled": true,
+  "bright_enabled": false,
+  "honeygain_enabled": false,
+  "log_level": "INFO",
+  "debug_mode": false
 }
 ```
 
-### Full `presearch_config.json`
-```json
-{
-  "enabled": true,
-  "api_port": 80,
-  "registration_code": "abc123def456ghi",
-  "node_id": "presearch_node_123",
-  "auto_update": true,
-  "update_check_interval": 3600
-}
-```
-
-### Full `spaceacres_config.json`
-```json
-{
-  "enabled": true,
-  "rpc_endpoint": "ws://localhost:9944",
-  "farmer_key": "your-farmer-account-key",
-  "plot_directory": "/mnt/plots",
-  "reward_address": "13K1X...",
-  "public_key": "your-public-key",
-  "proof_of_spacetime_enabled": true
-}
-```
+**Notes:**
+- All PoC credentials (API keys, payout addresses) are embedded at build time
+- GUI only controls enable/disable flags and operational settings
+- For production builds, credentials come from 1Password vault
+- For development builds, use test credentials
 
 ---
 
 ## Service Internals (For Reference)
+
+### Tool Credential Management
+
+**Build-time Embedding:**
+- Mysterium: API key, identity (wallet address)
+- Presearch: Registration code
+- Diiisco: API key
+- Space Acres: Farmer key, reward address
+- Bright: API token
+- Honeygain: API key
+
+All credentials are pulled from 1Password during build and encrypted into the executable. The service reads them from embedded config at runtime via `_get_tool_credentials()`.
 
 ### Measurement Collection Flow
 
@@ -385,22 +422,26 @@ measurement = json.loads(decoded.decode('utf-8'))
 1. Service starts → loads config via _read_service_config()
 2. Measurement daemon thread starts (_start_measurement_daemon)
 3. Every N seconds (configurable):
-   a. Read enabled PoCs from config
-   b. Collect hardware stats (psutil)
-   c. Query each PoC API for stats
-   d. Collect PoD status:
+   a. Read enabled tools from miner_config.json
+   b. Load tool credentials from embedded config
+   c. Collect hardware stats (psutil)
+   d. Query each enabled tool API for stats (using embedded credentials)
+   e. Collect PoD status:
       - Query PoD HTTP endpoint (http://localhost:8080/pod/status)
       - Or check pod_status.json file
       - Default: true (benign failure)
-   e. Update local cache podHours with PoD status
-   f. Aggregate into measurement object
-   g. Write to measurements/latest.json
-   h. Write encrypted version to measurements/TIMESTAMP.enc
+   f. Update local cache podHours with PoD status
+   g. Aggregate into measurement object
+   h. Write to measurements/latest.json
+   i. Write encrypted version to measurements/TIMESTAMP.enc
 4. GUI reads latest.json and displays to user
 5. Main loop reads podHours cache and sets "data" gate in rewards
 ```
 
-**Key Point:** The "data" gate will be set based on actual PoD collection, not GUI input!
+**Key Points:** 
+- The "data" gate is set based on actual PoD collection, not GUI input
+- Tool credentials are never exposed to GUI or config files
+- Only enable/disable flags are user-configurable
 
 ### IPC Operation Flow
 

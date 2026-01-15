@@ -55,14 +55,14 @@ try {
     $request = @{
         id = $requestId
         op = "write_measurement"
-        group = "TestMeasurement"
+        tool = "TestMeasurement"
         data_b64 = $base64Data
     }
     
     $requestPath = "$queueDir\$requestId.json"
     $request | ConvertTo-Json | Set-Content $requestPath -Encoding UTF8
     Write-Info "  Sent write_measurement request: $requestId"
-    Write-Info "  Group: TestMeasurement"
+    Write-Info "  Tool: TestMeasurement"
     Write-Info "  Data size: $($encryptedBytes.Length) bytes"
     
     # Wait for response (max 10 seconds)

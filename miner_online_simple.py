@@ -254,8 +254,15 @@ def _read_service_config() -> Dict[str, Any]:
     """Read all configuration files from config/ directory into memory.
     
     Reads:
-    - config/miner_config.json - Main miner configuration
-    - config/{poc_type}_config.json - PoC-specific configurations
+    - config/miner_config.json - Main miner configuration (enable/disable flags)
+    - config/presearch_config.json - Presearch tool settings
+    - config/diiisco_config.json - Diiisco tool settings
+    - config/brd_config.json - Bright tool settings
+    - config/honeygain.json - Honeygain tool settings
+    - config/honeygain.enc - Honeygain API key (encrypted)
+    
+    Critical credentials (API keys, payout addresses) are embedded at build time
+    from 1Password and available via load_config() -> tool_credentials.
     
     Returns:
         Dictionary with all configuration data
@@ -277,19 +284,25 @@ def _read_service_config() -> Dict[str, Any]:
             except Exception as e:
                 log.warning("Failed to load miner_config.json: %s", e)
         
-        # Read PoC-specific configs
-        poc_types = ['mysterium', 'presearch', 'diiisco', 'spaceacres', 'bright', 'honeygain']
-        for poc_type in poc_types:
-            poc_config_path = os.path.join(config_dir, f"{poc_type}_config.json")
-            if os.path.exists(poc_config_path):
+        # Read tool-specific config files (written by GUI)
+        tool_configs = {
+            'presearch_config': 'presearch_config.json',
+            'diiisco_config': 'diiisco_config.json',
+            'brd_config': 'brd_config.json',
+            'honeygain_config': 'honeygain.json'
+        }
+        
+        for config_key, config_filename in tool_configs.items():
+            config_path = os.path.join(config_dir, config_filename)
+            if os.path.exists(config_path):
                 try:
-                    with open(poc_config_path, 'r', encoding='utf-8') as f:
-                        poc_config = json.load(f)
-                        if isinstance(poc_config, dict):
-                            config[f'{poc_type}_config'] = poc_config
-                            log.debug("Loaded %s_config.json", poc_type)
+                    with open(config_path, 'r', encoding='utf-8') as f:
+                        tool_config = json.load(f)
+                        if isinstance(tool_config, dict):
+                            config[config_key] = tool_config
+                            log.debug("Loaded %s", config_filename)
                 except Exception as e:
-                    log.warning("Failed to load %s_config.json: %s", poc_type, e)
+                    log.warning("Failed to load %s: %s", config_filename, e)
     
     except Exception as e:
         log.error("Error reading service configuration: %s", e)
@@ -305,6 +318,28 @@ def _load_service_config() -> Dict[str, Any]:
     """
     with _service_config_lock:
         return dict(_service_config_cache)
+
+
+def _get_tool_credentials() -> Dict[str, Any]:
+    """Get tool credentials from embedded config.
+    
+    Credentials are embedded at build time from 1Password and include:
+    - mysterium_api_key, mysterium_identity
+    - presearch_registration_code
+    - diiisco_api_key
+    - spaceacres_farmer_key, spaceacres_reward_address
+    - bright_api_token
+    - honeygain_api_key
+    
+    Returns:
+        Dictionary of tool credentials (empty if not embedded)
+    """
+    try:
+        cfg = load_config()
+        return cfg.get('tool_credentials', {})
+    except Exception as e:
+        log.warning("Failed to load tool credentials: %s", e)
+        return {}
 
 
 def _reload_service_config() -> None:
@@ -340,15 +375,15 @@ def _get_measurement_interval() -> int:
     return 600
 
 
-def _get_enabled_pocs() -> List[str]:
-    """Get list of enabled PoCs from configuration.
+def _get_enabled_tools() -> List[str]:
+    """Get list of enabled tools from configuration.
     
-    Only returns PoCs that are:
+    Only returns tools that are:
     1. Enabled in the configuration
     2. Supported by this miner type (BM only supports mysterium, etc.)
     
     Returns:
-        List of enabled PoC types (e.g., ['mysterium'])
+        List of enabled tool names (e.g., ['mysterium'])
     """
     enabled = []
     
@@ -835,7 +870,8 @@ def read_encrypted_miner_config() -> Optional[str]:
         f = Fernet(key)
         decrypted_data = f.decrypt(config_data['data'].encode())
         config_data = json.loads(decrypted_data)
-        return config_data.get('miner_key')
+        miner_key = config_data.get('miner_key') if isinstance(config_data, dict) else None
+        return miner_key
     except Exception:
         return None
 
@@ -1092,8 +1128,28 @@ def decrypt_config() -> Dict[str, Any]:
     ec = owen_decrypt(knt, knp)
     return json.loads(Fernet(kas).decrypt(ec))
 
+def _dotenv_overrides() -> Dict[str, str]:
+    """Load optional .env next to the executable for local/dev overrides."""
+    exe_path = pathlib.Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve()
+    env_path = exe_path.parent / ".env"
+    overrides: Dict[str, str] = {}
+    try:
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                overrides[key.strip()] = value.strip()
+    except Exception:
+        pass
+    return overrides
+
 def load_config() -> Dict[str, Any]:
     # Use embedded encrypted config (credentials from 1Password at build time)
+    cfg: Dict[str, Any] = {}
     try:
         embedded_cfg = decrypt_config()
         if isinstance(embedded_cfg, dict):
@@ -1107,11 +1163,21 @@ def load_config() -> Dict[str, Any]:
             
             # Return if we have valid config
             if embedded_cfg.get("api_base_url") or embedded_cfg.get("api_url"):
-                return embedded_cfg
+                cfg = embedded_cfg
+    except Exception:
+        pass
+    # Allow local .env to override API base URL for developer/test installs
+    try:
+        overrides = _dotenv_overrides()
+        env_base = overrides.get("API_BASE_URL") or os.environ.get("API_BASE_URL")
+        if isinstance(env_base, str) and env_base.strip():
+            cfg["api_base_url"] = env_base.strip()
     except Exception:
         pass
     
     # No fallback - production builds must have embedded config from 1Password
+    if cfg.get("api_base_url") or cfg.get("api_url"):
+        return cfg
     return {}
 
 def required_versions_from_db(client) -> Dict[str, str]:
@@ -3382,25 +3448,15 @@ def _write_config_file(relative_path: str, content: str) -> bool:
         log.exception("Config file write error: %s", e)
         return False
 
-def _write_measurement_file(group: str, encrypted_bytes: bytes) -> bool:
-    """Write an encrypted measurement file to ProgramData measurements directory.
-    
-    Args:
-        group: Measurement group (e.g., "Bandwidth", "Satellite")
-        encrypted_bytes: Encrypted measurement data
-    
-    Returns:
-        True if successful, False otherwise
-    """
+def _write_measurement_file(tool: str, encrypted_bytes: bytes) -> bool:
+    """Write an encrypted measurement file to ProgramData measurements directory."""
     try:
-        # Normalize group name
-        group_safe = "".join(c for c in group if c.isalnum() or c in "_ -")
-        if not group_safe:
-            log.error("Invalid measurement group: %s", group)
+        tool_safe = "".join(c for c in tool if c.isalnum() or c in "_ -")
+        if not tool_safe:
+            log.error("Invalid measurement tool: %s", tool)
             return False
         
-        # Build filename
-        filename = f"measurements-{group_safe}-latest.json.enc"
+        filename = f"measurements-{tool_safe}-latest.json.enc"
         target_path = os.path.join(data_dir(), "measurements", filename)
         
         # Ensure directory exists
@@ -3414,7 +3470,7 @@ def _write_measurement_file(group: str, encrypted_bytes: bytes) -> bool:
             os.replace(temp_path, target_path)
             
             log_step("privileged_measurement_file_written", {
-                "group": group_safe,
+                "tool": tool_safe,
                 "size": len(encrypted_bytes)
             })
             return True
@@ -3425,7 +3481,7 @@ def _write_measurement_file(group: str, encrypted_bytes: bytes) -> bool:
             except Exception:
                 pass
             log_step("privileged_measurement_file_write_failed", {
-                "group": group_safe,
+                "tool": tool_safe,
                 "error": str(e)
             })
             return False
@@ -3948,20 +4004,19 @@ def _process_ops_queue_request(request_path: str) -> None:
             success = _write_config_file(relative_path, content)
             
         elif op == "write_measurement":
-            group = request.get("group")
+            tool = request.get("tool")
             data_b64 = request.get("data_b64")
             
-            if not group or not data_b64:
-                raise ValueError("write_measurement requires group and data_b64")
+            if not tool or not data_b64:
+                raise ValueError("write_measurement requires tool and data_b64")
             
-            # Decode base64
             import base64
             try:
                 encrypted_bytes = base64.b64decode(data_b64)
             except Exception as e:
                 raise ValueError(f"Invalid base64 data: {e}")
             
-            success = _write_measurement_file(group, encrypted_bytes)
+            success = _write_measurement_file(tool, encrypted_bytes)
             
         elif op == "add_firewall_rule":
             rule_name = request.get("rule_name")
@@ -4139,92 +4194,21 @@ _measurement_daemon_running = False
 def _collect_and_write_measurements() -> None:
     """Collect current measurements and write to measurements/ directory.
     
-    This function collects hardware stats, PoC status, and other measurements,
-    then writes them to the measurements/ directory as encrypted files.
+    This function autonomously collects hardware stats, PoC status, and measurements,
+    then writes them to the measurements/ directory.
     The GUI reads these files for display.
     
-    Also updates the local cache (podHours) with PoD status so that write_status()
-    can use it to set the "data" gate in rewards.
+    Note: PoD (Proof of Data) status is determined by upload_measurements_for_slot()
+    in the main loop based on actual measurement delivery to the API.
     """
     try:
-        config = _load_service_config()
-        enabled_pocs = _get_enabled_pocs()
+        # Use the autonomous measurement collector
+        from measurements.collector import write_latest_measurements
         
-        # Collect timestamp
-        now = now_utc()
+        # Collect and write measurements for this miner type
+        write_latest_measurements(MINER_CODE)
         
-        # Build measurement payload
-        measurements = {
-            "timestamp": now.isoformat(),
-            "software_version": SOFTWARE_VERSION,
-            "poc_version": POC_VERSION,
-            "miner_code": MINER_CODE,
-            "enabled_pocs": enabled_pocs,
-        }
-        
-        # Hardware measurements (CPU, RAM, Disk, Network)
-        try:
-            measurements["hardware"] = _collect_hardware_stats()
-        except Exception as e:
-            log.warning("Failed to collect hardware stats: %s", e)
-        
-        # PoC-specific measurements
-        for poc_type in enabled_pocs:
-            try:
-                if poc_type == "mysterium":
-                    measurements["mysterium"] = _collect_mysterium_stats(config)
-                elif poc_type == "presearch":
-                    measurements["presearch"] = _collect_presearch_stats(config)
-                elif poc_type == "diiisco":
-                    measurements["diiisco"] = _collect_diiisco_stats(config)
-                elif poc_type == "spaceacres":
-                    measurements["spaceacres"] = _collect_spaceacres_stats(config)
-                elif poc_type == "bright":
-                    measurements["bright"] = _collect_bright_stats(config)
-                elif poc_type == "honeygain":
-                    measurements["honeygain"] = _collect_honeygain_stats(config)
-            except Exception as e:
-                log.warning("Failed to collect %s stats: %s", poc_type, e)
-        
-        # Collect PoD status and update local cache
-        # This allows write_status() to set the "data" gate correctly
-        try:
-            pod_status = _collect_pod_status()
-            measurements["pod"] = {"status": pod_status}
-            _update_pod_hours_cache(now, pod_status)
-        except Exception as e:
-            log.warning("Failed to collect PoD status: %s", e)
-        
-        # Write measurements to file
-        try:
-            # Encrypt measurements (placeholder - use actual encryption logic)
-            import base64
-            measurements_json = json.dumps(measurements)
-            encrypted_data = base64.b64encode(measurements_json.encode('utf-8'))
-            
-            # Write to measurements directory
-            measurements_dir = os.path.join(data_dir(), "measurements")
-            os.makedirs(measurements_dir, exist_ok=True)
-            
-            filename = f"measurements_{now.strftime('%Y%m%d_%H%M%S')}.enc"
-            filepath = os.path.join(measurements_dir, filename)
-            
-            with open(filepath, "wb") as f:
-                f.write(encrypted_data)
-            
-            # Also write latest.json for easy GUI access
-            latest_path = os.path.join(measurements_dir, "latest.json")
-            with open(latest_path, "w", encoding="utf-8") as f:
-                json.dump(measurements, f, indent=2)
-            
-            log_step("measurements_collected", {
-                "timestamp": now.isoformat(),
-                "pocs": enabled_pocs,
-                "file": filename
-            })
-            
-        except Exception as e:
-            log.error("Failed to write measurements: %s", e)
+        log.debug("Measurements collected and written for %s", MINER_CODE)
         
     except Exception as e:
         log.exception("Measurement collection error: %s", e)
@@ -4355,101 +4339,10 @@ def _collect_honeygain_stats(config: Dict[str, Any]) -> Dict[str, Any]:
     return stats
 
 
-def _collect_pod_status() -> bool:
-    """Collect Proof of Data (PoD) status for the current moment.
-    
-    Returns:
-        True if PoD is passing/working, False otherwise
-    """
-    try:
-        # Try to query PoD service/API
-        # This is a placeholder - actual implementation depends on PoD provider
-        
-        # Option 1: Query PoD HTTP endpoint if available
-        try:
-            response = requests.get("http://localhost:8080/pod/status", timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                return bool(data.get("passing", False))
-        except Exception:
-            pass
-        
-        # Option 2: Check file-based proof submission status
-        try:
-            pod_status_file = os.path.join(data_dir(), "status", "pod_status.json")
-            if os.path.exists(pod_status_file):
-                with open(pod_status_file, "r", encoding="utf-8") as f:
-                    status = json.load(f)
-                    return bool(status.get("passing", False))
-        except Exception:
-            pass
-        
-        # Default: assume PoD is working if we can't determine otherwise
-        return True
-        
-    except Exception as e:
-        log.warning("Failed to collect PoD status: %s", e)
-        # Benign failure - assume True for PoD
-        return True
 
 
-def _update_pod_hours_cache(now: dt.datetime, pod_status: bool) -> None:
-    """Update the local cache podHours structure with current PoD status.
-    
-    The service writes to this cache, and write_status() reads from it
-    to set the "data" gate in rewards.
-    
-    Args:
-        now: Current timestamp
-        pod_status: True if PoD is passing
-    """
-    try:
-        cache_path = cache_path_for(now)
-        cache_dir = os.path.dirname(cache_path)
-        os.makedirs(cache_dir, exist_ok=True)
-        
-        # Read existing cache
-        cache_doc = read_local_cache(cache_path) if os.path.exists(cache_path) else {}
-        
-        # Ensure podHours structure exists
-        if "podHours" not in cache_doc:
-            cache_doc["podHours"] = {}
-        
-        # Get current hour and slot
-        hour = now.hour
-        day = day_iso(now)
-        interval = 600  # Default 10 minutes
-        
-        # Calculate slot within the hour
-        minute_of_hour = now.minute
-        slots_per_hour = max(1, 3600 // max(1, interval))
-        slot = min(slots_per_hour - 1, (minute_of_hour * slots_per_hour) // 60)
-        
-        # Ensure hour entry exists
-        hour_key = str(hour)
-        if hour_key not in cache_doc["podHours"]:
-            cache_doc["podHours"][hour_key] = {"slots": []}
-        
-        # Ensure slots list is long enough
-        slots_list = cache_doc["podHours"][hour_key].get("slots", [])
-        while len(slots_list) <= slot:
-            slots_list.append(None)
-        
-        # Update current slot
-        slots_list[slot] = bool(pod_status)
-        cache_doc["podHours"][hour_key]["slots"] = slots_list
-        
-        # Preserve existing data and metadata
-        if "date" not in cache_doc:
-            cache_doc["date"] = day
-        
-        # Write back to cache
-        atomic_write_json(cache_path, cache_doc)
-        
-        log.debug("Updated PoD cache: hour=%d, slot=%d, status=%s", hour, slot, pod_status)
-        
-    except Exception as e:
-        log.warning("Failed to update PoD cache: %s", e)
+
+
 
 
 def _measurement_collection_loop() -> None:
@@ -4493,7 +4386,7 @@ def _start_measurement_daemon() -> None:
         log.info("Measurement collection daemon started | interval=%s seconds", _get_measurement_interval())
         log_step("measurement_daemon_start", {
             "interval": _get_measurement_interval(),
-            "enabled_pocs": _get_enabled_pocs()
+            "enabled_pocs": _get_enabled_tools()
         })
     except Exception as e:
         log.error("Failed to start measurement daemon: %s", e)

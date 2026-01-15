@@ -13,6 +13,21 @@ param(
   [string]$GithubToken = "",
   [bool]$SoftwareUptodate = $true,
   [SecureString]$OPRefPfxPassword = $null,
+  # Tool Credentials (embedded at build time from 1Password)
+  [string]$OPRefPresearchRegCode = "op://Hardware/Presearch/registration_code",
+  [string]$OPRefPresearchApiKey = "op://Hardware/Presearch/api_key",
+  [string]$OPRefDiiiscoApiKey = "op://Hardware/Diiisco/api_key",
+  [string]$OPRefDiiiscoNodeKey = "op://Hardware/Diiisco/node_key",
+  [string]$OPRefSpaceAcresFarmerKey = "op://Hardware/SpaceAcres/farmer_key",
+  [string]$OPRefSpaceAcresRewardAddr = "op://Hardware/SpaceAcres/reward_address",
+  [string]$OPRefBrightApiToken = "op://Hardware/Bright/api_token",
+  [string]$OPRefHoneygainApiKey = "op://Hardware/Honeygain/api_key",
+
+  [string]$OPRefMystPayoutAddr = "op://Bandwidth Miners/Mysterium SDK API/MYST_PAYOUT_ADDR",
+  [string]$OPRefMystRegistrationToken = "op://Bandwidth Miners/Mysterium SDK API/MYST_REG_TOKEN",
+  [string]$OPRefMystApiKey = "op://Bandwidth Miners/Mysterium SDK API/MYST_API_KEY",
+
+
   [int]$IntervalSeconds = 600,
   [string]$TlsCAFile = "",
   [switch]$Sign = $false,
@@ -303,6 +318,109 @@ try {
     }
     if (-not $githubTok) { throw "Provide GitHub token via -OPRefGithubToken or -GithubToken when -UseGithub is set" }
     $cfg.github_token = $githubTok
+  }
+  
+  # Tool Credentials (embedded from 1Password)
+  if ($Use1Password) {
+    $toolCreds = @{}
+    
+    # Mysterium
+    try {
+      if ($OPRefMysteriumApiKey) {
+        $val = (& op read $OPRefMysteriumApiKey 2>$null).Trim()
+        if ($val) { 
+          $toolCreds.mysterium_api_key = $val
+          Write-Host "Mysterium API key configured"
+        }
+      }
+      if ($OPRefMysteriumIdentity) {
+        $val = (& op read $OPRefMysteriumIdentity 2>$null).Trim()
+        if ($val) { 
+          $toolCreds.mysterium_identity = $val
+          Write-Host "Mysterium identity configured"
+        }
+      }
+    } catch { Write-Warning "Mysterium credentials unavailable: $_" }
+    
+    # Presearch
+    try {
+      if ($OPRefPresearchRegCode) {
+        $val = (& op read $OPRefPresearchRegCode 2>$null).Trim()
+        if ($val) { 
+          $toolCreds.presearch_registration_code = $val
+          Write-Host "Presearch registration code configured"
+        }
+      }
+      if ($OPRefPresearchApiKey) {
+        $val = (& op read $OPRefPresearchApiKey 2>$null).Trim()
+        if ($val) { 
+          $toolCreds.presearch_api_key = $val
+          Write-Host "Presearch API key configured"
+        }
+      }
+    } catch { Write-Warning "Presearch credentials unavailable: $_" }
+    
+    # Diiisco
+    try {
+      if ($OPRefDiiiscoApiKey) {
+        $val = (& op read $OPRefDiiiscoApiKey 2>$null).Trim()
+        if ($val) { 
+          $toolCreds.diiisco_api_key = $val
+          Write-Host "Diiisco API key configured"
+        }
+      }
+      if ($OPRefDiiiscoNodeKey) {
+        $val = (& op read $OPRefDiiiscoNodeKey 2>$null).Trim()
+        if ($val) { 
+          $toolCreds.diiisco_node_key = $val
+          Write-Host "Diiisco node key configured"
+        }
+      }
+    } catch { Write-Warning "Diiisco credentials unavailable: $_" }
+    
+    # Space Acres
+    try {
+      if ($OPRefSpaceAcresFarmerKey) {
+        $val = (& op read $OPRefSpaceAcresFarmerKey 2>$null).Trim()
+        if ($val) { 
+          $toolCreds.spaceacres_farmer_key = $val
+          Write-Host "Space Acres farmer key configured"
+        }
+      }
+      if ($OPRefSpaceAcresRewardAddr) {
+        $val = (& op read $OPRefSpaceAcresRewardAddr 2>$null).Trim()
+        if ($val) { 
+          $toolCreds.spaceacres_reward_address = $val
+          Write-Host "Space Acres reward address configured"
+        }
+      }
+    } catch { Write-Warning "Space Acres credentials unavailable: $_" }
+    
+    # Bright
+    try {
+      if ($OPRefBrightApiToken) {
+        $val = (& op read $OPRefBrightApiToken 2>$null).Trim()
+        if ($val) { 
+          $toolCreds.bright_api_token = $val
+          Write-Host "Bright API token configured"
+        }
+      }
+    } catch { Write-Warning "Bright credentials unavailable: $_" }
+    
+    # Honeygain
+    try {
+      if ($OPRefHoneygainApiKey) {
+        $val = (& op read $OPRefHoneygainApiKey 2>$null).Trim()
+        if ($val) { 
+          $toolCreds.honeygain_api_key = $val
+          Write-Host "Honeygain API key configured"
+        }
+      }
+    } catch { Write-Warning "Honeygain credentials unavailable: $_" }
+    
+    if ($toolCreds.Count -gt 0) {
+      $cfg.tool_credentials = $toolCreds
+    }
   }
   
   $cfg | ConvertTo-Json -Compress | Set-Content -Encoding UTF8 $tmpCfg

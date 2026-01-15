@@ -49,7 +49,7 @@ $findings = @()
 function Record-Finding {
     param([string]$Category, [string]$Finding, [string]$Severity)
     $findings += @{ Category = $Category; Finding = $Finding; Severity = $Severity }
-    Write-Warning "$Severity - $Category: $Finding"
+    Write-Warning "$Severity - ${Category}: $Finding"
 }
 
 #region Test 1: Edge Cases - Invalid Config
