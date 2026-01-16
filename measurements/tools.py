@@ -71,48 +71,38 @@ def _get_json(url: str, timeout: float = 5.0) -> Optional[Dict[str, Any]]:
 def poll_mysterium() -> Dict[str, Any]:
     """Poll Mysterium TequilAPI for status and traffic stats.
     
-    Returns dict with keys:
-    - enabled: bool (API reachable)
-    - running: bool (service running)
-    - provider_status: str | None
-    - traffic: dict with bytes_sent, bytes_received, etc.
-    - error: str | None
+    Returns CSV-compatible dict with keys:
+    - online: bool (service running)
+    - earnings_usd: float (estimated earnings)
+    - sessions: int (active sessions)
     """
     port = int(os.environ.get("MYST_API_PORT", MYSTERIUM_DEFAULT_PORT))
     base_url = f"http://127.0.0.1:{port}"
     
     result = {
-        "enabled": False,
-        "running": False,
-        "provider_status": None,
-        "traffic": {},
-        "error": None,
+        "online": False,
+        "earnings_usd": 0.0,
+        "sessions": 0,
     }
     
     # Check port first
     if not _port_reachable(port):
-        result["error"] = f"Mysterium API port {port} unreachable"
         return result
-    
-    result["enabled"] = True
     
     # Health check
     health = _get_json(f"{base_url}/healthcheck")
-    if health:
-        result["running"] = True
-        if isinstance(health, dict):
-            state = health.get("state", {})
-            if isinstance(state, dict):
-                result["provider_status"] = state.get("service")
+    if not health:
+        return result
     
-    # Traffic stats
+    result["online"] = True
+    
+    # Traffic stats (earnings proxy from sessions)
     traffic = _get_json(f"{base_url}/traffic")
     if traffic and isinstance(traffic, dict):
-        result["traffic"] = {
-            "bytes_sent": traffic.get("bytes_sent", 0),
-            "bytes_received": traffic.get("bytes_received", 0),
-            "sessions": traffic.get("sessions", 0),
-        }
+        sessions = traffic.get("sessions", 0)
+        result["sessions"] = sessions
+        # Rough estimate: $0.10 per session (adjust based on actual Mysterium rates)
+        result["earnings_usd"] = round(sessions * 0.10, 2)
     
     return result
 

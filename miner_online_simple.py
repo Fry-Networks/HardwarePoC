@@ -272,17 +272,30 @@ def _read_service_config() -> Dict[str, Any]:
     try:
         config_dir = os.path.join(data_dir(), "config")
         
-        # Read main miner config
-        miner_config_path = os.path.join(config_dir, "miner_config.json")
-        if os.path.exists(miner_config_path):
-            try:
-                with open(miner_config_path, 'r', encoding='utf-8') as f:
-                    miner_config = json.load(f)
-                    if isinstance(miner_config, dict):
-                        config['miner_config'] = miner_config
-                        log.debug("Loaded miner_config.json")
-            except Exception as e:
-                log.warning("Failed to load miner_config.json: %s", e)
+        # Load encrypted miner_config.enc; required in production
+        decrypted_miner_config = _decrypt_config_file(
+            "miner_config.enc",
+            salt=b"miner_config_salt_v1",
+            password="miner_config_encryption_key_v1",
+        )
+        if isinstance(decrypted_miner_config, dict):
+            miner_config = decrypted_miner_config.get("miner_config")
+            if isinstance(miner_config, dict):
+                config["miner_config"] = miner_config
+            else:
+                config["miner_config"] = {
+                    k: v for k, v in decrypted_miner_config.items()
+                    if k not in ("measurement_intervals",)
+                }
+
+            intervals = decrypted_miner_config.get("measurement_intervals")
+            if isinstance(intervals, dict):
+                config["measurement_intervals"] = intervals
+
+            if "miner_key" in decrypted_miner_config:
+                config.setdefault("miner_key", decrypted_miner_config.get("miner_key"))
+        else:
+            log.warning("Encrypted miner_config.enc missing or failed to decrypt; measurement intervals and miner config unavailable")
         
         # Read tool-specific config files (written by GUI)
         tool_configs = {
@@ -359,20 +372,39 @@ def _reload_service_config() -> None:
         log.error("Failed to reload service configuration: %s", e)
 
 
-def _get_measurement_interval() -> int:
-    """Get measurement interval from config, default to 600 seconds (10 minutes)."""
+def _get_measurement_intervals() -> Dict[str, int]:
+    """Get per-sensor measurement intervals (seconds).
+    
+    Default intervals:
+    - Bandwidth: 10 seconds
+    - Satellite: 10 seconds
+    - Radiation: 10 seconds
+    - Decibel: 2 seconds
+    - AEM: 600 seconds (10 minutes)
+    - Tools: 60 seconds
+    """
+    defaults = {
+        "bandwidth": 10,
+        "satellite": 10,
+        "radiation": 10,
+        "decibel": 2,
+        "aem": 600,
+        "tools": 60,
+    }
+
     try:
         config = _load_service_config()
-        miner_config = config.get('miner_config', {})
-        if isinstance(miner_config, dict):
-            interval = miner_config.get('measurement_interval')
-            if isinstance(interval, (int, float)) and interval > 0:
-                return int(interval)
+        intervals = config.get('measurement_intervals', {})
+        if isinstance(intervals, dict):
+            # Only accept positive numeric overrides; keep defaults otherwise
+            for key, value in intervals.items():
+                if key in defaults and isinstance(value, (int, float)) and value > 0:
+                    defaults[key] = int(value)
     except Exception:
         pass
     
-    # Default: 600 seconds (10 minutes)
-    return 600
+    return defaults
+
 
 
 def _get_enabled_tools() -> List[str]:
@@ -836,42 +868,47 @@ def _config_file_candidates(filename: str) -> List[str]:
             uniq.append(path)
     return uniq
 
-def read_encrypted_miner_config() -> Optional[str]:
-    """Read miner key from encrypted config file if present."""
+def _decrypt_config_file(filename: str, salt: bytes, password: str) -> Optional[Dict[str, Any]]:
+    """Decrypt a JSON config file using fixed PBKDF2/Fernet settings."""
     try:
-        config_data: Optional[dict[str, Any]] = None
-        for config_path in _config_file_candidates("miner_config.enc"):
-            if not os.path.exists(config_path):
+        encrypted: Optional[dict[str, Any]] = None
+        for path in _config_file_candidates(filename):
+            if not os.path.exists(path):
                 continue
-            with open(config_path, 'r') as f:
-                encrypted_data = json.load(f)
-            config_data = encrypted_data
+            with open(path, "r", encoding="utf-8") as f:
+                encrypted = json.load(f)
             break
-        if not isinstance(config_data, dict):
+        if not isinstance(encrypted, dict) or 'data' not in encrypted:
             return None
-        # Decrypt using the same method as the API config
-        # We'll use a simple key derivation for the miner config
+
         from cryptography.fernet import Fernet
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
         import base64
-        # Use a fixed salt for miner config (this is acceptable since it's just obfuscation)
-        salt = b'miner_config_salt_v1'
+
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,
             iterations=100000,
         )
-        # Derive key from a known string (this is obfuscation, not true security)
-        password = "miner_config_encryption_key_v1".encode()
-        key = base64.urlsafe_b64encode(kdf.derive(password))
-        # Decrypt
-        f = Fernet(key)
-        decrypted_data = f.decrypt(config_data['data'].encode())
-        config_data = json.loads(decrypted_data)
-        miner_key = config_data.get('miner_key') if isinstance(config_data, dict) else None
-        return miner_key
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+        decrypted = Fernet(key).decrypt(encrypted['data'].encode())
+        return json.loads(decrypted)
+    except Exception:
+        return None
+
+def read_encrypted_miner_config() -> Optional[str]:
+    """Read miner key from encrypted config file if present."""
+    try:
+        config_data = _decrypt_config_file(
+            "miner_config.enc",
+            salt=b"miner_config_salt_v1",
+            password="miner_config_encryption_key_v1",
+        )
+        if isinstance(config_data, dict):
+            return config_data.get("miner_key")
+        return None
     except Exception:
         return None
 
@@ -1647,6 +1684,7 @@ def write_status(
     poi_data: Optional[bool] = None,
     hex_registered: Optional[str] = None,
     pol_override: Optional[Dict[str, Any]] = None,
+    pod_status: Optional[bool] = None,
 ) -> None:
     # --- time / slot basics ---
     day = day_iso(ts)  # "YYYY-MM-DD"
@@ -1884,27 +1922,32 @@ def write_status(
     if poc_slot_ok is None:
         poc_slot_ok = (status == "online")
 
-    # --- slot-level PoD from local cache ---
-    pod_slot_ok: Optional[bool] = None
-    try:
-        pod_hours_local_raw = local_doc.get("podHours")
-        pod_hours_local: dict[str, Any] = pod_hours_local_raw if isinstance(pod_hours_local_raw, dict) else {}
+    # --- slot-level PoD: use provided value or fall back to cache ---
+    pod_slot_ok: Optional[bool] = pod_status
+    
+    # If not provided, try local cache
+    if pod_slot_ok is None:
+        try:
+            pod_hours_local_raw = local_doc.get("podHours")
+            pod_hours_local: dict[str, Any] = pod_hours_local_raw if isinstance(pod_hours_local_raw, dict) else {}
 
-        pod_entry_raw = pod_hours_local.get(str(hour))
-        pod_entry: dict[str, Any] = pod_entry_raw if isinstance(pod_entry_raw, dict) else {}
+            pod_entry_raw = pod_hours_local.get(str(hour))
+            pod_entry: dict[str, Any] = pod_entry_raw if isinstance(pod_entry_raw, dict) else {}
 
-        pod_slots_list_raw = pod_entry.get("slots")
-        pod_slots_list: list[Any] = pod_slots_list_raw if isinstance(pod_slots_list_raw, list) else []
+            pod_slots_list_raw = pod_entry.get("slots")
+            pod_slots_list: list[Any] = pod_slots_list_raw if isinstance(pod_slots_list_raw, list) else []
 
-        if slot < len(pod_slots_list):
-            pod_slot_ok = bool(pod_slots_list[slot])
-    except Exception:
-        pod_slot_ok = None
+            if slot < len(pod_slots_list):
+                pod_slot_ok = bool(pod_slots_list[slot])
+        except Exception:
+            pod_slot_ok = None
 
+    # Fall back to weekly cache
     if pod_slot_ok is None and isinstance(weekly_slot_entry, dict):
         gates = _safe_dict(weekly_slot_entry.get("gates"))
         pod_slot_ok = bool(gates.get("data")) if gates else None
 
+    # Final fallback
     if pod_slot_ok is None:
         pod_slot_ok = False
 
@@ -1949,7 +1992,7 @@ def write_status(
     # --- unified slot snapshot for the graph ---
     slot_obj: dict[str, Any] = {
         "gates": {
-            "data": True,
+            "data": bool(pod_slot_ok),
             "online": (status == "online"),
             "mac_match": mac_match,
             "pol": bool(pol_status),
@@ -4192,17 +4235,19 @@ def _ops_queue_daemon_loop() -> None:
 _measurement_daemon_running = False
 
 def _collect_and_write_measurements() -> None:
-    """Collect current measurements and write to measurements/ directory.
+    """Autonomous measurement collection scheduler.
     
-    This function autonomously collects hardware stats, PoC status, and measurements,
-    then writes them to the measurements/ directory.
-    The GUI reads these files for display.
+    Runs on configured intervals per sensor type.
+    Collects and writes measurements to daily CSV files in measurements/ directory.
     
-    Note: PoD (Proof of Data) status is determined by upload_measurements_for_slot()
-    in the main loop based on actual measurement delivery to the API.
+    Collection intervals:
+    - Bandwidth (BM): 2-10 seconds (+ 10 min for real tests)
+    - Satellite (ISM/OSM): 10 seconds
+    - Radiation (IRM): 10 seconds
+    - Decibel (IDM/ODM): 2 seconds
+    - Tools (Mysterium, etc.): 60 seconds
     """
     try:
-        # Use the autonomous measurement collector
         from measurements.collector import write_latest_measurements
         
         # Collect and write measurements for this miner type
@@ -4346,27 +4391,91 @@ def _collect_honeygain_stats(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _measurement_collection_loop() -> None:
-    """Background daemon loop for periodic measurement collection."""
+    """Background daemon loop for per-sensor measurement collection.
+    
+    Bandwidth mode:
+    - Live polling: Every 1 second (reads system stats for UI display)
+    - Real measurement: Every 600 seconds/10 min (actual 10MB DL + 5MB UL test)
+    
+    Other sensors:
+    - Satellite: 10 sec (ISM/OSM miners)
+    - Radiation: 10 sec (IRM miners)
+    - Decibel: 2 sec (IDM/ODM miners)
+    - Tools: 60 sec (Mysterium, Honeygain, etc.)
+    """
     global _measurement_daemon_running
     _measurement_daemon_running = True
     
     log_step("measurement_daemon_started", {"timestamp": now_utc().isoformat()})
     
+    # Track last collection time per sensor
+    from measurements.collector import (
+        collect_and_write_bandwidth_live,
+        collect_and_write_bandwidth,
+        collect_and_write_satellite,
+        collect_and_write_radiation,
+        collect_and_write_decibel,
+        collect_and_write_aem,
+        collect_and_write_tool_stats,
+    )
+    
+    last_collection = {
+        "bandwidth_live": 0.0,      # Every 2 seconds
+        "bandwidth": 0.0,            # Every 600 seconds (10 minutes)
+        "satellite": 0.0,
+        "radiation": 0.0,
+        "decibel": 0.0,
+        "aem": 0.0,
+        "tools": 0.0,
+    }
+    
+    intervals = _get_measurement_intervals()
+    
     while _measurement_daemon_running:
         try:
-            # Get measurement interval from config
-            interval = _get_measurement_interval()
+            now = time.time()
             
-            # Collect and write measurements
-            _collect_and_write_measurements()
+            # Determine which sensors to collect based on miner type
+            collectors = {}
             
-            # Sleep until next interval
-            time.sleep(interval)
+            if MINER_CODE == "BM":
+                # BM: Live polling every 1 sec + real measurement every 600 sec
+                collectors["bandwidth_live"] = (collect_and_write_bandwidth_live, 1)
+                collectors["bandwidth"] = (collect_and_write_bandwidth, 600)
+                collectors["tools"] = (collect_and_write_tool_stats, intervals["tools"])
+            
+            elif MINER_CODE in ("ISM", "OSM"):
+                collectors["satellite"] = (collect_and_write_satellite, intervals["satellite"])
+            
+            elif MINER_CODE == "IRM":
+                collectors["radiation"] = (collect_and_write_radiation, intervals["radiation"])
+            
+            elif MINER_CODE in ("IDM", "ODM"):
+                collectors["decibel"] = (collect_and_write_decibel, intervals["decibel"])
+            
+            elif MINER_CODE == "AEM":
+                collectors["aem"] = (collect_and_write_aem, intervals["aem"])
+            
+            # Run due collectors
+            for sensor_type, (collector_fn, interval) in collectors.items():
+                # Initialize tracking for this sensor if not present
+                if sensor_type not in last_collection:
+                    last_collection[sensor_type] = now
+                
+                if now - last_collection[sensor_type] >= interval:
+                    try:
+                        collector_fn(MINER_CODE)
+                        last_collection[sensor_type] = now
+                    except Exception as e:
+                        log.warning("Collection failed for %s: %s", sensor_type, e)
+            
+            # Sleep briefly and check again
+            time.sleep(1)
             
         except Exception as e:
             log.exception("Measurement daemon loop error: %s", e)
             log_step("measurement_daemon_loop_error", {"error": str(e)})
-            time.sleep(60)  # Backoff on error
+            time.sleep(5)  # Backoff on error
 
 
 def _start_measurement_daemon() -> None:
@@ -4383,10 +4492,11 @@ def _start_measurement_daemon() -> None:
         )
         daemon_thread.start()
         
-        log.info("Measurement collection daemon started | interval=%s seconds", _get_measurement_interval())
+        intervals = _get_measurement_intervals()
+        log.info("Measurement collection daemon started | intervals=%s", intervals)
         log_step("measurement_daemon_start", {
-            "interval": _get_measurement_interval(),
-            "enabled_pocs": _get_enabled_tools()
+            "intervals": intervals,
+            "miner_code": MINER_CODE
         })
     except Exception as e:
         log.error("Failed to start measurement daemon: %s", e)
@@ -4999,6 +5109,7 @@ def main() -> None:
                     poi_data=poi_data,
                     hex_registered=pol_hex_registered,
                     pol_override=pending_pol_update,
+                    pod_status=pod_slot_ok,
                 )
                 pending_pol_update = None
 

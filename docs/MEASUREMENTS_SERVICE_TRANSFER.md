@@ -7,39 +7,59 @@ This document lists the Python scripts that need to be transferred to the autono
 ## Overview
 
 **Current State:**  
-- The GUI Worker (worker.py) collects sensor data and emits measurements via Qt signals
-- The service should autonomously read service-written measurements from `ProgramData/measurements/latest.json`
-- Measurement collection responsibility transitioning from GUI to service
+- Service collection modules added (`measurement_sources.py`, `measurement_service.py`, `service_csv_writer.py`)
+- Target architecture active: service writes CSV logs; GUI polls CSV (worker removed)
+- LiveData panels now run on CSV polling timers; Data History reads service CSVs
 
 **Goal:**  
-Transfer measurement collection logic to the autonomous service so it operates independently of the GUI.
+Transfer ALL measurement collection and persistence to the autonomous service. GUI becomes pure display + configuration.
 
-**GUI Responsibilities (KEPT):**
-- LiveData UI panels (bandwidth, AEM POI, satellite, decibel, radiation graphs)
-- Config tools (decibel device selector, serial port selector, radiation device selector)
-- PoC application UI panels (Mysterium, Bright, Honeygain, Presearch, Space Acres, Diiisco config/status)
-- Reading and displaying measurements from service-written `measurements/latest.json`
+**GUI Responsibilities (DISPLAY + CONFIG ONLY):**
+- ✅ **LiveData UI panels** (bandwidth, AEM POI, satellite, decibel, radiation graphs)
+- ✅ **Config tools** (device selectors, port selectors, baud rate, tools settings)
+- ✅ **Tools UI panels** (Mysterium, Bright, Honeygain, etc. config/control)
+- ✅ **Poll service-written CSV files** (read last line every 2-10 seconds for live display)
+- ✅ **Data History tab** (reads full CSV logs for historical charts)
+- ✅ **"Open CSV" button** (opens service-written CSV files)
+- ❌ **NO data collection** (no worker thread)
+- ❌ **NO measurement writing** (service handles all I/O)
 
-**Service Responsibilities (TRANSFERRED):**
-- Autonomous collection of measurement data from all sensors and APIs
-- Writing plaintext measurements to `measurements/latest.json`
-- Scheduled polling (10-minute intervals for periodic tasks)
-- Serial port communication (GPS, Geiger)
-- API calls to PoC applications
+**Service Responsibilities (AUTONOMOUS COLLECTION + PERSISTENCE):**
+- ✅ **Collect all sensor data** every 2-10 seconds (high-frequency for UI responsiveness)
+- ✅ **Write daily CSV logs** (append-only, one file per sensor per day):
+  - `logs/bm_YYYYMMDD.csv` (dl, ul every 2-10 sec)
+  - `logs/satellite_YYYYMMDD.csv` (sats, fix, lat, lon, hdop every 10 sec)
+  - `logs/radiation_YYYYMMDD.csv` (cpm, usv every 10 sec)
+  - `logs/decibel_YYYYMMDD.csv` (dbfs every 2 sec)
+  - `logs/aem_YYYYMMDD.csv` (poi events)
+- ✅ **Send measurements to backend every 10 minutes with real bandwidth tests once by 10 minutes** (same behavior vs actual)
+- ✅ **NO encryption**
+- ✅ **Serial port communication** (GPS, Geiger)
+- ✅ **API calls to tools** (Mysterium, Honeygain, etc.)
+- ✅ **Runs independently** (survives GUI crash/restart)
 
 ---
 
-## Core Service Measurement Modules
+## Core Infrastructure Modules
 
-### 1. **Service Infrastructure** (All Miner Types)
-These files handle service communication, configuration, and measurement I/O:
+### 1. **GUI Utilities** (Display Only)
+These files help GUI read service data and manage configuration:
 
-| Module | Path | Purpose |
-|--------|------|---------|
-| `measurement_reader.py` | `miner_GUI/utils/measurement_reader.py` | Read plaintext measurements written by service from `measurements/latest.json` |
-| `data.py` | `miner_GUI/utils/data.py` | Utility functions for data directory resolution, config reading |
-| `encryption.py` | `miner_GUI/utils/encryption.py` | Key derivation and encryption utilities for measurement encryption |
-| `ops_queue_client.py` | `miner_GUI/utils/ops_queue_client.py` | IPC communication with service via ops_queue (write_measurement operation) |
+| Module | Path | Purpose | Fate |
+|--------|------|---------|------|
+| `csv_reader.py` | `miner_GUI/utils/csv_reader.py` | **NEW** - Read last line from service CSV files for live display | ✅ Added |
+| `device_config.py` | `miner_GUI/utils/device_config.py` | Manage device selections (ports, audio, etc.) | ✅ Keep |
+| `data.py` | `miner_GUI/utils/data.py` | Data directory resolution, logging | ✅ Keep |
+| `ops_queue_client.py` | `miner_GUI/utils/ops_queue_client.py` | IPC with service (config writes only) | ✅ Keep |
+| ~~`measurement_reader.py`~~ | ~~`miner_GUI/utils/measurement_reader.py`~~ | ~~Read measurements/latest.json~~ | ❌ Remove (CSV replaces it) |
+| ~~`encryption.py`~~ | ~~`miner_GUI/utils/encryption.py`~~ | ~~Encryption for measurements~~ | ❌ Remove (service sends to backend directly) |
+
+### 1b. **Service Modules (New)**
+| Module | Path | Purpose | Status |
+|--------|------|---------|--------|
+| `service_csv_writer.py` | `miner_GUI/services/service_csv_writer.py` | Append-only CSV writer for service logs | ✅ Added |
+| `measurement_sources.py` | `miner_GUI/services/measurement_sources.py` | Qt-free sensor sampling helpers | ✅ Added |
+| `measurement_service.py` | `miner_GUI/services/measurement_service.py` | Sensor loops + CSV logging + backend hook | ✅ Added |
 
 ---
 
@@ -53,7 +73,7 @@ Collects network bandwidth measurements (download/upload speeds):
 | Component | Module | Path | Fate | Purpose |
 |-----------|--------|------|------|---------|
 | **UI Panel** | `bandwidth.py` | `miner_GUI/LiveData/bandwidth.py` | **KEEP in GUI** | Display DL/UL progress bars |
-| **Collection Logic** | `worker.py` methods | `miner_GUI/services/worker.py` | **TRANSFER to Service** | `_sample_bandwidth()` and `_real_bandwidth_test()` |
+| **Collection Logic** | `measurement_service.py` + `measurement_sources.py` | `miner_GUI/services` | **TRANSFERRED to Service** | Bandwidth sampler + real test |
 
 **Measurement Fields:**
 ```json
@@ -76,7 +96,7 @@ Collects Proof of Installation (PoI) status from daily status JSON:
 | Component | Module | Path | Fate | Purpose |
 |-----------|--------|------|------|---------|
 | **UI Panel** | `aem.py` | `miner_GUI/LiveData/aem.py` | **KEEP in GUI** | Display AEM/PoI status |
-| **Collection Logic** | `worker.py` method | `miner_GUI/services/worker.py` (lines 168-201) | **TRANSFER to Service** | `_sample_aem()` reads PoI from status JSON |
+| **Collection Logic** | `measurement_service.py` + `measurement_sources.py` | `miner_GUI/services` | **TRANSFERRED to Service** | PoI sampler from status JSON |
 
 **Measurement Fields:**
 ```json
@@ -98,7 +118,7 @@ Collects GPS/GNSS satellite data from serial port:
 |-----------|--------|------|------|---------|
 | **UI Panel** | `satellite.py` | `miner_GUI/LiveData/satellite.py` | **KEEP in GUI** | Display satellite count and GPS fix |
 | **Config Tool** | Port selector in UI | `miner_GUI/ui/main_window.py` | **KEEP in GUI** | User selects GPS serial port |
-| **Collection Logic** | `worker.py` method | `miner_GUI/services/worker.py` (lines 91-92, 337-391) | **TRANSFER to Service** | `_sample_gnss()` parses NMEA from serial port |
+| **Collection Logic** | `measurement_service.py` + `measurement_sources.py` | `miner_GUI/services` | **TRANSFERRED to Service** | GNSS sampler parses NMEA serial |
 
 **Measurement Fields:**
 ```json
@@ -125,7 +145,7 @@ Collects radiation measurements from serial port:
 |-----------|--------|------|------|---------|
 | **UI Panel** | `geiger.py` | `miner_GUI/LiveData/geiger.py` | **KEEP in GUI** | Display CPM and dose rate bar graphs |
 | **Config Tool** | Device selector in UI | `miner_GUI/ui/main_window.py` | **KEEP in GUI** | User selects Geiger serial port and baud rate |
-| **Collection Logic** | `worker.py` method | `miner_GUI/services/worker.py` (lines 93-94, 392-435) | **TRANSFER to Service** | `_sample_geiger()` reads Geiger counter from serial port |
+| **Collection Logic** | `measurement_service.py` + `measurement_sources.py` | `miner_GUI/services` | **TRANSFERRED to Service** | Geiger sampler reads serial |
 
 **Measurement Fields:**
 ```json
@@ -151,7 +171,7 @@ Collects audio level measurements from sound device:
 |-----------|--------|------|------|---------|
 | **UI Panel** | `decibel.py` | `miner_GUI/LiveData/decibel.py` | **KEEP in GUI** | Display audio level dBFS bar graph |
 | **Config Tool** | Audio device selector | `miner_GUI/ui/main_window.py` | **KEEP in GUI** | User selects audio input device |
-| **Collection Logic** | `worker.py` methods | `miner_GUI/services/worker.py` (lines 75-86, 436-495) | **TRANSFER to Service** | `_sample_decibel()` and `_run_decibel_stream()` sample audio |
+| **Collection Logic** | `measurement_service.py` + `measurement_sources.py` | `miner_GUI/services` | **TRANSFERRED to Service** | Decibel sampler (audio) |
 
 **Measurement Fields:**
 ```json
@@ -166,9 +186,9 @@ Collects audio level measurements from sound device:
 
 ---
 
-## PoC Application Controllers (Mining Apps)
+## Tool Controllers (Mining Apps)
 
-These handle specific mining application services and need measurement emission capability:
+These handle specific mining tool services and need measurement emission capability:
 
 **Note:** UI panels and config tools remain in GUI. Only the collection/polling logic transfers to service.
 
@@ -241,7 +261,6 @@ Collects earnings and status from Diiisco:
 ## Core Infrastructure & Configuration
 
 ### Keep in GUI:
-- `measurement_reader.py` - **READ** measurements from service-written `latest.json`
 - All UI panels and widgets (`LiveData/`, `ui/widgets/`)
 - All UI integration helpers (`ui/helpers/integrations/`)
 - Config tools and UI elements
@@ -249,74 +268,130 @@ Collects earnings and status from Diiisco:
 - `status_week.py` - Display weekly status aggregation
 
 ### Transfer to Service:
-- `encryption.py` - Service-side encryption for historical measurements
+- `encryption.py` - Removed from GUI; service sends directly without GUI encryption
 - `ops_queue_client.py` - Service uses this for IPC responses
-- Measurement collection logic from `worker.py` methods
+- Measurement collection logic formerly in `worker.py` now housed in `measurement_sources.py`/`measurement_service.py` (legacy worker removed)
 - Polling logic from service controllers (mysterium.py, honeygain.py, etc.)
 
----
+## Service Collection & Output by Type
 
-## Measurement Collection Summary by Type
-
-| Miner Type | Collection Method | Interval | Source Module |
-|------------|-------------------|----------|----------------|
-| **BM** | Real bandwidth test (DL/UL Mbps) | 10 minutes | `worker.py` |
-| **AEM** | Read PoI from status JSON | On-demand | `worker.py` |
-| **Satellite** | NMEA parsing from GPS serial | Continuous | `worker.py` |
-| **Radiation** | Geiger counter serial reads | Continuous | `worker.py` |
-| **Decibel** | Audio device sampling (dBFS) | Continuous | `worker.py` |
-| **Mysterium** | TequilAPI polling | Periodic | `mysterium.py` |
-| **Honeygain** | Honeygain API polling | Periodic | `honeygain.py` |
-| **Bright** | Bright API polling | Periodic | `bright.py` |
-| **Presearch** | Presearch node API polling | Periodic | `presearch.py` |
-| **SpaceAcres** | Space Acres API polling | Periodic | `space_acres.py` |
-| **Diiisco** | Diiisco API polling | Periodic | `diiisco.py` |
+| Sensor Type | Collection Method | Frequency | CSV Output | GUI Polling |
+|------------|-------------------|-----------|------------|-------------|
+| **BM** | Network adapter stats + real tests | Every 2-10 sec + 10 min for real tests | `logs/bm_YYYYMMDD.csv` | Read last line |
+| **Satellite** | NMEA parsing from GPS serial | Every 10 sec | `logs/satellite_YYYYMMDD.csv` | Read last line |
+| **Radiation** | Geiger counter serial reads | Every 10 sec | `logs/radiation_YYYYMMDD.csv` | Read last line |
+| **Decibel** | Audio device sampling (dBFS) | Every 2 sec | `logs/decibel_YYYYMMDD.csv` | Read last line |
+| **AEM** | Read PoI from service status | Every 10 min | `logs/aem_YYYYMMDD.csv` | Read last line |
+| **Mysterium** | TequilAPI polling | Every 60 sec | `logs/mysterium_YYYYMMDD.csv` | Read last line |
+| **Honeygain** | Honeygain API polling | Every 60 sec | `logs/honeygain_YYYYMMDD.csv` | Read last line |
+| **Bright** | Bright API polling | Every 60 sec | `logs/bright_YYYYMMDD.csv` | Read last line |
+| **Presearch** | Presearch API polling | Every 60 sec | `logs/presearch_YYYYMMDD.csv` | Read last line |
+| **SpaceAcres** | Space Acres API polling | Every 60 sec | `logs/spaceacres_YYYYMMDD.csv` | Read last line |
+| **Diiisco** | Diiisco API polling | Every 60 sec | `logs/diiisco_YYYYMMDD.csv` | Read last line |
 
 ---
 
 ## Implementation Notes
 
-### Key Responsibilities for Service:
-1. **Run scheduled collection task** for each miner type
-2. **Write plaintext JSON** to `ProgramData/measurements/latest.json` after each collection cycle
-3. **Maintain encryption** for historical measurements if needed
-4. **Poll APIs** for PoC applications (Mysterium, Honeygain, etc.)
-5. **Read serial ports** for hardware sensors (GPS, Geiger, audio)
-6. **Calculate measurements** and aggregate into standard format
-7. **Handle failures gracefully** - missing sensors, unreachable APIs, etc.
+### Key Responsibilities for Service
+- ✅ Run high-frequency collection (every 2-10 seconds for UI responsiveness)
+- ✅ Write append-only CSV to `logs/{sensor}_YYYYMMDD.csv` after each collection
+- ✅ Send to backend once every 10 minutes (same as actual behavior)
+- ✅ Poll APIs for tools (Mysterium, Honeygain, etc.)
+- ✅ Read serial ports for hardware sensors (GPS, Geiger)
+- ✅ Sample audio devices for decibel measurements
+- ✅ Handle failures gracefully (missing sensors, unreachable APIs, etc.)
+- ✅ Rotate daily (new CSV file each day)
 
 ### File Output Locations:
-- **Plaintext Current:** `%PROGRAMDATA%\FryNetworks\miner-{CODE}\measurements\latest.json`
-- **Encrypted Historical:** `%PROGRAMDATA%\FryNetworks\miner-{CODE}\measurements\measurements_*.enc`
-- **Daily CSV Logs:** `%APPDATA%\FryNetworks\miner-{CODE}\logs\{device}_realtest_YYYYMMDD.csv`
+- **Daily CSV Logs (Service writes, GUI reads):**
+  - `%PROGRAMDATA%\FryNetworks\miner-{CODE}\logs\bm_YYYYMMDD.csv`
+  - `%PROGRAMDATA%\FryNetworks\miner-{CODE}\logs\satellite_YYYYMMDD.csv`
+  - `%PROGRAMDATA%\FryNetworks\miner-{CODE}\logs\radiation_YYYYMMDD.csv`
+  - `%PROGRAMDATA%\FryNetworks\miner-{CODE}\logs\decibel_YYYYMMDD.csv`
+  - `%PROGRAMDATA%\FryNetworks\miner-{CODE}\logs\aem_YYYYMMDD.csv`
+  - `%PROGRAMDATA%\FryNetworks\miner-{CODE}\logs\{poc_app}_YYYYMMDD.csv`
 
 ### Service -> GUI Communication:
-- GUI reads `measurements/latest.json` via `read_latest_measurements()` from `measurement_reader.py`
-- Service uses `ops_queue` for config changes via `write_config` operation
-- No GUI -> Service measurement writes; service is autonomous
+- ✅ GUI polls CSV files (reads last line) every 2-10 seconds for live display
+- ✅ GUI reads full CSV for Data History tab
+- ✅ Service uses `ops_queue` for receiving config changes from GUI
+- ❌ No JSON files (CSV serves both live + history)
+- ❌ No encryption 
 
----
+### Dependencies to Transfer
+- `sounddevice` - audio sampling (Decibel)
+- `serial` (pyserial) - GPS and Geiger serial ports
+- `psutil` - bandwidth sampling
+- `requests` - HTTP API calls to tools applications
+- `cryptography` - only if encryption is retained elsewhere (not used in CSV path)
 
-## Dependencies to Transfer
+## Next Steps - Service Implementation
 
-### Python Packages:
-- `PySide6` (Qt framework) - for UI panels, may not be needed in headless service
-- `sounddevice` - for audio sampling (Decibel)
-- `serial` (pyserial) - for GPS and Geiger serial port communication
-- `cryptography` - for encryption key derivation and measurement encryption
-- `requests` - for HTTP API calls to PoC applications
+### Phase 1: Extract Collection Logic (No Qt Dependencies)
+1. ✅ Move sensor samplers into `measurement_sources.py` (no Qt)
+2. ✅ Retire legacy `worker.py` after GUI polling cutover (file deleted)
 
-### Environment:
-- Windows: NSSM or Task Scheduler for background service
-- Configuration: `miner_config.json`, service access to ProgramData directories
+### Phase 2: Service CSV Writer
+1. ✅ Add `service_csv_writer.py` (append-only daily CSV)
+2. ✅ Date-based rotation via file naming
 
----
+### Phase 3: Service Collection Loop
+1. ✅ Add `measurement_service.py` (threads + stop event)
+2. ✅ Append to CSV after each collection
+3. ✅ Backend sender hook (same as actual behavior)
+4. 🔄 Reload device config when files change (currently read once)
 
-## Next Steps
+### Phase 4: GUI Updates (Display-Only)
+1. ✅ `csv_reader.py` for last-line polling
+2. ✅ Replace worker thread with CSV polling in LiveData panels
+3. ✅ Remove `worker.py` (legacy thread deleted)
+4. ✅ Update Data History to reuse `csv_reader.read_full_csv()`
+5. ✅ Remove `measurement_reader.py` (JSON) after cutover
+6. ✅ Remove `encryption.py` from GUI (file deleted; service handles backend directly)
 
-1. **Extract collection methods** from `worker.py` into service-compatible modules (no Qt dependencies)
-2. **Implement service measurement collection loop** - run every 10 minutes
-3. **Extract API polling logic** from Mysterium, Honeygain, Bright, Presearch, Space Acres, Diiisco
+### Phase 5: Testing
+1. ✅ Testing guide created: [PHASE_5_TESTING_GUIDE.md](PHASE_5_TESTING_GUIDE.md)
+2. ✅ **Level 1: Sanity Checks COMPLETE**
+   - ✅ Module compilation verified
+   - ✅ CSV reader type mismatch fixed (`Union[str, Path]`)
+   - ✅ services/__init__.py cleaned (worker import removed)
+   - ✅ Mock CSV data created (BM, Satellite)
+   - Tests: `test_imports_level1.py`, `test_csv_reader_level1.py`
+3. ✅ **Level 2: GUI Module Imports COMPLETE**
+   - ✅ measurement_display helpers import
+   - ✅ DataHistoryWidget UI component imports
+   - ✅ LiveData panel components (BandwidthPanel, SatellitePanel, etc.) import
+   - ✅ PySide not instantiated (unit test safe)
+   - Test: `test_gui_imports_level2.py`
+4. ✅ **Level 3: LiveData Polling COMPLETE**
+   - ✅ CSV polling without GUI event loop works
+   - ✅ Data type conversions for display
+   - ✅ Multi-sensor polling functional
+   - ✅ Callback pattern ready for GUI integration
+   - Test: `test_livedata_polling_level3.py`
+5. ✅ **Level 4: Data History CSV Loading COMPLETE**
+   - ✅ Full CSV data loads for charting
+   - ✅ Timestamp parsing and ordering verified
+   - ✅ Chart data format ready (min/max/count)
+   - ✅ Date filtering capability verified
+   - ✅ Data integrity confirmed (no missing fields)
+   - Test: `test_datahistory_level4.py`
+6. ✅ **Level 5: GUI Integration Tests (Next)**
+   - ✅ Start actual GUI with mock CSV data
+   - 🔄 Verify LiveData displays current values
+   - ✅ Verify Data History shows chart
+   - ✅ Test date navigation and filtering
+7. ⬜ **Level 6-7: Resilience & Performance (Optional)**
+   - [ ] Crash recovery scenarios
+   - [ ] Large dataset handling
+   - [ ] Concurrent polling
+
+### Phase 6: Deployment
+1. ⬜ Package service (NSSM/Task Scheduler) using new modules
+2. ⬜ GUI runs on-demand (display only)
+3. ⬜ Backend receives real-time measurements from service
+4. ⬜ Add monitoring/log shipping for service errors
 4. **Create service measurement writer** - emit `measurements/latest.json` after each collection
 5. **Port serial communication** (GPS, Geiger) to service context (no Qt)
 6. **Port audio sampling** (Decibel) to service context (sounddevice without Qt)
