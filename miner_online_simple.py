@@ -1107,6 +1107,35 @@ def upload_measurements_for_slot(
     if not hex_registered:
         _record_critical_failure(f"pod-no-hex-{miner_key}", f"Skipping measurement upload; no registered hexId for {miner_key}", miner_key=miner_key)
         return (False if pod_required else True), delivered_groups
+    # First, check local pod_status.json entries (written by collectors after successful upload)
+    try:
+        pod_status_path = os.path.join(data_dir(), "status", "pod_status.json")
+        if os.path.exists(pod_status_path):
+            try:
+                with open(pod_status_path, "r", encoding="utf-8") as f:
+                    pod_data = json.load(f)
+                entries: List[Any] = []
+                if isinstance(pod_data, dict) and isinstance(pod_data.get("measurements"), list):
+                    entries = pod_data.get("measurements") or []
+                elif isinstance(pod_data, list):
+                    entries = pod_data
+                for e in entries:
+                    try:
+                        ets = e.get("timestamp")
+                        mtype = e.get("type") or e.get("measurement_type")
+                        mts = _parse_measurement_timestamp(ets)
+                        if mts and mtype:
+                            in_slot = (slot_start <= mts < slot_end)
+                            norm = _normalize_measurement_group(mtype)
+                            if in_slot and norm and norm in expected_set and norm not in delivered_groups:
+                                delivered_groups.append(norm)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     try:
         measurement_data_list = read_measurement_files()
     except Exception:
@@ -2300,16 +2329,20 @@ def detect_local_mac() -> str:
     Returns colon-separated upper-case MAC or empty string.
     """
     try:
-        import psutil
-        addrs = psutil.net_if_addrs()
-        for ifname, lst in addrs.items():
-            for addr in lst:
-                mac = getattr(addr, "address", None) or ""
-                if not isinstance(mac, str) or not mac:
-                    continue
-                norm = re.sub(r"[^0-9A-Fa-f]", "", mac)
-                if len(norm) == 12 and norm != "000000000000":
-                    return ":".join(norm[i:i+2].upper() for i in range(0, 12, 2))
+        try:
+            import psutil  # type: ignore[import-not-found]
+        except Exception:
+            psutil = None
+        if psutil:
+            addrs = psutil.net_if_addrs()
+            for ifname, lst in addrs.items():
+                for addr in lst:
+                    mac = getattr(addr, "address", None) or ""
+                    if not isinstance(mac, str) or not mac:
+                        continue
+                    norm = re.sub(r"[^0-9A-Fa-f]", "", mac)
+                    if len(norm) == 12 and norm != "000000000000":
+                        return ":".join(norm[i:i+2].upper() for i in range(0, 12, 2))
     except Exception:
         pass
     try:
@@ -4268,28 +4301,39 @@ def _collect_hardware_stats() -> Dict[str, Any]:
     stats = {}
     
     try:
-        import psutil
+        try:
+            import psutil  # type: ignore[import-not-found]
+        except Exception:
+            psutil = None
+
+        if psutil:
+            try:
+                # CPU
+                stats["cpu_percent"] = psutil.cpu_percent(interval=1)
+                stats["cpu_count"] = psutil.cpu_count()
+
+                # Memory
+                mem = psutil.virtual_memory()
+                stats["memory_percent"] = mem.percent
+                stats["memory_total_gb"] = round(mem.total / (1024**3), 2)
+                stats["memory_used_gb"] = round(mem.used / (1024**3), 2)
+            except Exception:
+                pass
         
-        # CPU
-        stats["cpu_percent"] = psutil.cpu_percent(interval=1)
-        stats["cpu_count"] = psutil.cpu_count()
-        
-        # Memory
-        mem = psutil.virtual_memory()
-        stats["memory_percent"] = mem.percent
-        stats["memory_total_gb"] = round(mem.total / (1024**3), 2)
-        stats["memory_used_gb"] = round(mem.used / (1024**3), 2)
-        
-        # Disk
-        disk = psutil.disk_usage('/')
-        stats["disk_percent"] = disk.percent
-        stats["disk_total_gb"] = round(disk.total / (1024**3), 2)
-        stats["disk_used_gb"] = round(disk.used / (1024**3), 2)
-        
-        # Network (basic check)
-        net_io = psutil.net_io_counters()
-        stats["network_bytes_sent"] = net_io.bytes_sent
-        stats["network_bytes_recv"] = net_io.bytes_recv
+        # Disk and Network (guarded if psutil available)
+        try:
+            if psutil:
+                disk = psutil.disk_usage('/')
+                stats["disk_percent"] = disk.percent
+                stats["disk_total_gb"] = round(disk.total / (1024**3), 2)
+                stats["disk_used_gb"] = round(disk.used / (1024**3), 2)
+                
+                # Network (basic check)
+                net_io = psutil.net_io_counters()
+                stats["network_bytes_sent"] = net_io.bytes_sent
+                stats["network_bytes_recv"] = net_io.bytes_recv
+        except Exception:
+            pass
         
     except Exception as e:
         log.warning("psutil not available or error collecting stats: %s", e)
@@ -4394,8 +4438,8 @@ def _measurement_collection_loop() -> None:
     """Background daemon loop for per-sensor measurement collection.
     
     Bandwidth mode:
-    - Live polling: Every 1 second (reads system stats for UI display)
-    - Real measurement: Every 600 seconds/10 min (actual 10MB DL + 5MB UL test)
+    - Live polling: Every 10 seconds (reads system stats for UI display; CSV for GUI)
+    - Real measurement: Every 600 seconds/10 min (actual 10MB DL + 5MB UL test; backend upload & PoD)    
     
     Other sensors:
     - Satellite: 10 sec (ISM/OSM miners)
@@ -4409,52 +4453,68 @@ def _measurement_collection_loop() -> None:
     log_step("measurement_daemon_started", {"timestamp": now_utc().isoformat()})
     
     # Track last collection time per sensor
-    from measurements.collector import (
-        collect_and_write_bandwidth_live,
-        collect_and_write_bandwidth,
-        collect_and_write_satellite,
-        collect_and_write_radiation,
-        collect_and_write_decibel,
-        collect_and_write_aem,
-        collect_and_write_tool_stats,
-    )
-    
-    last_collection = {
-        "bandwidth_live": 0.0,      # Every 2 seconds
-        "bandwidth": 0.0,            # Every 600 seconds (10 minutes)
-        "satellite": 0.0,
-        "radiation": 0.0,
-        "decibel": 0.0,
-        "aem": 0.0,
-        "tools": 0.0,
-    }
+    last_collection: dict[str, float] = {}
     
     intervals = _get_measurement_intervals()
+    
+    # Get API connection params for measurement upload
+    # These will be passed to collection functions that upload to backend
+    api_client = None
+    hex_id = None
+    miner_key = None
+    install_id = None
+    
+    try:
+        miner_key = read_miner_key()
+        install_id = read_encrypted_install_config()
+    except Exception:
+        pass
     
     while _measurement_daemon_running:
         try:
             now = time.time()
+            
+            # Try to establish API connection if not connected
+            # This allows measurements to upload to backend before saving to CSV
+            if api_client is None and miner_key:
+                try:
+                    api_client = connect_mongo("", None, None)
+                    if api_client and miner_key:
+                        hex_id = registered_hexid_from_devices(api_client, miner_key)
+                except Exception as e:
+                    log.debug("API not available for measurement upload: %s", e)
+                    api_client = None
+                    hex_id = None
             
             # Determine which sensors to collect based on miner type
             collectors = {}
             
             if MINER_CODE == "BM":
                 # BM: Live polling every 1 sec + real measurement every 600 sec
-                collectors["bandwidth_live"] = (collect_and_write_bandwidth_live, 1)
-                collectors["bandwidth"] = (collect_and_write_bandwidth, 600)
-                collectors["tools"] = (collect_and_write_tool_stats, intervals["tools"])
+                from measurements.collector import (
+                    collect_and_write_bandwidth_live,
+                    collect_and_upload_bandwidth,
+                    collect_and_write_tool_stats,
+                )
+                collectors["bandwidth_live"] = (lambda: collect_and_write_bandwidth_live(MINER_CODE), intervals.get("bandwidth", 10))
+                collectors["bandwidth"] = (lambda: collect_and_upload_bandwidth(MINER_CODE, api_client, hex_id, install_id, miner_key), 600) 
+                collectors["tools"] = (lambda: collect_and_write_tool_stats(MINER_CODE), intervals["tools"])
             
             elif MINER_CODE in ("ISM", "OSM"):
-                collectors["satellite"] = (collect_and_write_satellite, intervals["satellite"])
+                from measurements.collector import collect_and_upload_satellite
+                collectors["satellite"] = (lambda: collect_and_upload_satellite(MINER_CODE, api_client, hex_id, install_id, miner_key), intervals["satellite"])
             
             elif MINER_CODE == "IRM":
-                collectors["radiation"] = (collect_and_write_radiation, intervals["radiation"])
+                from measurements.collector import collect_and_upload_radiation
+                collectors["radiation"] = (lambda: collect_and_upload_radiation(MINER_CODE, api_client, hex_id, install_id, miner_key), intervals["radiation"])
             
             elif MINER_CODE in ("IDM", "ODM"):
-                collectors["decibel"] = (collect_and_write_decibel, intervals["decibel"])
+                from measurements.collector import collect_and_upload_decibel
+                collectors["decibel"] = (lambda: collect_and_upload_decibel(MINER_CODE, api_client, hex_id, install_id, miner_key), intervals["decibel"])
             
             elif MINER_CODE == "AEM":
-                collectors["aem"] = (collect_and_write_aem, intervals["aem"])
+                from measurements.collector import collect_and_upload_aem
+                collectors["aem"] = (lambda: collect_and_upload_aem(MINER_CODE, api_client, hex_id, install_id, miner_key), intervals["aem"])
             
             # Run due collectors
             for sensor_type, (collector_fn, interval) in collectors.items():
@@ -4464,8 +4524,21 @@ def _measurement_collection_loop() -> None:
                 
                 if now - last_collection[sensor_type] >= interval:
                     try:
-                        collector_fn(MINER_CODE)
+                        result = collector_fn()
                         last_collection[sensor_type] = now
+                        # If collector succeeded and this sensor is expected for PoD, mark slot pod_status True
+                        try:
+                            if result and miner_key:
+                                expected = set(_normalize_measurement_group(g) for g in expected_measurement_groups())
+                                norm = _normalize_measurement_group(sensor_type)
+                                if norm and norm in expected:
+                                    # Use the sensor interval as the slot length for marking
+                                    try:
+                                        write_week_local(miner_key, now_utc(), "online", interval, pod_status=True)
+                                    except Exception as e:
+                                        log.debug("Failed to mark weekly pod_status: %s", e)
+                        except Exception:
+                            pass
                     except Exception as e:
                         log.warning("Collection failed for %s: %s", sensor_type, e)
             
