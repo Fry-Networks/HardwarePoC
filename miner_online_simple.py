@@ -1371,6 +1371,11 @@ def _compute_rewards_multiplier(
     mysterium_active: bool,
 ) -> float:
     """Compute per-slot rewards multiplier based on gating and active tools."""
+    # RDN, SDN, SVN: only check mac_match and poc_ok (no pod_ok required)
+    if miner_type in ("RDN", "SDN", "SVN"):
+        return 1.0 if (mac_match and poc_ok) else 0.0
+
+    # Other miners require mac_match, poc_ok, and pod_ok
     if not (mac_match and poc_ok and pod_ok):
         return 0.0
     if miner_type == "AEM":
@@ -2791,6 +2796,7 @@ def write_week_local(
     mac_registered: Optional[str] = None,
     mac_mismatch: Optional[bool] = None,
     poi_data: Optional[bool] = None,       # AEM only
+    pol_status: Optional[bool] = None,     # PoL (Proof of Location)
     gui_version: Optional[str] = None,
     skip_slot: bool = False,
 ) -> None:
@@ -2836,6 +2842,14 @@ def write_week_local(
         doc["mac_registered"] = doc.get("mac_registered", "")
 
     doc["mac_mismatch"] = bool(mac_mismatch) if mac_mismatch is not None else bool(doc.get("mac_mismatch", False))
+
+    # PoL (Proof of Location) - update when provided, otherwise preserve existing
+    if isinstance(pol_status, bool):
+        doc["pol_status"] = bool(pol_status)
+        doc["pol_last_updated"] = _iso_z(ts_utc)
+    elif "pol_status" not in doc:
+        doc["pol_status"] = None
+        doc["pol_last_updated"] = None
 
     # Always populate GUI_version (prefer explicit arg, fallback to global)
     gv = gui_version.strip() if isinstance(gui_version, str) and gui_version.strip() else ""
@@ -2948,6 +2962,7 @@ def write_week_local(
             "mac": bool(mac_ok),
             "data": bool(data_gate_for_multiplier),
             "tools": (bool(tools_ok) if tools_ok is not None else True),
+            "pol": bool(pol_status) if isinstance(pol_status, bool) else None,
         },
         "tools_active": tools_active,
         "number_of_tools": len(tools_active),
@@ -3005,7 +3020,23 @@ def _start_poi_local_loop(miner_key: str, interval_seconds: int, poll_seconds: i
                 mac_registered = snap.get("mac_registered")
                 mac_mismatch = snap.get("mac_mismatch")
 
-                # AEM: "data" gate isn’t relevant; pass pod_status=None
+                # Fetch current PoL status from hardware doc if available
+                pol_status_val: Optional[bool] = None
+                try:
+                    from mongo_api_proxy import MongoProxyClient
+                    from external_api import ExternalApiClient
+                    api = ExternalApiClient()
+                    client_temp = MongoProxyClient(api)
+                    coll_temp = client_temp["PoC"]["hardware"]
+                    hw_doc = coll_temp.find_one({"miner_key": miner_key})
+                    if isinstance(hw_doc, dict):
+                        pol_block = hw_doc.get("pol")
+                        if isinstance(pol_block, dict):
+                            pol_status_val = pol_block.get("status") if isinstance(pol_block.get("status"), bool) else None
+                except Exception:
+                    pol_status_val = None
+
+                # AEM: "data" gate isn't relevant; pass pod_status=None
                 write_week_local(
                     miner_key,
                     now_utc(),
@@ -3015,6 +3046,7 @@ def _start_poi_local_loop(miner_key: str, interval_seconds: int, poll_seconds: i
                     mac_registered=mac_registered,
                     mac_mismatch=mac_mismatch,
                     poi_data=installed,
+                    pol_status=pol_status_val,
                     gui_version=GUI_VERSION,
                 )
 
@@ -5030,12 +5062,15 @@ def main() -> None:
 
     last_pol_check: Optional[dt.datetime] = None
     pending_pol_update: Optional[Dict[str, Any]] = None
+    pol_status: Optional[bool] = None  # Current PoL status for weekly cache
     try:
         initial_pol_ts = now_utc()
         pol_block_start = write_location_daily(coll, client, miner_key, initial_pol_ts)
         if pol_block_start:
             pending_pol_update = pol_block_start
             last_pol_check = initial_pol_ts
+            # Extract pol_status for weekly cache
+            pol_status = pol_block_start.get("status") if isinstance(pol_block_start.get("status"), bool) else None
     except Exception:
         pass
 
@@ -5162,6 +5197,7 @@ def main() -> None:
                     mac_registered=mac_registered,
                     mac_mismatch=local_mismatch,
                     poi_data=poi_snapshot,
+                    pol_status=pol_status,
                     gui_version=GUI_VERSION,
                 )
             except Exception:
@@ -5246,6 +5282,8 @@ def main() -> None:
                         if pol_block_new:
                             pending_pol_update = pol_block_new
                             last_pol_check = slot_ts
+                            # Update pol_status for weekly cache
+                            pol_status = pol_block_new.get("status") if isinstance(pol_block_new.get("status"), bool) else pol_status
                 except Exception:
                     pass
 

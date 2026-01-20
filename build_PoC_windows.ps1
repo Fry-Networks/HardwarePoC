@@ -27,6 +27,8 @@ param(
   [string]$OPRefMystRegistrationToken = "op://Bandwidth Miners/Mysterium SDK API/MYST_REG_TOKEN",
   [string]$OPRefMystApiKey = "op://Bandwidth Miners/Mysterium SDK API/MYST_API_KEY",
 
+  # Autonomys Auto Drive
+  [string]$OPRefAutonomysApiKey = "op://DataStorage/AutoDrive/AUTONOMYS_API_KEY",
 
   [int]$IntervalSeconds = 600,
   [string]$TlsCAFile = "",
@@ -411,13 +413,24 @@ try {
     try {
       if ($OPRefHoneygainApiKey) {
         $val = (& op read $OPRefHoneygainApiKey 2>$null).Trim()
-        if ($val) { 
+        if ($val) {
           $toolCreds.honeygain_api_key = $val
           Write-Host "Honeygain API key configured"
         }
       }
     } catch { Write-Warning "Honeygain credentials unavailable: $_" }
-    
+
+    # Autonomys Auto Drive
+    try {
+      if ($OPRefAutonomysApiKey) {
+        $val = (& op read $OPRefAutonomysApiKey 2>$null).Trim()
+        if ($val) {
+          $toolCreds.autonomys_api_key = $val
+          Write-Host "Autonomys API key configured"
+        }
+      }
+    } catch { Write-Warning "Autonomys credentials unavailable: $_" }
+
     if ($toolCreds.Count -gt 0) {
       $cfg.tool_credentials = $toolCreds
     }

@@ -476,7 +476,13 @@ def collect_all_by_miner_type(miner_code: str, api_client: Optional[Any] = None,
         # AI Edge Miner
         if collect_and_upload_aem(miner_code, api_client, hex_id, install_id, miner_key):
             success = True
-    
+
+    elif miner_code in ("RDN", "SDN", "SVN"):
+        # These miner types don't collect sensor measurements
+        # They rely on tool/service activity instead
+        log.debug("Miner type %s does not collect measurements", miner_code)
+        success = True  # Not an error condition
+
     else:
         log.warning("Unknown miner code: %s", miner_code)
     

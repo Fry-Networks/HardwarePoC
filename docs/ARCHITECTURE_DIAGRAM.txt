@@ -1,0 +1,254 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                 FryNetworks Autonomys Integration Architecture                ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                          MEASUREMENT COLLECTION                               │
+│                                                                               │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐     │
+│  │ Bandwidth│  │Satellite │  │Radiation │  │ Decibel  │  │   AEM    │     │
+│  │   (BM)   │  │(ISM/OSM) │  │  (IRM)   │  │(IDM/ODM) │  │          │     │
+│  │          │  │          │  │          │  │          │  │          │     │
+│  │ Every    │  │ Every    │  │ Every    │  │ Every    │  │ Every    │     │
+│  │ 10 min   │  │ 10 min   │  │ 10 min   │  │ 10 min   │  │ 10 min   │     │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘     │
+│       └────────────┬┴────────────┬┴────────────┬┴────────────┬┘            │
+│                    ↓             ↓             ↓             ↓              │
+└────────────────────┼─────────────┼─────────────┼─────────────┼──────────────┘
+                     │             │             │             │
+                     ↓             ↓             ↓             ↓
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              CSV WRITER                                       │
+│  measurements/csv_writer.py                                                   │
+│                                                                               │
+│  Writes to: C:\ProgramData\FryNetworks\miner-{CODE}\measurements\            │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ Live Dataset (for GUI)          Real Dataset (for uploads)          │    │
+│  │ bandwidth_live_20260120.csv     bandwidth_real_20260120.csv         │    │
+│  │ radiation_live_20260120.csv     radiation_real_20260120.csv         │    │
+│  │ (updated every 10 seconds)      (updated every 10 minutes)          │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+└────────────────────────────┬──────────────────────┬──────────────────────────┘
+                             │                      │
+                             ↓                      ↓
+        ┌────────────────────────────────┐  ┌──────────────────────────────────┐
+        │    EXISTING PATH (MongoDB)     │  │    NEW PATH (Autonomys)          │
+        │    collector.py                │  │    autonomys_orchestrator.py     │
+        │                                │  │                                  │
+        │  • Immediate upload            │  │  • Wait until next day (00:30)   │
+        │  • Direct to backend API       │  │  • Process yesterday's data      │
+        │  • Real-time verification      │  │  • Complete daily records        │
+        │  • Continues unchanged         │  │                                  │
+        └────────┬───────────────────────┘  └──────────┬───────────────────────┘
+                 │                                      │
+                 ↓                                      ↓
+        ┌────────────────────┐           ┌─────────────────────────────────────┐
+        │  MongoDB Database  │           │   AUTONOMYS PROCESSING PIPELINE     │
+        │                    │           └─────────────────────────────────────┘
+        │  • Raw measurements│                          ↓
+        │  • Instant access  │           ┌─────────────────────────────────────┐
+        │  • High storage $$ │           │  1. Read CSV Data                   │
+        │                    │           │     autonomys_orchestrator.py       │
+        └────────────────────┘           │     • read_all_rows(dataset="real") │
+                                         │     • Parse timestamps               │
+                                         └─────────────────────────────────────┘
+                                                        ↓
+                                         ┌─────────────────────────────────────┐
+                                         │  2. Hourly Aggregation              │
+                                         │     autonomys_aggregator.py         │
+                                         │     • Group by hour (0-23)          │
+                                         │     • Calculate avg/min/max         │
+                                         │     • Count samples per hour        │
+                                         │     • Returns pandas DataFrame      │
+                                         └─────────────────────────────────────┘
+                                                        ↓
+                                         ┌─────────────────────────────────────┐
+                                         │  3. Write Parquet Files             │
+                                         │     autonomys_aggregator.py         │
+                                         │     • Convert DataFrame to Parquet  │
+                                         │     • Snappy compression            │
+                                         │     • ~10x smaller than CSV         │
+                                         └─────────────────────────────────────┘
+                                                        ↓
+                                         ┌─────────────────────────────────────┐
+                                         │  4. Generate Metadata               │
+                                         │     autonomys_aggregator.py         │
+                                         │     • Daily summaries               │
+                                         │     • Peak hours                    │
+                                         │     • Sample counts                 │
+                                         │     • JSON format                   │
+                                         └─────────────────────────────────────┘
+                                                        ↓
+                                         ┌─────────────────────────────────────┐
+                                         │  5. Update Manifests                │
+                                         │     autonomys_writer.py             │
+                                         │     • Per-hex manifest.json         │
+                                         │     • Root metadata.json            │
+                                         │     • Coverage tracking             │
+                                         └─────────────────────────────────────┘
+                                                        ↓
+                                         ┌─────────────────────────────────────┐
+                                         │  LOCAL STORAGE                      │
+                                         │  C:\ProgramData\FryNetworks\        │
+                                         │  autonomys-measurements\            │
+                                         │                                     │
+                                         │  res-7/                             │
+                                         │  └─ 871f90151ffffff/                │
+                                         │     ├─ manifest.json                │
+                                         │     └─ bandwidth/                   │
+                                         │        └─ hourly/                   │
+                                         │           ├─ 2026-01-20.parquet     │
+                                         │           └─ 2026-01-20.meta.json   │
+                                         └─────────────────────────────────────┘
+                                                        ↓
+                                         ┌─────────────────────────────────────┐
+                                         │  6. Upload to Autonomys             │
+                                         │     autonomys_uploader.py           │
+                                         │     • S3-compatible API             │
+                                         │     • boto3 client                  │
+                                         │     • API key authentication        │
+                                         └─────────────────────────────────────┘
+                                                        ↓
+                                         ┌─────────────────────────────────────┐
+                                         │  AUTONOMYS AUTO DRIVE               │
+                                         │  (Decentralized Storage)            │
+                                         │                                     │
+                                         │  • Permanent storage                │
+                                         │  • Low cost                         │
+                                         │  • Globally accessible              │
+                                         │  • Monetizable                      │
+                                         └─────────────────────────────────────┘
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                            FOLDER STRUCTURE                                   ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+autonomys-measurements/
+├── metadata.json ─────────────────────┐ Network-wide manifest
+│                                      │ • Total hexagons: 847
+├── index.json ────────────────────────┤ • Measurement types: 5
+│                                      │ • Pricing tiers
+└── res-7/ ────────────────────────────┴ • Contact info
+    ├── 871f90151ffffff/ ──────────────┐
+    │   ├── manifest.json ──────────────┤ Per-hex metadata
+    │   │                               │ • Coverage dates
+    │   │                               │ • Location (lat/lon)
+    │   ├── bandwidth/ ─────────────────┤ • Data quality
+    │   │   ├── hourly/ ────────────────┤ • Pricing tier
+    │   │   │   ├── 2026-01-20.parquet ─┴─┐
+    │   │   │   └── 2026-01-20.meta.json ─┤ Hourly aggregates
+    │   │   │                              │ • 24 hours × metrics
+    │   │   └── daily/ ────────────────────┤ • avg/min/max
+    │   │       └── 2026-01.parquet ───────┴ • Sample counts
+    │   │
+    │   ├── radiation/
+    │   │   └── hourly/
+    │   │       └── 2026-01-20.parquet
+    │   │
+    │   ├── satellite/
+    │   ├── decibel/
+    │   └── aem/
+    │
+    ├── 871f90152ffffff/
+    ├── 871f90153ffffff/
+    └── ...
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                        DATA MONETIZATION FLOW                                 ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+┌──────────────────┐
+│  Data Buyers     │
+│                  │
+│ • Researchers    │
+│ • Telecom Cos    │
+│ • Real Estate    │
+│ • Smart Cities   │
+└────────┬─────────┘
+         │
+         ↓
+┌────────────────────────────────────────────────────────────┐
+│           PRICING ENGINE                                    │
+│                                                             │
+│  Price = base × hex_res × time_gran × type × duration      │
+│                                                             │
+│  Example 1: Hourly Bandwidth (res-7)                       │
+│  $50 = $50 × 1.0 × 1.0 × 1.0 × 1                          │
+│                                                             │
+│  Example 2: Daily Radiation (res-7)                        │
+│  $22.50 = $15 × 1.0 × 1.0 × 1.5 × 1                       │
+└────────────────────────────────────────────────────────────┘
+         │
+         ↓
+┌────────────────────────────────────────────────────────────┐
+│           DATA PRODUCTS CATALOG                             │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐ │
+│  │ Basic Explorer        │ Any type │ Daily  │ $15/hex  │ │
+│  │ Professional Bandwidth│ Bandwidth│ Hourly │ $50/hex  │ │
+│  │ Environmental Research│ Rad/Sat  │ Hourly │ $60/hex  │ │
+│  │ Smart City Bundle     │ All types│ Hourly │ $150/hex │ │
+│  │ Custom API Access     │ Any      │ Query  │ Pay-per  │ │
+│  └──────────────────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────────┘
+         │
+         ↓
+┌────────────────────────────────────────────────────────────┐
+│           ACCESS CONTROL                                    │
+│                                                             │
+│  • API key authentication                                   │
+│  • Hex-level permissions                                    │
+│  • Time-range restrictions                                  │
+│  • Download quotas                                          │
+└────────────────────────────────────────────────────────────┘
+         │
+         ↓
+┌────────────────────────────────────────────────────────────┐
+│      AUTONOMYS AUTO DRIVE ACCESS                            │
+│                                                             │
+│  S3-compatible download:                                    │
+│  GET /res-7/871f90151ffffff/bandwidth/hourly/2026-01.parquet│
+│                                                             │
+│  Returns: Parquet file with hourly aggregates               │
+└────────────────────────────────────────────────────────────┘
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                          DEPLOYMENT TIMELINE                                  ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+Day 1:  Install dependencies, test locally
+        ├─ pip install -r requirements-autonomys.txt
+        ├─ Get API key from ai3.storage
+        └─ python test_autonomys_integration.py
+
+Week 1: Roll out to production
+        ├─ Deploy to one miner (test)
+        ├─ Monitor daily uploads
+        └─ Verify data quality
+
+Month 1: Full deployment
+        ├─ All miner types
+        ├─ Backfill 3-6 months
+        └─ Create data catalog
+
+Month 2: Monetization launch
+        ├─ Build buyer portal
+        ├─ Define data products
+        ├─ Market to customers
+        └─ First sales!
+
+Month 3+: Scale & optimize
+        ├─ Add more aggregation levels
+        ├─ Multi-resolution support
+        ├─ Analytics dashboard
+        └─ Reduce MongoDB costs
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                            READY TO DEPLOY!
+                    Run: python test_autonomys_integration.py
+═══════════════════════════════════════════════════════════════════════════════
