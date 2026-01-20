@@ -210,15 +210,45 @@ def _write_stop_reason(reason: str, *, miner_key: Optional[str] = None) -> None:
         pass
 
 def _init_service_file_logging() -> None:
-    """Attach a file handler under the ProgramData logs folder for service diagnostics."""
+    """Attach a file handler under the ProgramData logs folder for service diagnostics.
+
+    Note: When running as a Windows service, the service wrapper typically redirects
+    stderr to the log file already. We skip adding a FileHandler to avoid duplicates.
+    """
     try:
+        import sys
+
+        # Skip file handler setup if stderr is not a TTY (likely redirected by service wrapper)
+        # This prevents duplicate log entries when running as a Windows service
+        try:
+            if not sys.stderr.isatty():
+                return
+        except (AttributeError, ValueError):
+            # If isatty() fails or doesn't exist, proceed with normal setup
+            pass
+
         log_dir = os.path.join(data_dir(), "logs")
         os.makedirs(log_dir, exist_ok=True)
         file_path = os.path.join(log_dir, "service.err.log")
+
+        root = logging.getLogger()
+
+        # Check if a FileHandler for this file already exists
+        for handler in root.handlers:
+            if isinstance(handler, logging.FileHandler):
+                try:
+                    handler_path = os.path.abspath(handler.baseFilename)
+                    target_path = os.path.abspath(file_path)
+                    if handler_path == target_path:
+                        # Handler already exists for this file
+                        return
+                except (AttributeError, OSError):
+                    pass
+
+        # Add new FileHandler only if one doesn't exist
         fh = logging.FileHandler(file_path, encoding="utf-8")
         fh.setLevel(logging.INFO)
         fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-        root = logging.getLogger()
         root.addHandler(fh)
     except Exception:
         # Do not block startup if logging cannot initialize
@@ -1136,48 +1166,62 @@ def upload_measurements_for_slot(
     except Exception:
         pass
 
+    # Check CSV files for measurements in this slot
+    # Measurements are uploaded immediately when collected, so we just verify they exist in CSV
     try:
-        measurement_data_list = read_measurement_files()
-    except Exception:
-        measurement_data_list = []
-    if not measurement_data_list:
-        return (False if pod_required else True), delivered_groups
-    for measurement_data in measurement_data_list:
-        try:
-            timestamp_raw = measurement_data.get("timestamp")
-            measurement_ts = _parse_measurement_timestamp(timestamp_raw)
-            measurement_in_slot = bool(
-                measurement_ts and slot_start <= measurement_ts < slot_end
-            )
-            measurement_type_raw = measurement_data.get("group") or measurement_data.get("measurement_type")
-            value = measurement_data.get("measurement", {})
-            measurement_type = measurement_type_raw.strip() if isinstance(measurement_type_raw, str) else None
-            if measurement_ts and measurement_type and isinstance(value, dict) and value:
-                timestamp_payload = (
-                    timestamp_raw if isinstance(timestamp_raw, str) and timestamp_raw.strip()
-                    else measurement_ts.isoformat()
-                )
-                client._api.upload_measurement(
-                    hex_id=hex_registered,
-                    miner_code=MINER_CODE,
-                    install_id=install_id,
-                    timestamp=str(timestamp_payload),
-                    measurement_type=measurement_type,
-                    value=value,
-                )
-                normalized = _normalize_measurement_group(measurement_type)
-                if measurement_in_slot and normalized and normalized in expected_set and normalized not in delivered_groups:
-                    delivered_groups.append(normalized)
-            else:
-                log.debug("Skipping measurement upload; missing required fields: %s", measurement_data)
-        except Exception as e:
-            _record_critical_failure(f"pod-upload-error-{miner_key}", f"Failed to upload measurement for {miner_key}: {e}", miner_key=miner_key)
-        else:
-            _reset_critical_failure(f"pod-upload-error-{miner_key}")
+        from measurements.csv_writer import read_all_rows
+
+        # Map expected groups to sensor types
+        sensor_type_map = {
+            "bandwidth": "bandwidth",
+            "satellite": "satellite",
+            "radiation": "radiation",
+            "decibel": "decibel",
+            "aem": "aem",
+        }
+
+        for expected_group in expected_set:
+            sensor_type = sensor_type_map.get(expected_group)
+            if not sensor_type:
+                continue
+
+            try:
+                # Read all rows from the CSV for today
+                rows = read_all_rows(sensor_type, MINER_CODE, dataset="real")
+
+                # Check if any measurement falls within the slot time range
+                for row in rows:
+                    try:
+                        timestamp_str = row.get("timestamp", "")
+                        if not timestamp_str:
+                            continue
+
+                        measurement_ts = _parse_measurement_timestamp(timestamp_str)
+                        if measurement_ts and slot_start <= measurement_ts < slot_end:
+                            # Found a measurement in this slot for this sensor type
+                            if expected_group not in delivered_groups:
+                                delivered_groups.append(expected_group)
+                            break
+                    except Exception:
+                        continue
+            except Exception as e:
+                log.debug("Failed to check CSV for %s: %s", sensor_type, e)
+                continue
+
+    except Exception as e:
+        log.error("Failed to check CSV measurements: %s", e)
+
     if not pod_required:
         return True, delivered_groups
     delivered_set = set(delivered_groups)
-    return (delivered_set.issuperset(expected_set), delivered_groups)
+    pod_met = delivered_set.issuperset(expected_set)
+
+    # Log if PoD check failed
+    if not pod_met:
+        missing_groups = expected_set - delivered_set
+        log.info("PoD incomplete for slot %s: missing %s", slot_end, missing_groups)
+
+    return (pod_met, delivered_groups)
 
 def owen_decrypt(key: bytes, ciphertext: bytes) -> bytes:
     nonce, ct = ciphertext[:16], ciphertext[16:]
@@ -2420,6 +2464,9 @@ def cache_lock_path_for(ts: dt.datetime) -> str:
     """Return the lock file path for the given day's cache."""
     return os.path.join(data_dir(), "status", f"status-{ts.strftime('%Y%m%d')}.lock")
 
+
+
+
 class _CacheLock:
     """Lightweight advisory lock for a day's cache file.
     Uses msvcrt.locking on Windows; best-effort no-op elsewhere.
@@ -2861,7 +2908,10 @@ def write_week_local(
     else:
         tools_ok = None
 
-    # "data" gate: BM uses pod_status; if unknown, treat as False for multiplier gating
+    # "data" gate: BM uses pod_status
+    # - pod_status=True: upload succeeded, data delivered
+    # - pod_status=False: upload failed or wasn't possible
+    # - pod_status=None: should not happen (always set in current logic)
     data_gate_for_multiplier = bool(data_ok) if isinstance(data_ok, bool) else False
 
     multiplier: Optional[float] = None
@@ -4473,7 +4523,7 @@ def _measurement_collection_loop() -> None:
     while _measurement_daemon_running:
         try:
             now = time.time()
-            
+
             # Try to establish API connection if not connected
             # This allows measurements to upload to backend before saving to CSV
             if api_client is None and miner_key:
@@ -4485,43 +4535,57 @@ def _measurement_collection_loop() -> None:
                     log.debug("API not available for measurement upload: %s", e)
                     api_client = None
                     hex_id = None
-            
-            # Determine which sensors to collect based on miner type
-            collectors = {}
-            
+
+            # --- Build two sets of collectors: live writers (for UI) and uploads (backend) ---
+            live_collectors: dict[str, tuple[Callable[[], bool], int]] = {}
+            upload_collectors: dict[str, tuple[Callable[[], bool], int]] = {}
+
             if MINER_CODE == "BM":
-                # BM: Live polling every 1 sec + real measurement every 600 sec
+                # BM: live writes at configured 'bandwidth' interval; upload every 600s
                 from measurements.collector import (
                     collect_and_write_bandwidth_live,
                     collect_and_upload_bandwidth,
                     collect_and_write_tool_stats,
                 )
-                collectors["bandwidth_live"] = (lambda: collect_and_write_bandwidth_live(MINER_CODE), intervals.get("bandwidth", 10))
-                collectors["bandwidth"] = (lambda: collect_and_upload_bandwidth(MINER_CODE, api_client, hex_id, install_id, miner_key), 600) 
-                collectors["tools"] = (lambda: collect_and_write_tool_stats(MINER_CODE), intervals["tools"])
-            
+                live_collectors["bandwidth_live"] = (lambda: collect_and_write_bandwidth_live(MINER_CODE), intervals.get("bandwidth", 10))
+                upload_collectors["bandwidth"] = (lambda: collect_and_upload_bandwidth(MINER_CODE, api_client, hex_id, install_id, miner_key), 600)
+                live_collectors["tools"] = (lambda: collect_and_write_tool_stats(MINER_CODE), intervals["tools"])
+
             elif MINER_CODE in ("ISM", "OSM"):
-                from measurements.collector import collect_and_upload_satellite
-                collectors["satellite"] = (lambda: collect_and_upload_satellite(MINER_CODE, api_client, hex_id, install_id, miner_key), intervals["satellite"])
-            
+                from measurements.collector import collect_and_write_satellite_live, collect_and_upload_satellite
+                live_collectors["satellite_live"] = (lambda: collect_and_write_satellite_live(MINER_CODE), intervals["satellite"])
+                upload_collectors["satellite"] = (lambda: collect_and_upload_satellite(MINER_CODE, api_client, hex_id, install_id, miner_key), 600)
+
             elif MINER_CODE == "IRM":
-                from measurements.collector import collect_and_upload_radiation
-                collectors["radiation"] = (lambda: collect_and_upload_radiation(MINER_CODE, api_client, hex_id, install_id, miner_key), intervals["radiation"])
-            
+                from measurements.collector import collect_and_write_radiation_live, collect_and_upload_radiation
+                live_collectors["radiation_live"] = (lambda: collect_and_write_radiation_live(MINER_CODE), intervals["radiation"])
+                upload_collectors["radiation"] = (lambda: collect_and_upload_radiation(MINER_CODE, api_client, hex_id, install_id, miner_key), 600)
+
             elif MINER_CODE in ("IDM", "ODM"):
-                from measurements.collector import collect_and_upload_decibel
-                collectors["decibel"] = (lambda: collect_and_upload_decibel(MINER_CODE, api_client, hex_id, install_id, miner_key), intervals["decibel"])
-            
+                from measurements.collector import collect_and_write_decibel_live, collect_and_upload_decibel
+                live_collectors["decibel_live"] = (lambda: collect_and_write_decibel_live(MINER_CODE), intervals["decibel"])
+                upload_collectors["decibel"] = (lambda: collect_and_upload_decibel(MINER_CODE, api_client, hex_id, install_id, miner_key), 600)
+
             elif MINER_CODE == "AEM":
                 from measurements.collector import collect_and_upload_aem
-                collectors["aem"] = (lambda: collect_and_upload_aem(MINER_CODE, api_client, hex_id, install_id, miner_key), intervals["aem"])
-            
-            # Run due collectors
-            for sensor_type, (collector_fn, interval) in collectors.items():
-                # Initialize tracking for this sensor if not present
+                # AEM does not have separate fast live writer; upload interval remains 600s
+                upload_collectors["aem"] = (lambda: collect_and_upload_aem(MINER_CODE, api_client, hex_id, install_id, miner_key), intervals["aem"])
+
+            # Run due live collectors
+            for sensor_type, (collector_fn, interval) in live_collectors.items():
                 if sensor_type not in last_collection:
                     last_collection[sensor_type] = now
-                
+                if now - last_collection[sensor_type] >= interval:
+                    try:
+                        result = collector_fn()
+                        last_collection[sensor_type] = now
+                    except Exception as e:
+                        log.warning("Live collection failed for %s: %s", sensor_type, e)
+
+            # Run due upload collectors
+            for sensor_type, (collector_fn, interval) in upload_collectors.items():
+                if sensor_type not in last_collection:
+                    last_collection[sensor_type] = now
                 if now - last_collection[sensor_type] >= interval:
                     try:
                         result = collector_fn()
@@ -4532,16 +4596,16 @@ def _measurement_collection_loop() -> None:
                                 expected = set(_normalize_measurement_group(g) for g in expected_measurement_groups())
                                 norm = _normalize_measurement_group(sensor_type)
                                 if norm and norm in expected:
-                                    # Use the sensor interval as the slot length for marking
+                                    # Upload collectors use a 10-minute slot (600s)
                                     try:
-                                        write_week_local(miner_key, now_utc(), "online", interval, pod_status=True)
+                                        write_week_local(miner_key, now_utc(), "online", 600, pod_status=True)
                                     except Exception as e:
                                         log.debug("Failed to mark weekly pod_status: %s", e)
                         except Exception:
                             pass
                     except Exception as e:
-                        log.warning("Collection failed for %s: %s", sensor_type, e)
-            
+                        log.warning("Upload collection failed for %s: %s", sensor_type, e)
+
             # Sleep briefly and check again
             time.sleep(1)
             
@@ -4638,7 +4702,7 @@ def main() -> None:
         cfg_src = cfg_path if os.path.exists(cfg_path) else "(embedded/default)"
         log.info(
             "Starting monitoring service v%s | miner_key=%s | ProgramData=%s | config=%s | api_base=%s | interval=%s | poi_interval=%s | lease_seconds=%s",
-            SOFTWARE_VERSION,
+            VERSION,
             miner_key,
             data_dir(),
             cfg_src,
@@ -4976,6 +5040,22 @@ def main() -> None:
         pass
 
     # ----------------------------
+    # Initial measurement collection (for first PoC update)
+    # ----------------------------
+    try:
+        from measurements.collector import collect_all_by_miner_type
+        hex_registered = None
+        try:
+            hex_registered = registered_hexid_from_devices(client, miner_key)
+        except Exception:
+            pass
+        if hex_registered:
+            log.info("Performing initial measurement collection before first PoC update")
+            collect_all_by_miner_type(MINER_CODE, client, hex_registered, install_id, miner_key)
+    except Exception as e:
+        log.warning("Initial measurement collection failed: %s", e)
+
+    # ----------------------------
     # Main monitoring loop
     # ----------------------------
     warned_version = False
@@ -5032,6 +5112,7 @@ def main() -> None:
                         log.error("Measurement upload error: %s", e)
                         pod_slot_ok = False
                 else:
+                    # Connection down; can't upload
                     pod_slot_ok = False
 
             if expected_groups and not pod_slot_ok:

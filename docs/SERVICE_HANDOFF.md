@@ -25,10 +25,10 @@ This document is the implementation guide for the autonomous service. It clarifi
 ---
 
 ## CSV Output (Authoritative)
-- **Location:** `%PROGRAMDATA%\FryNetworks\miner-{CODE}\measurements\{sensor}_YYYYMMDD.csv`
+- **Location:** `%PROGRAMDATA%\FryNetworks\miner-{CODE}\measurements\{sensor}_live_YYYYMMDD.csv` and `{sensor}_real_YYYYMMDD.csv` (separate files for Live and Historical data)
 - **Encoding:** UTF-8 (no BOM). Append-only. One header row.
 - **Rotation:** New file per calendar day (YYYYMMDD).
-- **Writer:** Use `miner_GUI/services/service_csv_writer.py` (`append_row()`), even in service context.
+- **Writer:** Use `miner_GUI/services/service_csv_writer.py` and call `append_row(..., dataset='live'|'real')` appropriately; service collectors should default to writing live samples to `_live_` and write real/historical samples (10min cadence) to `_real_`.
 
 ### CSV Schemas per Sensor/Tool
 - **Bandwidth (BM/IDM/ODM):**
@@ -57,7 +57,8 @@ This document is the implementation guide for the autonomous service. It clarifi
 - **Tools (Mysterium, Honeygain, Bright, Presearch, SpaceAcres, Diiisco):** 60 seconds.
 
 Implement these timers in the service entrypoint (e.g., `miner_online_simple.py` or dedicated service main). Each tick:
-- Sample → build row dict → `append_row(sensor_type, row)` → POST to backend.
+- Sample → build row dict → `append_row(sensor_type, row, dataset='live')` for immediate UI display → POST to backend when appropriate.
+- Real (10-minute) collectors SHOULD call `append_row(sensor_type, row, dataset='real')` so historical charts are kept separate from noisy live samples.
 
 ---
 
