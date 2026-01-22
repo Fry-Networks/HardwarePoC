@@ -26,6 +26,7 @@ from .autonomys_aggregator import (
     write_hourly_metadata
 )
 from .autonomys_uploader import get_uploader
+from .autonomys_redactor import DataRedactor, get_redaction_level_info
 
 log = logging.getLogger("measurements.autonomys_orchestrator")
 
@@ -36,16 +37,18 @@ def process_daily_csv_to_autonomys(
     hex_id: str,
     date_str: Optional[str] = None,
     install_id: Optional[str] = None,
-    upload_to_cloud: bool = True
+    upload_to_cloud: bool = True,
+    redaction_level: str = 'standard'
 ) -> bool:
     """Process daily CSV data and write to Autonomys structure.
 
     This function:
     1. Reads CSV data for the day
     2. Aggregates into hourly intervals
-    3. Writes parquet files to local Autonomys folder
-    4. Updates manifests
-    5. Optionally uploads to Autonomys Auto Drive
+    3. **REDACTS sensitive information for public storage**
+    4. Writes parquet files to local Autonomys folder
+    5. Updates manifests
+    6. Optionally uploads redacted data to Autonomys Auto Drive
 
     Args:
         miner_code: Miner type code (BM, ISM, etc.)
@@ -88,8 +91,29 @@ def process_daily_csv_to_autonomys(
             log.warning("Aggregation produced no data for %s on %s", measurement_type, date_str)
             return False
 
-        # Ensure Autonomys folder structure exists
-        hourly_dir, daily_dir = ensure_autonomys_structure(hex_id, measurement_type)
+        # Apply redaction to protect sensitive information
+        redactor = DataRedactor(redaction_level=redaction_level)
+
+        # Redact measurement data based on type
+        if measurement_type == 'bandwidth':
+            hourly_df = redactor.redact_bandwidth_data(hourly_df)
+        elif measurement_type == 'satellite':
+            hourly_df = redactor.redact_satellite_data(hourly_df)
+        elif measurement_type == 'radiation':
+            hourly_df = redactor.redact_radiation_data(hourly_df)
+        elif measurement_type == 'decibel':
+            hourly_df = redactor.redact_decibel_data(hourly_df)
+        elif measurement_type == 'aem':
+            hourly_df = redactor.redact_aem_data(hourly_df)
+
+        log.info("Applied %s redaction to %s data", redaction_level, measurement_type)
+
+        # Get redacted hex_id for folder structure
+        redacted_hex_id = redactor.redact_location(hex_id,
+            target_resolution=get_redaction_level_info(redaction_level)['hex_resolution'])
+
+        # Ensure Autonomys folder structure exists (using redacted hex)
+        hourly_dir, daily_dir = ensure_autonomys_structure(redacted_hex_id, measurement_type)
 
         # Format date for filenames (YYYY-MM-DD)
         date_obj = datetime.strptime(date_str, "%Y%m%d")
@@ -101,8 +125,8 @@ def process_daily_csv_to_autonomys(
             log.error("Failed to write parquet for %s on %s", measurement_type, date_str)
             return False
 
-        # Create and write hourly metadata
-        metadata = create_hourly_metadata(hourly_df, formatted_date, hex_id, measurement_type)
+        # Create and write hourly metadata (using redacted hex_id)
+        metadata = create_hourly_metadata(hourly_df, formatted_date, redacted_hex_id, measurement_type)
         metadata_path = hourly_dir / f"{formatted_date}.meta.json"
         write_hourly_metadata(metadata, metadata_path)
 
@@ -110,15 +134,35 @@ def process_daily_csv_to_autonomys(
         first_timestamp = datetime.fromisoformat(rows[0]['timestamp'])
         last_timestamp = datetime.fromisoformat(rows[-1]['timestamp'])
 
-        create_or_update_hex_manifest(
-            hex_id=hex_id,
+        # Create manifest with original hex_id first
+        manifest_created = create_or_update_hex_manifest(
+            hex_id=redacted_hex_id,  # Use redacted hex_id
             measurement_type=measurement_type,
             first_timestamp=first_timestamp,
             last_timestamp=last_timestamp,
             sample_count=len(rows),
-            install_id=install_id,
-            miner_code=miner_code
+            install_id=None,  # Don't include install_id in public data
+            miner_code=None   # Don't include miner_code in public data
         )
+
+        # Apply manifest redaction
+        if manifest_created:
+            from .autonomys_writer import get_hex_resolution, autonomys_root_dir
+            resolution = get_hex_resolution(redacted_hex_id)
+            root = autonomys_root_dir()
+            manifest_path = root / f"res-{resolution}" / redacted_hex_id / "manifest.json"
+
+            if manifest_path.exists():
+                import json
+                with open(manifest_path, 'r', encoding='utf-8') as f:
+                    manifest = json.load(f)
+
+                # Redact the manifest
+                redacted_manifest = redactor.redact_manifest(manifest, redacted_hex_id)
+
+                # Write back redacted version
+                with open(manifest_path, 'w', encoding='utf-8') as f:
+                    json.dump(redacted_manifest, f, indent=2)
 
         # Update root metadata
         create_or_update_root_metadata()
@@ -128,17 +172,22 @@ def process_daily_csv_to_autonomys(
             uploader = get_uploader()
             if uploader:
                 try:
-                    # Upload parquet file
-                    import h3
-                    resolution = h3.h3_get_resolution(hex_id)
-                    remote_path = f"res-{resolution}/{hex_id}/{measurement_type}/hourly/{formatted_date}.parquet"
+                    # Upload parquet file (using redacted hex_id)
+                    from .autonomys_writer import get_hex_resolution
+                    resolution = get_hex_resolution(redacted_hex_id)
+                    remote_path = f"res-{resolution}/{redacted_hex_id}/{measurement_type}/hourly/{formatted_date}.parquet"
                     uploader.upload_file(parquet_path, remote_path)
 
                     # Upload metadata file
-                    remote_meta_path = f"res-{resolution}/{hex_id}/{measurement_type}/hourly/{formatted_date}.meta.json"
+                    remote_meta_path = f"res-{resolution}/{redacted_hex_id}/{measurement_type}/hourly/{formatted_date}.meta.json"
                     uploader.upload_file(metadata_path, remote_meta_path)
 
-                    log.info("Uploaded %s data to Autonomys Auto Drive", measurement_type)
+                    # Upload redacted manifest
+                    manifest_remote_path = f"res-{resolution}/{redacted_hex_id}/manifest.json"
+                    uploader.upload_file(manifest_path, manifest_remote_path)
+
+                    log.info("Uploaded redacted %s data to Autonomys Auto Drive (redaction: %s)",
+                             measurement_type, redaction_level)
                 except Exception as e:
                     log.error("Failed to upload to Autonomys: %s", e)
                     # Don't fail the whole operation if upload fails
@@ -363,10 +412,9 @@ def upload_manifest_files(hex_id: str) -> bool:
         return False
 
     try:
-        import h3
-        resolution = h3.h3_get_resolution(hex_id)
+        from .autonomys_writer import get_hex_resolution, autonomys_root_dir
+        resolution = get_hex_resolution(hex_id)
 
-        from .autonomys_writer import autonomys_root_dir
         root = autonomys_root_dir()
 
         # Upload hex manifest

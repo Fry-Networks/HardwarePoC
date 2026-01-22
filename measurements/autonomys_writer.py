@@ -9,17 +9,40 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 log = logging.getLogger("measurements.autonomys_writer")
 
+# Type-checker-only imports to help Pylance resolve optional deps
+if TYPE_CHECKING:
+    import pandas as pd  # type: ignore
+    import pyarrow as pa  # type: ignore
+    import pyarrow.parquet as pq  # type: ignore
+
 # H3 library will be imported when needed
+h3: Any = None
+H3_AVAILABLE = False
 try:
-    import h3
+    # Preferred: import the basic string-based API if available
+    import h3.api.basic_str as h3  # type: ignore
     H3_AVAILABLE = True
-except ImportError:
-    H3_AVAILABLE = False
-    log.warning("h3 library not available. Install with: pip install h3")
+except Exception:
+    try:
+        import h3  # type: ignore
+        # If top-level 'h3' lacks expected functions, try the basic_str submodule
+        if not (hasattr(h3, 'h3_get_resolution') or hasattr(h3, 'get_resolution')):
+            try:
+                import h3.api.basic_str as basic_str  # type: ignore
+                h3 = basic_str
+                H3_AVAILABLE = True
+            except Exception:
+                H3_AVAILABLE = False
+                log.warning("h3 library present but missing expected API. Install 'h3' package >=4.0.0")
+        else:
+            H3_AVAILABLE = True
+    except Exception:
+        H3_AVAILABLE = False
+        log.warning("h3 library not available. Install with: pip install h3")
 
 # Parquet support
 try:
@@ -41,6 +64,76 @@ def autonomys_root_dir() -> Path:
         return Path("C:\\ProgramData\\FryNetworks\\autonomys-measurements")
 
 
+# --- h3 helper wrappers ---------------------------------------------------
+
+def _h3_has(attr: str) -> bool:
+    """Return True if h3 module is available and has attribute 'attr'."""
+    return H3_AVAILABLE and hasattr(h3, attr)
+
+
+def get_hex_resolution(hex_id: str) -> int:
+    """Get H3 resolution for a hex id using available h3 API.
+
+    Raises RuntimeError if h3 isn't available or AttributeError if no
+    suitable resolution lookup exists.
+    """
+    if not H3_AVAILABLE:
+        raise RuntimeError("h3 library not available")
+    # Try v4 API first
+    if _h3_has('get_resolution'):
+        return h3.get_resolution(hex_id)  # type: ignore[attr-defined]
+    # Try v3 API
+    if _h3_has('h3_get_resolution'):
+        return h3.h3_get_resolution(hex_id)  # type: ignore[attr-defined]
+    raise AttributeError("h3 resolution lookup not available on installed h3 module")
+
+
+def get_parent_hex(hex_id: str, target_resolution: int) -> str:
+    """Get the parent (coarser) hex id at the requested resolution."""
+    if not H3_AVAILABLE:
+        raise RuntimeError("h3 library not available")
+    # Try v4 API first
+    if _h3_has('cell_to_parent'):
+        return h3.cell_to_parent(hex_id, target_resolution)  # type: ignore[attr-defined]
+    # Try v3 API variants
+    if _h3_has('h3_to_parent'):
+        return h3.h3_to_parent(hex_id, target_resolution)  # type: ignore[attr-defined]
+    if _h3_has('to_parent'):
+        return h3.to_parent(hex_id, target_resolution)  # type: ignore[attr-defined]
+    raise AttributeError("h3 parent lookup not available on installed h3 module")
+
+
+def get_hex_center(hex_id: str) -> Optional[Tuple[float, float]]:
+    """Get the center lat/lon for a hex cell.
+
+    Args:
+        hex_id: H3 hex ID
+
+    Returns:
+        Tuple of (lat, lon) or None if error
+    """
+    if not H3_AVAILABLE:
+        return None
+
+    try:
+        # Try v4 API first
+        if _h3_has('cell_to_latlng'):
+            lat, lon = h3.cell_to_latlng(hex_id)  # type: ignore[attr-defined]
+            return (lat, lon)
+        # Try v3 API variants
+        if _h3_has('h3_to_geo'):
+            lat, lon = h3.h3_to_geo(hex_id)  # type: ignore[attr-defined]
+            return (lat, lon)
+        if _h3_has('to_geo'):
+            lat, lon = h3.to_geo(hex_id)  # type: ignore[attr-defined]
+            return (lat, lon)
+        log.error('h3 to_geo/cell_to_latlng function not found on installed h3 module')
+        return None
+    except Exception as e:
+        log.error("Failed to get center for hex %s: %s", hex_id, e)
+        return None
+
+
 def ensure_autonomys_structure(hex_id: str, measurement_type: str) -> Tuple[Path, Path]:
     """Ensure the Autonomys folder structure exists for a hex and measurement type.
 
@@ -56,7 +149,7 @@ def ensure_autonomys_structure(hex_id: str, measurement_type: str) -> Tuple[Path
 
     # Get hex resolution from hex_id
     try:
-        resolution = h3.h3_get_resolution(hex_id)
+        resolution = get_hex_resolution(hex_id)
     except Exception as e:
         log.error("Invalid hex_id %s: %s", hex_id, e)
         raise ValueError(f"Invalid H3 hex_id: {hex_id}") from e
@@ -74,25 +167,6 @@ def ensure_autonomys_structure(hex_id: str, measurement_type: str) -> Tuple[Path
 
     return hourly_dir, daily_dir
 
-
-def get_hex_center(hex_id: str) -> Optional[Tuple[float, float]]:
-    """Get the center lat/lon for a hex cell.
-
-    Args:
-        hex_id: H3 hex ID
-
-    Returns:
-        Tuple of (lat, lon) or None if error
-    """
-    if not H3_AVAILABLE:
-        return None
-
-    try:
-        lat, lon = h3.h3_to_geo(hex_id)
-        return (lat, lon)
-    except Exception as e:
-        log.error("Failed to get center for hex %s: %s", hex_id, e)
-        return None
 
 
 def create_or_update_hex_manifest(
@@ -122,7 +196,7 @@ def create_or_update_hex_manifest(
         return False
 
     try:
-        resolution = h3.h3_get_resolution(hex_id)
+        resolution = get_hex_resolution(hex_id)
         root = autonomys_root_dir()
         manifest_path = root / f"res-{resolution}" / hex_id / "manifest.json"
 

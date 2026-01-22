@@ -6,6 +6,8 @@ This document explains the Autonomys Auto Drive integration for FryNetworks meas
 
 The Autonomys integration enables decentralized storage and monetization of measurement data through a hierarchical folder structure optimized for different pricing tiers and data granularity levels.
 
+**Important:** Since Autonomys Auto Drive is publicly accessible, all data uploaded is **automatically redacted** to protect sensitive information while maintaining data value. You can still sell the full, unredacted data separately through private channels.
+
 ## Architecture
 
 ### Data Flow
@@ -79,7 +81,7 @@ export AUTONOMYS_API_KEY=your-api-key-here
 ```python
 from measurements.autonomys_orchestrator import process_yesterday_to_autonomys
 
-# Process yesterday's complete data
+# Process yesterday's complete data with standard redaction
 results = process_yesterday_to_autonomys(
     miner_code="IRM",
     hex_id="871f90151ffffff",
@@ -89,6 +91,8 @@ results = process_yesterday_to_autonomys(
 
 print(results)  # {'radiation': True}
 ```
+
+**Note:** By default, `standard` redaction is applied. See [Data Redaction](#data-redaction) section for details.
 
 ### Test with Today's Data
 
@@ -187,6 +191,110 @@ process_yesterday_to_autonomys(
     upload_to_cloud=True
 )
 ```
+
+## Data Redaction
+
+Since Autonomys Auto Drive is publicly accessible, **all uploaded data is automatically redacted** to protect sensitive information while maintaining analytical value. This allows you to:
+
+1. Share aggregated data publicly on Autonomys (with privacy protection)
+2. Sell the full, unredacted data separately through private channels
+3. Maintain competitive advantage by keeping exact measurements private
+
+### Redaction Levels
+
+Three redaction levels are available:
+
+#### 1. Minimal Redaction (`redaction_level='minimal'`)
+- Round measurement values to 1 decimal place
+- Keep original hex resolution (~5 km²)
+- Keep all metadata
+- **Use case:** Low-sensitivity data where exact values aren't critical
+
+#### 2. Standard Redaction (`redaction_level='standard'`, **default**)
+- Add 5% random noise to measurements
+- Reduce hex precision to resolution 5 (~250 km² area, 50× larger)
+- Remove interface names, install IDs, miner codes
+- Round GPS coordinates to ~10 km precision
+- **Use case:** Balanced privacy and utility for most commercial applications
+
+#### 3. Full Redaction (`redaction_level='full'`)
+- Add 10% random noise to measurements
+- Round values to buckets (e.g., 5 Mbps, 5 dB)
+- Reduce hex precision to resolution 4 (~1,300 km² area, 260× larger)
+- Remove all identifying information
+- **Use case:** Maximum privacy for highly sensitive data
+
+### What Gets Redacted
+
+**Bandwidth measurements:**
+- Interface names removed (standard/full)
+- Download/upload speeds get noise added (standard/full)
+- Values rounded to 5 Mbps buckets (full only)
+
+**Satellite/GNSS measurements:**
+- Exact lat/lon removed (standard/full)
+- Satellite counts and quality metrics kept (useful for analysis)
+
+**Radiation measurements:**
+- CPM/µSv/mR values get 3-10% noise (standard/full)
+- Values rounded to integers (full only)
+
+**Decibel measurements:**
+- Rounded to 1 decimal (standard)
+- Rounded to 5 dB buckets (full)
+
+**Location data (all types):**
+- Hex ID precision reduced (res-7 → res-5 or res-4)
+- GPS coordinates rounded or removed
+
+**Metadata:**
+- Install IDs removed
+- Miner types removed
+- Coverage dates and sample counts kept (useful for buyers)
+
+### Using Custom Redaction Levels
+
+```python
+from measurements.autonomys_orchestrator import process_daily_csv_to_autonomys
+
+# Minimal redaction for low-sensitivity data
+process_daily_csv_to_autonomys(
+    miner_code="BM",
+    measurement_type="bandwidth",
+    hex_id="871f90151ffffff",
+    date_str="20260120",
+    redaction_level='minimal',
+    upload_to_cloud=True
+)
+
+# Full redaction for maximum privacy
+process_daily_csv_to_autonomys(
+    miner_code="IRM",
+    measurement_type="radiation",
+    hex_id="871f90151ffffff",
+    date_str="20260120",
+    redaction_level='full',
+    upload_to_cloud=True
+)
+```
+
+### Selling Unredacted Data
+
+The redacted data on Autonomys serves as a **preview** or **sample** for potential buyers. You can:
+
+1. **Advertise the redacted data** on Autonomys with pricing information
+2. **Sell full-resolution data privately** through direct agreements
+3. **Offer tiered products:**
+   - Free: Redacted data on Autonomys (marketing/lead generation)
+   - Standard: Standard redaction with daily aggregates
+   - Premium: Minimal or no redaction with hourly/raw data
+   - Enterprise: Custom solutions with real-time access
+
+**Example sales flow:**
+1. Buyer discovers your radiation data in downtown Chicago (res-5 hex)
+2. Buyer sees redacted preview showing ~30 CPM average
+3. Buyer contacts you for unredacted data with exact location (res-7)
+4. You provide full dataset privately (not through Autonomys)
 
 ## Data Monetization
 
@@ -354,7 +462,17 @@ See the module docstrings for detailed API documentation:
 
 ## Resources
 
+### Documentation
+- [Data Redaction Quick Start](REDACTION_QUICK_START.md) - Quick overview of redaction system
+- [Data Redaction Strategy](REDACTION_STRATEGY.md) - Complete redaction strategy and business model
+
+### External Resources
 - [Autonomys Auto Drive Documentation](https://develop.autonomys.xyz/sdk/auto-drive)
 - [H3 Hexagon System](https://h3geo.org/)
 - [Apache Parquet Format](https://parquet.apache.org/)
 - [AI3 Storage Dashboard](https://ai3.storage)
+
+### Code References
+- [autonomys_redactor.py](../measurements/autonomys_redactor.py) - Redaction implementation
+- [autonomys_orchestrator.py](../measurements/autonomys_orchestrator.py) - Main integration with redaction
+- [test_redaction.py](../test_redaction.py) - Interactive redaction demo
