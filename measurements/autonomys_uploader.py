@@ -79,6 +79,7 @@ class AutonomysUploader:
         config = Config(
             region_name=region,
             signature_version='s3v4',
+            s3={'addressing_style': 'path'},  # Use path-style addressing for Auto Drive
             retries={'max_attempts': 3, 'mode': 'standard'}
         )
 
@@ -113,28 +114,34 @@ class AutonomysUploader:
             return None
 
         try:
-            extra_args = {}
+            # Read file content
+            with open(local_path, 'rb') as f:
+                file_content = f.read()
+
+            # Prepare kwargs for put_object
+            put_kwargs = {
+                'Bucket': 'uploads',  # Arbitrary bucket name for Auto Drive
+                'Key': remote_path,
+                'Body': file_content
+            }
+
+            # Prepare metadata
+            # Per Auto Drive docs: omit encryption metadata for unencrypted uploads
+            # Only include user-provided metadata if any
             if metadata:
-                # Convert metadata dict to S3 metadata (string keys/values only)
-                extra_args['Metadata'] = {
-                    str(k): str(v) for k, v in metadata.items()
-                }
+                put_kwargs['Metadata'] = {str(k): str(v) for k, v in metadata.items()}
 
-            # Upload file
+            # Upload using put_object for better error handling
             # Note: Auto Drive uses path-based routing, no actual bucket concept
-            # The "bucket" parameter becomes part of the endpoint path
-            self.s3_client.upload_file(
-                str(local_path),
-                'frynetworks-measurements',  # Pseudo-bucket name
-                remote_path,
-                ExtraArgs=extra_args
-            )
+            response = self.s3_client.put_object(**put_kwargs)
 
-            log.info("Uploaded to Auto Drive: %s", remote_path)
+            log.info("Uploaded to Auto Drive: %s (ETag: %s)", remote_path, response.get('ETag', 'N/A'))
             return remote_path
 
         except ClientError as e:
-            log.error("Failed to upload %s: %s", local_path, e)
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            error_msg = e.response.get('Error', {}).get('Message', str(e))
+            log.error("Failed to upload %s (Code: %s): %s", local_path, error_code, error_msg)
             return None
         except Exception as e:
             log.error("Unexpected error uploading %s: %s", local_path, e)

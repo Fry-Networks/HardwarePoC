@@ -25,6 +25,7 @@ OP_REF_BEARER_TOKEN=${OP_REF_BEARER_TOKEN:-"op://VPS/Hardware_API/API_BEARER_TOK
 OP_REF_SIGNING_KEY=${OP_REF_SIGNING_KEY:-"op://VSCode/hardware_exe/local_signing_key_hex"}
 OP_REF_UPDATE_REPO=${OP_REF_UPDATE_REPO:-"op://VSCode/hardware_exe/Github_repo_test"}
 OP_REF_GITHUB_TOKEN=${OP_REF_GITHUB_TOKEN:-"op://VSCode/hardware_exe/Github_token"}
+OP_REF_AUTONOMYS_API_KEY=${OP_REF_AUTONOMYS_API_KEY:-"op://DataStorage/AutoDrive/AUTONOMYS_API_KEY"}
 BEARER_TOKEN=${BEARER_TOKEN:-""}
 SIGNING_KEY=${SIGNING_KEY:-""}
 GITHUB_TOKEN=${GITHUB_TOKEN:-""}
@@ -251,6 +252,15 @@ if [ -n "$sign_key_value" ]; then
   echo "Signing key OK"
 fi
 
+# Autonomys API key (1Password reference)
+AUTONOMYS_API_KEY_VAL=""
+if [ "$USE_1PASSWORD" = true ] && [ -n "$OP_REF_AUTONOMYS_API_KEY" ]; then
+  AUTONOMYS_API_KEY_VAL=$(op read "$OP_REF_AUTONOMYS_API_KEY" 2>/dev/null | tr -d '\n' || echo "")
+fi
+if [ -n "$AUTONOMYS_API_KEY_VAL" ]; then
+  echo "Autonomys API key configured"
+fi
+
 # Create config
 tmp_cfg="_tmp_config.json"
 "$PYTHON_BIN" - <<EOF > "$tmp_cfg"
@@ -281,6 +291,10 @@ if r:
 gh = "$github_tok"
 if gh:
     cfg["github_token"] = gh
+autonomys_key = "${AUTONOMYS_API_KEY_VAL}"
+if autonomys_key:
+  cfg.setdefault("tool_credentials", {})["autonomys_api_key"] = autonomys_key
+  cfg["autonomys_upload_enabled"] = True
 print(json.dumps(cfg))
 EOF
 

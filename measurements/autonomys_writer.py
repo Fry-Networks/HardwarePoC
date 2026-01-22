@@ -55,13 +55,24 @@ except ImportError:
     log.warning("Parquet support not available. Install with: pip install pandas pyarrow")
 
 
-def autonomys_root_dir() -> Path:
-    """Get root directory for Autonomys measurements storage."""
+def autonomys_root_dir(miner_code: Optional[str] = None) -> Path:
+    """Get root directory for measurements storage.
+
+    Args:
+        miner_code: Optional miner code (BM, IDM, etc.) to get miner-specific directory
+
+    Returns:
+        Path to measurements directory (same location as CSV files)
+    """
     try:
         base = Path(os.environ.get("PROGRAMDATA", "C:\\ProgramData"))
-        return base / "FryNetworks" / "autonomys-measurements"
+        if miner_code:
+            return base / "FryNetworks" / f"miner-{miner_code}" / "measurements"
+        return base / "FryNetworks" / "measurements"
     except Exception:
-        return Path("C:\\ProgramData\\FryNetworks\\autonomys-measurements")
+        if miner_code:
+            return Path(f"C:\\ProgramData\\FryNetworks\\miner-{miner_code}\\measurements")
+        return Path("C:\\ProgramData\\FryNetworks\\measurements")
 
 
 # --- h3 helper wrappers ---------------------------------------------------
@@ -134,32 +145,26 @@ def get_hex_center(hex_id: str) -> Optional[Tuple[float, float]]:
         return None
 
 
-def ensure_autonomys_structure(hex_id: str, measurement_type: str) -> Tuple[Path, Path]:
-    """Ensure the Autonomys folder structure exists for a hex and measurement type.
+def ensure_autonomys_structure(hex_id: str, measurement_type: str, miner_code: Optional[str] = None) -> Tuple[Path, Path]:
+    """Ensure the folder structure exists for hourly/daily parquet files.
+
+    Files go directly in measurements/hourly/ alongside CSV files:
+    miner-{code}/measurements/hourly/
 
     Args:
-        hex_id: H3 hex ID (e.g., "871f90151ffffff")
-        measurement_type: Type of measurement (bandwidth, satellite, etc.)
+        hex_id: H3 hex ID (used internally for redaction, not in path)
+        measurement_type: Type of measurement (not used in path, kept for compatibility)
+        miner_code: Miner code (BM, IDM, etc.) to determine miner-specific folder
 
     Returns:
         Tuple of (hourly_dir, daily_dir) paths
     """
-    if not H3_AVAILABLE:
-        raise RuntimeError("h3 library is required for Autonomys integration")
+    # Use the same measurements folder as the CSV files
+    # Parquet files go right alongside CSVs in hourly/ and daily/ subdirectories
+    root = autonomys_root_dir(miner_code)
 
-    # Get hex resolution from hex_id
-    try:
-        resolution = get_hex_resolution(hex_id)
-    except Exception as e:
-        log.error("Invalid hex_id %s: %s", hex_id, e)
-        raise ValueError(f"Invalid H3 hex_id: {hex_id}") from e
-
-    # Build path: autonomys-measurements/res-{resolution}/{hex_id}/{measurement_type}/
-    root = autonomys_root_dir()
-    hex_dir = root / f"res-{resolution}" / hex_id / measurement_type
-
-    hourly_dir = hex_dir / "hourly"
-    daily_dir = hex_dir / "daily"
+    hourly_dir = root / "hourly"
+    daily_dir = root / "daily"
 
     # Create directories
     hourly_dir.mkdir(parents=True, exist_ok=True)
@@ -178,7 +183,10 @@ def create_or_update_hex_manifest(
     install_id: Optional[str] = None,
     miner_code: Optional[str] = None
 ) -> bool:
-    """Create or update the manifest.json file for a hex cell.
+    """Create or update the manifest.json file (stored internally, not uploaded).
+
+    Note: Manifest is no longer created to avoid exposing hex structure to users.
+    This function now only returns True for backwards compatibility.
 
     Args:
         hex_id: H3 hex ID
@@ -190,15 +198,32 @@ def create_or_update_hex_manifest(
         miner_code: Miner type code
 
     Returns:
-        True if successful
+        True (always, for compatibility)
+    """
+    # No longer create manifest files - they would expose the privacy strategy
+    # Upload system will handle metadata internally
+    return True
+
+def _create_internal_manifest(
+    hex_id: str,
+    measurement_type: str,
+    first_timestamp: datetime,
+    last_timestamp: datetime,
+    sample_count: int,
+    install_id: Optional[str] = None,
+    miner_code: Optional[str] = None
+) -> bool:
+    """Internal function to create manifest (not exposed to users).
+
+    This is used internally by the upload system only.
     """
     if not H3_AVAILABLE:
         return False
 
     try:
         resolution = get_hex_resolution(hex_id)
-        root = autonomys_root_dir()
-        manifest_path = root / f"res-{resolution}" / hex_id / "manifest.json"
+        root = autonomys_root_dir(miner_code)
+        manifest_path = root / ".internal" / "manifest.json"
 
         # Load existing manifest or create new
         if manifest_path.exists():

@@ -1,0 +1,17 @@
+{
+  "s3_upload": {
+    "enabled": true,
+    "bucket_name": "frynetworks-measurements",
+    "miner_id": "miner-001",
+    "aws_region": "us-east-1",
+    "aws_access_key_id": "AKIA...",
+    "aws_secret_access_key": "...",
+    "prefix": "original-data"
+  },
+  "notes": {
+    "miner_id": "Unique identifier for this miner (use install_id or custom ID)",
+    "bucket_name": "S3 bucket where original data will be stored",
+    "prefix": "S3 key prefix (default: 'original-data')",
+    "aws_credentials": "Can also be set via environment variables or IAM role"
+  }
+}

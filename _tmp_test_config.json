@@ -1,0 +1,13 @@
+{
+  "external_api": {
+    "base_url": "https://hardwareapi.frynetworks.com",
+    "timeout": 10.0
+  },
+  "interval_seconds": 600,
+  "use_github": true,
+  "software_uptodate": true,
+  "tool_credentials": {
+    "autonomys_api_key": "TEST_AUTONOMYS_KEY_123"
+  },
+  "autonomys_upload_enabled": true
+}

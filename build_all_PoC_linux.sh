@@ -24,6 +24,28 @@ fi
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BUILD_SCRIPT="${SCRIPT_DIR}/build_PoC_linux.sh"
 
+# Default 1Password reference for Autonomys API key (CI can override by setting OPREF_AUTONOMYS_KEY)
+OPREF_AUTONOMYS_KEY=${OPREF_AUTONOMYS_KEY:-"op://VPS/Hardware_API/AUTONOMYS_API_KEY"}
+
+# If `op` is available, try to resolve the Autonomys API key and export it for child build scripts
+if command -v op >/dev/null 2>&1; then
+  if [ -n "$OPREF_AUTONOMYS_KEY" ]; then
+    set +e
+    AUTONOMYS_API_KEY=$(op read "$OPREF_AUTONOMYS_KEY" 2>/dev/null)
+    if [ $? -eq 0 ] && [ -n "$AUTONOMYS_API_KEY" ]; then
+      export AUTONOMYS_API_KEY
+      echo "[OK] Retrieved Autonomys API key from 1Password"
+    else
+      echo "[WARN] Could not read Autonomys API key from 1Password reference: $OPREF_AUTONOMYS_KEY"
+      unset AUTONOMYS_API_KEY
+    fi
+    set -e
+  fi
+fi
+
+# Ensure child builds see the enable flag (embed at build time)
+export AUTONOMYS_UPLOAD_ENABLED=1
+
 if [ ! -x "$BUILD_SCRIPT" ]; then
   echo "Build script not found or not executable: $BUILD_SCRIPT" >&2
   exit 1
@@ -35,7 +57,8 @@ for CODE in "${MINER_CODES[@]}"; do
   echo "\n=============================="
   echo "Building $CODE v$VERSION"
   echo "=============================="
-  "$BUILD_SCRIPT" "$CODE" "$VERSION"
+  # Pass through environment variables so the child build embeds them
+  AUTONOMYS_UPLOAD_ENABLED=${AUTONOMYS_UPLOAD_ENABLED} AUTONOMYS_API_KEY=${AUTONOMYS_API_KEY:-} "$BUILD_SCRIPT" "$CODE" "$VERSION"
 done
 
 echo "\nAll builds completed."

@@ -22,6 +22,8 @@ python test_autonomys_integration.py
 
 **That's it!** The system is ready to process and upload measurements.
 
+> Note: The REST uploader now defaults to the JSON create-session + chunked upload flow (session → chunk → complete). The `measurements.autonomys_uploader_rest` module uses chunked uploads by default for reliability and compatibility with the Autonomys API; if you need the older single-request multipart behavior you can modify `upload_file` in that module.
+
 ## 📚 Documentation
 
 | Document | Purpose | Audience |

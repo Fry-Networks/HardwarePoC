@@ -26,6 +26,9 @@ from .autonomys_aggregator import (
     write_hourly_metadata
 )
 from .autonomys_uploader import get_uploader
+from .autonomys_uploader_native import get_native_uploader
+from .autonomys_uploader_rest import get_rest_uploader
+from .autonomys_uploader_nodejs import get_nodejs_uploader
 from .autonomys_redactor import DataRedactor, get_redaction_level_info
 
 log = logging.getLogger("measurements.autonomys_orchestrator")
@@ -108,12 +111,12 @@ def process_daily_csv_to_autonomys(
 
         log.info("Applied %s redaction to %s data", redaction_level, measurement_type)
 
-        # Get redacted hex_id for folder structure
+        # Get redacted hex_id (used internally, not exposed in folder structure)
         redacted_hex_id = redactor.redact_location(hex_id,
             target_resolution=get_redaction_level_info(redaction_level)['hex_resolution'])
 
-        # Ensure Autonomys folder structure exists (using redacted hex)
-        hourly_dir, daily_dir = ensure_autonomys_structure(redacted_hex_id, measurement_type)
+        # Ensure Autonomys folder structure exists (simple structure, no hex/res exposed)
+        hourly_dir, daily_dir = ensure_autonomys_structure(redacted_hex_id, measurement_type, miner_code)
 
         # Format date for filenames (YYYY-MM-DD)
         date_obj = datetime.strptime(date_str, "%Y%m%d")
@@ -125,74 +128,51 @@ def process_daily_csv_to_autonomys(
             log.error("Failed to write parquet for %s on %s", measurement_type, date_str)
             return False
 
-        # Create and write hourly metadata (using redacted hex_id)
-        metadata = create_hourly_metadata(hourly_df, formatted_date, redacted_hex_id, measurement_type)
+        # Create and write hourly metadata (minimal info, no hex_id exposed)
+        metadata = create_hourly_metadata(hourly_df, formatted_date, None, measurement_type)
         metadata_path = hourly_dir / f"{formatted_date}.meta.json"
         write_hourly_metadata(metadata, metadata_path)
 
-        # Update hex manifest
-        first_timestamp = datetime.fromisoformat(rows[0]['timestamp'])
-        last_timestamp = datetime.fromisoformat(rows[-1]['timestamp'])
-
-        # Create manifest with original hex_id first
-        manifest_created = create_or_update_hex_manifest(
-            hex_id=redacted_hex_id,  # Use redacted hex_id
-            measurement_type=measurement_type,
-            first_timestamp=first_timestamp,
-            last_timestamp=last_timestamp,
-            sample_count=len(rows),
-            install_id=None,  # Don't include install_id in public data
-            miner_code=None   # Don't include miner_code in public data
-        )
-
-        # Apply manifest redaction
-        if manifest_created:
-            from .autonomys_writer import get_hex_resolution, autonomys_root_dir
-            resolution = get_hex_resolution(redacted_hex_id)
-            root = autonomys_root_dir()
-            manifest_path = root / f"res-{resolution}" / redacted_hex_id / "manifest.json"
-
-            if manifest_path.exists():
-                import json
-                with open(manifest_path, 'r', encoding='utf-8') as f:
-                    manifest = json.load(f)
-
-                # Redact the manifest
-                redacted_manifest = redactor.redact_manifest(manifest, redacted_hex_id)
-
-                # Write back redacted version
-                with open(manifest_path, 'w', encoding='utf-8') as f:
-                    json.dump(redacted_manifest, f, indent=2)
-
-        # Update root metadata
-        create_or_update_root_metadata()
+        # Note: No manifest files created to avoid exposing privacy strategy to users
 
         # Upload to Autonomys Auto Drive if requested
         if upload_to_cloud:
-            uploader = get_uploader()
-            if uploader:
+            # Use REST API uploader (pure Python, no Node.js required)
+            rest_uploader = get_rest_uploader()
+            if rest_uploader:
                 try:
-                    # Upload parquet file (using redacted hex_id)
-                    from .autonomys_writer import get_hex_resolution
-                    resolution = get_hex_resolution(redacted_hex_id)
-                    remote_path = f"res-{resolution}/{redacted_hex_id}/{measurement_type}/hourly/{formatted_date}.parquet"
-                    uploader.upload_file(parquet_path, remote_path)
+                    # Parse date for proper naming
+                    date_obj = datetime.strptime(date_str, "%Y%m%d")
+
+                    # Upload parquet file with flat naming
+                    # Format: {hexId}_{measurement_type}_YYYY-MM-DD.parquet
+                    cid_parquet = rest_uploader.upload_daily_file(
+                        local_path=parquet_path,
+                        hex_id=redacted_hex_id,
+                        measurement_type=measurement_type,
+                        date=date_obj
+                    )
 
                     # Upload metadata file
-                    remote_meta_path = f"res-{resolution}/{redacted_hex_id}/{measurement_type}/hourly/{formatted_date}.meta.json"
-                    uploader.upload_file(metadata_path, remote_meta_path)
+                    # Format: {hexId}_{measurement_type}_YYYY-MM-DD.meta.json
+                    cid_meta = rest_uploader.upload_daily_file(
+                        local_path=metadata_path,
+                        hex_id=redacted_hex_id,
+                        measurement_type=measurement_type,
+                        date=date_obj
+                    )
 
-                    # Upload redacted manifest
-                    manifest_remote_path = f"res-{resolution}/{redacted_hex_id}/manifest.json"
-                    uploader.upload_file(manifest_path, manifest_remote_path)
+                    if cid_parquet and cid_meta:
+                        log.info("Uploaded redacted %s data to Autonomys (CID: %s, privacy-protected)",
+                                 measurement_type, cid_parquet)
+                    else:
+                        log.warning("Partial upload failure for %s", measurement_type)
 
-                    log.info("Uploaded redacted %s data to Autonomys Auto Drive (redaction: %s)",
-                             measurement_type, redaction_level)
                 except Exception as e:
                     log.error("Failed to upload to Autonomys: %s", e)
                     # Don't fail the whole operation if upload fails
             else:
-                log.warning("Autonomys uploader not available, skipping cloud upload")
+                log.warning("Autonomys REST uploader not available, skipping cloud upload")
 
         return True
 

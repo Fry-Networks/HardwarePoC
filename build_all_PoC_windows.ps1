@@ -48,6 +48,7 @@ param(
     [string]$OPRefBearerToken = "op://VPS/Hardware_API/API_BEARER_TOKEN",
     
     [string]$OPRefSigningKey = "op://VSCode/hardware_exe/local_signing_key_hex",
+    [string]$OPRefAutonomysKey = "op://VPS/Hardware_API/AUTONOMYS_API_KEY",
     
     [int]$IntervalSeconds = 600,
     
@@ -84,6 +85,7 @@ try {
 Write-Host "Retrieving secrets from 1Password..." -ForegroundColor Yellow
 $bearerToken = $null
 $signingKey = $null
+$autonomysKey = $null
 
 if ($OPRefBearerToken -and $OPRefBearerToken -ne "") {
     try {
@@ -108,6 +110,21 @@ if ($OPRefSigningKey -and $OPRefSigningKey -ne "") {
         }
     } catch {
         Write-Warning "Failed to retrieve signing key: $_"
+    }
+}
+
+if ($OPRefAutonomysKey -and $OPRefAutonomysKey -ne "") {
+    try {
+        $autonomysKey = & op read $OPRefAutonomysKey 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "[OK] Autonomys API key retrieved" -ForegroundColor Green
+        } else {
+            Write-Warning "Failed to retrieve Autonomys API key: $autonomysKey"
+            $autonomysKey = $null
+        }
+    } catch {
+        Write-Warning "Failed to retrieve Autonomys API key: $_"
+        $autonomysKey = $null
     }
 }
 
@@ -143,6 +160,13 @@ function Build-Miner {
         
         if ($BuildParams.Sign) {
             $params.Sign = $true
+        }
+        # Inject Autonomys upload enable flag and API key so builds embed them
+        if ($BuildParams.AutonomysUploadEnabled) {
+            $params.AutonomysUploadEnabled = $BuildParams.AutonomysUploadEnabled
+        }
+        if ($BuildParams.AutonomysApiKey) {
+            $params.AutonomysApiKey = $BuildParams.AutonomysApiKey
         }
         
         & $buildScript @params
@@ -180,6 +204,8 @@ $buildParams = @{
     SigningKey = $signingKey
     IntervalSeconds = $IntervalSeconds
     Sign = $Sign
+    AutonomysUploadEnabled = $true
+    AutonomysApiKey = $autonomysKey
 }
 
 Write-Host "`n============================================================" -ForegroundColor Cyan

@@ -5096,6 +5096,8 @@ def main() -> None:
     warned_version = False
     last_version_check_hour: Optional[dt.datetime] = None
     next_slot_time: Optional[dt.datetime] = None
+    # Track last Autonomys daily upload target (YYYYMMDD) to avoid duplicate runs
+    last_autonomys_target: Optional[str] = None
 
     while True:
         refresh_software_version()
@@ -5304,6 +5306,59 @@ def main() -> None:
                     pod_status=pod_slot_ok,
                 )
                 pending_pol_update = None
+
+                # --- Daily Autonomys upload (run once/day shortly after midnight UTC) ---
+                try:
+                    enabled = os.environ.get('AUTONOMYS_UPLOAD_ENABLED') or os.environ.get('AUTONOMYS_UPLOADS_ENABLED')
+                    # If not present in env, allow a build-time config JSON to enable uploads
+                    if not enabled:
+                        try:
+                            build_cfg = os.path.join(app_dir(), "config", "autonomys_build.json")
+                            if os.path.exists(build_cfg):
+                                with open(build_cfg, "r", encoding="utf-8") as bf:
+                                    bc = json.load(bf)
+                                # accept bool or string values
+                                b_enabled = bc.get("autonomys_upload_enabled") or bc.get("autonomys_uploads_enabled")
+                                if isinstance(b_enabled, bool):
+                                    enabled = "true" if b_enabled else "false"
+                                elif isinstance(b_enabled, (int, float)):
+                                    enabled = "true" if int(b_enabled) else "false"
+                                elif isinstance(b_enabled, str) and b_enabled.strip():
+                                    enabled = b_enabled
+                                # inject API key from build config into env if provided
+                                api_key = bc.get("autonomys_api_key") or bc.get("AUTONOMYS_API_KEY")
+                                if isinstance(api_key, str) and api_key.strip() and not os.environ.get("AUTONOMYS_API_KEY"):
+                                    os.environ["AUTONOMYS_API_KEY"] = api_key.strip()
+                        except Exception:
+                            pass
+
+                    if isinstance(enabled, str) and enabled.strip().lower() in _TRUE_SET:
+                        # target is yesterday
+                        target_date = (slot_ts - dt.timedelta(days=1)).strftime("%Y%m%d")
+                        # run once per target_date when we observe the first midnight slot
+                        if last_autonomys_target != target_date and slot_ts.hour == 0 and slot_ts.minute == 0:
+                            try:
+                                # Import here to avoid heavy imports at module load
+                                from measurements.autonomys_orchestrator import process_yesterday_to_autonomys
+
+                                # Determine hex id to use for upload
+                                hex_for_upload = None
+                                try:
+                                    hex_for_upload = registered_hexid_from_devices(client, miner_key)
+                                except Exception:
+                                    hex_for_upload = pol_hex_registered or None
+
+                                if not hex_for_upload:
+                                    log.warning("Autonomys upload skipped: no registered hexId available")
+                                else:
+                                    log.info("Starting Autonomys daily upload for %s (date=%s)", hex_for_upload, target_date)
+                                    results = process_yesterday_to_autonomys(MINER_CODE, hex_for_upload, install_id=install_id, upload_to_cloud=True)
+                                    log.info("Autonomys daily upload results: %s", results)
+                                    last_autonomys_target = target_date
+                            except Exception as e:
+                                log.error("Autonomys daily upload failed: %s", e)
+                except Exception:
+                    pass
 
                 # Refresh installation heartbeat
                 try:

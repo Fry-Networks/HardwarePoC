@@ -13,7 +13,7 @@
 - **What it does:**
   - Adds noise to measurement values
   - Coarsens location precision (res-7 → res-5/res-4)
-  - Removes identifying information (install IDs, interfaces, miner codes)
+  - Removes interface information
   - Redacts manifests and metadata
 
 ### 2. Integrated Into Pipeline
@@ -89,7 +89,7 @@ process_daily_csv_to_autonomys(
 | Level | Location | Measurements | Identifiers | Use Case |
 |-------|----------|--------------|-------------|----------|
 | **minimal** | res-7 (~5 km²) | Rounded to 1 decimal | Kept | Low-sensitivity data |
-| **standard** ⭐ | res-5 (~250 km²) | +5% noise | Removed | **Recommended default** |
+| **standard** ⭐ | res-5 (~252 km²) | +5% noise | Removed | **Recommended default** |
 | **full** | res-4 (~1,300 km²) | +10% noise, bucketed | Removed | Maximum privacy |
 
 ## File Structure
@@ -128,6 +128,38 @@ C:\ProgramData\FryNetworks\autonomys-measurements\
 │   Enterprise:   │  $500-1000/hex/month (no redaction, exact GPS)
 └─────────────────┘
 ```
+
+## Storage Locations
+
+### Two Separate Paths (Maximum Security)
+
+**Original Data (Never Uploaded):**
+```
+C:\ProgramData\FryNetworks\measurements\
+  +-- decibel\
+      +-- hourly\
+          +-- 2026-01-22.parquet
+              - dbfs_avg: -41.77 (exact)
+              - dbfs_min: -45.1 (exact)
+              - dbfs_max: -38.7 (exact)
+              - hex_id: 871f90151ffffff (res-7)
+```
+
+**Redacted Data (Uploaded to Autonomys):**
+```
+C:\ProgramData\FryNetworks\autonomys-measurements\
+  +-- res-5\
+      +-- 851f901ffffffff\
+          +-- decibel\
+              +-- hourly\
+                  +-- 2026-01-22.parquet
+                      - dbfs_avg: -41.8 (rounded)
+                      - dbfs_min: -45.1
+                      - dbfs_max: -38.7
+                      - hex_id: 851f901ffffffff (res-5, coarsened)
+```
+
+📖 **See [docs/STORAGE_STRUCTURE.md](docs/STORAGE_STRUCTURE.md) for complete details**
 
 ## Testing
 
@@ -168,17 +200,14 @@ C:\ProgramData\FryNetworks\autonomys-measurements\res-5\
 ✅ **Original data never uploaded** - Full-resolution data (res-7) stays local
 ✅ **Irreversible redaction** - Random noise cannot be reversed
 ✅ **Location privacy** - Hex coarsening protects exact locations
-✅ **Identity protection** - Install IDs and miner codes removed
 ✅ **Configurable levels** - Choose privacy/utility tradeoff per dataset
 
 ## What Gets Protected
 
 | Data Item | Before | After (Standard) |
 |-----------|--------|------------------|
-| Location | 871f90151ffffff (res-7, ~5 km²) | 851f901ffffffff (res-5, ~250 km²) |
+| Location | 871f90151ffffff (res-7, ~5 km²) | 851f901ffffffff (res-5, ~252 km²) |
 | Download | 85.327 Mbps | 84.1 Mbps (±5% noise) |
-| Interface | "wlan0" | "REDACTED" |
-| Install ID | "550e8400-e29b..." | Removed |
 | GPS | 40.712776, -74.005974 | 40.7, -74.0 |
 
 ## Quick Start for Your Colleague

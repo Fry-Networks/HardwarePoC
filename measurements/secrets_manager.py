@@ -28,12 +28,13 @@ def get_from_1password(item_name: str, field_name: str = "credential") -> Option
     """
     try:
         # Try to get secret using 1Password CLI
-        # Format: op item get "Item Name" --field "field_name"
+        # Format: op item get "Item Name" --field "field_name" --reveal
+        # The --reveal flag is needed to get the actual secret value
         result = subprocess.run(
-            ["op", "item", "get", item_name, "--field", field_name],
+            ["op", "item", "get", item_name, "--field", field_name, "--reveal"],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=30,
             check=False
         )
 
@@ -99,7 +100,13 @@ def get_autonomys_api_key() -> Optional[str]:
     except Exception as e:
         log.debug("Could not retrieve embedded Autonomys key: %s", e)
 
-    # Try 1Password CLI direct read (production build path)
+    # Try 1Password item "AutoDrive" (production setup)
+    api_key = get_from_1password("AutoDrive", "AUTONOMYS_API_KEY")
+    if api_key:
+        log.info("Using Autonomys API key from 1Password (AutoDrive)")
+        return api_key
+
+    # Try 1Password CLI direct read (alternative path)
     api_key = get_from_1password("Hardware/Autonomys", "api_key")
     if api_key:
         log.info("Using Autonomys API key from 1Password CLI (op://Hardware/Autonomys/api_key)")
@@ -172,7 +179,7 @@ def test_1password_connection() -> bool:
             ["op", "account", "list"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=30,
             check=False
         )
 

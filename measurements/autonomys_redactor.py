@@ -296,7 +296,7 @@ REDACTION_LEVELS = {
     },
     'standard': {
         'description': 'Standard redaction - noise + coarser location',
-        'hex_resolution': 5,  # ~250 km² (50x larger area)
+        'hex_resolution': 5,  # ~252 km² (50x larger area)
         'add_noise': True,
         'noise_percent': 5.0,
         'remove_identifiers': True

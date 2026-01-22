@@ -1,0 +1,10 @@
+# S3 upload dependencies for miner-side original data backup
+
+# AWS SDK for Python
+boto3>=1.34.0
+
+# Note: This is optional. Install only on miners that need S3 upload capability.
+# If not installed, S3 upload will be gracefully disabled.
+
+# Installation:
+#   pip install -r requirements-s3.txt

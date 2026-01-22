@@ -337,7 +337,7 @@ def write_hourly_parquet(
 def create_hourly_metadata(
     hourly_df: pd.DataFrame,
     date_str: str,
-    hex_id: str,
+    hex_id: Optional[str],
     measurement_type: str
 ) -> Dict[str, Any]:
     """Create metadata for hourly parquet file.
@@ -345,7 +345,7 @@ def create_hourly_metadata(
     Args:
         hourly_df: Hourly aggregated data
         date_str: Date string (YYYY-MM-DD)
-        hex_id: H3 hex ID
+        hex_id: H3 hex ID (optional, None to hide from metadata)
         measurement_type: Type of measurement
 
     Returns:
@@ -356,13 +356,16 @@ def create_hourly_metadata(
 
     metadata = {
         "date": date_str,
-        "hex_id": hex_id,
         "measurement_type": measurement_type,
         "aggregation": "hourly",
         "hours": len(hourly_df),
         "total_samples": int(hourly_df['sample_count'].sum()),
         "summary": {}
     }
+
+    # Only include hex_id if provided (for privacy)
+    if hex_id is not None:
+        metadata["hex_id"] = hex_id
 
     # Add type-specific summaries
     if measurement_type == 'bandwidth':

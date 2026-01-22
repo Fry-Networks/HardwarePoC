@@ -431,6 +431,14 @@ try {
       }
     } catch { Write-Warning "Autonomys credentials unavailable: $_" }
 
+    # If we embedded an Autonomys API key, also enable uploads at runtime
+    try {
+      if ($toolCreds.ContainsKey('autonomys_api_key')) {
+        $cfg.autonomys_upload_enabled = $true
+        Write-Host "Autonomys upload enabled (embedded)"
+      }
+    } catch {}
+
     if ($toolCreds.Count -gt 0) {
       $cfg.tool_credentials = $toolCreds
     }
