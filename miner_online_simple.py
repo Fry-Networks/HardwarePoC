@@ -5310,25 +5310,22 @@ def main() -> None:
                 # --- Daily Autonomys upload (run once/day shortly after midnight UTC) ---
                 try:
                     enabled = os.environ.get('AUTONOMYS_UPLOAD_ENABLED') or os.environ.get('AUTONOMYS_UPLOADS_ENABLED')
-                    # If not present in env, allow a build-time config JSON to enable uploads
+                    # If not present in env, check embedded config (from build-time 1Password)
                     if not enabled:
                         try:
-                            build_cfg = os.path.join(app_dir(), "config", "autonomys_build.json")
-                            if os.path.exists(build_cfg):
-                                with open(build_cfg, "r", encoding="utf-8") as bf:
-                                    bc = json.load(bf)
-                                # accept bool or string values
-                                b_enabled = bc.get("autonomys_upload_enabled") or bc.get("autonomys_uploads_enabled")
-                                if isinstance(b_enabled, bool):
-                                    enabled = "true" if b_enabled else "false"
-                                elif isinstance(b_enabled, (int, float)):
-                                    enabled = "true" if int(b_enabled) else "false"
-                                elif isinstance(b_enabled, str) and b_enabled.strip():
-                                    enabled = b_enabled
-                                # inject API key from build config into env if provided
-                                api_key = bc.get("autonomys_api_key") or bc.get("AUTONOMYS_API_KEY")
-                                if isinstance(api_key, str) and api_key.strip() and not os.environ.get("AUTONOMYS_API_KEY"):
-                                    os.environ["AUTONOMYS_API_KEY"] = api_key.strip()
+                            embedded_cfg = load_config()
+                            b_enabled = embedded_cfg.get("autonomys_upload_enabled") or embedded_cfg.get("autonomys_uploads_enabled")
+                            if isinstance(b_enabled, bool):
+                                enabled = "true" if b_enabled else "false"
+                            elif isinstance(b_enabled, (int, float)):
+                                enabled = "true" if int(b_enabled) else "false"
+                            elif isinstance(b_enabled, str) and b_enabled.strip():
+                                enabled = b_enabled
+                            # inject API key from embedded config into env if provided
+                            tool_creds = embedded_cfg.get("tool_credentials", {})
+                            api_key = tool_creds.get("autonomys_api_key")
+                            if isinstance(api_key, str) and api_key.strip() and not os.environ.get("AUTONOMYS_API_KEY"):
+                                os.environ["AUTONOMYS_API_KEY"] = api_key.strip()
                         except Exception:
                             pass
 

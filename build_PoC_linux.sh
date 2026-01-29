@@ -43,13 +43,19 @@ OPEN_1P=${OPEN_1P:-false}
 COMPANY_NAME=${COMPANY_NAME:-"Fry Networks LLC"}
 PRODUCT_NAME=${PRODUCT_NAME:-""}
 FILE_DESCRIPTION=${FILE_DESCRIPTION:-""}
+ARCH=${ARCH:-""}  # Set to "aarch64" for ARM64 Docker cross-build
+DOCKER_IMAGE=${DOCKER_IMAGE:-"python:3.11-slim"}
 
 # Install Python packages
 "$PYTHON_BIN" -m pip install --upgrade pip
 
-packages=('pyinstaller' 'psutil' 'requests' 'cryptography' 'sounddevice' 'pyserial' 'numpy' 'matplotlib' 'h3' 'pillow' 'shapely' 'geoip2')
+base_packages=(pyinstaller psutil requests cryptography h3 pillow)
+optional_packages=(sounddevice pyserial numpy matplotlib shapely geoip2)
+packages=()
 if [ "$BUILD_GUI" = true ]; then
-  packages+=('PySide6')
+  packages=("${base_packages[@]}" "${optional_packages[@]}" PySide6)
+else
+  packages=("${base_packages[@]}")
 fi
 
 echo "Installing Python packages: ${packages[*]}"
@@ -352,10 +358,21 @@ with open(src_path, 'w') as f:
 " $line_num "$dlt" "$dlp" "$knt" "$knp" "$src_path"
 
 # Build service
-svc_name="FRY_PoC_${CODE}_v${VERSION}"
+arch_suffix=""
+if [ -n "$ARCH" ]; then
+  arch_suffix="_linux_${ARCH}"
+fi
+svc_name="FRY_PoC_${CODE}_v${VERSION}${arch_suffix}"
 svc_dist_dir="dist/svc/${CODE}"
 mkdir -p "$svc_dist_dir"
-svc_args=(--clean --onefile --noconsole --noconfirm --name "$svc_name" --collect-binaries h3 --collect-all shapely --collect-all geoip2 --distpath "$svc_dist_dir")
+svc_args=(--clean --onefile --noconsole --noconfirm --name "$svc_name" --distpath "$svc_dist_dir")
+
+# For GUI/full bundles include native collects; for service-only builds add explicit excludes
+if [ "$BUILD_GUI" = true ]; then
+  svc_args+=(--collect-binaries h3 --collect-all shapely --collect-all geoip2)
+else
+  svc_args+=(--exclude-module pyarrow --exclude-module pandas --exclude-module PySide6 --exclude-module matplotlib --exclude-module numpy --exclude-module sounddevice --exclude-module portaudio --exclude-module pyside6)
+fi
 
 # Icon resolution
 icon_base=""
@@ -392,7 +409,27 @@ if [ -n "$TLS_CA_FILE" ]; then
 fi
 
 # Build
-"$PYTHON_BIN" -m PyInstaller "${svc_args[@]}" miner_online_simple.py
+if [ "$ARCH" = "aarch64" ]; then
+  echo "=== Docker cross-build for linux/arm64 ==="
+  if ! command -v docker >/dev/null; then
+    echo "Error: Docker is required for aarch64 cross-builds but was not found on PATH."
+    exit 1
+  fi
+  project_dir="$(pwd)"
+  docker run --rm --platform linux/arm64 \
+    -v "$project_dir:/build" \
+    -w /build \
+    -e DEBIAN_FRONTEND=noninteractive \
+    "$DOCKER_IMAGE" bash -c "
+      set -e
+      apt-get update -qq && apt-get install -y -qq binutils >/dev/null 2>&1
+      pip install --quiet --upgrade pip
+      pip install --quiet ${packages[*]}
+      python3 -m PyInstaller ${svc_args[*]} miner_online_simple.py
+    "
+else
+  "$PYTHON_BIN" -m PyInstaller "${svc_args[@]}" miner_online_simple.py
+fi
 svc_built="$svc_dist_dir/$svc_name"
 
 # Signing (placeholder for Linux)
@@ -410,6 +447,10 @@ out="release/$CODE"
 mkdir -p "$out"
 mv "$svc_built" "$out/$svc_name"
 
+# Generate sha256 checksum
+(cd "$out" && sha256sum "$svc_name" > "$svc_name.sha256")
+echo "SHA256 checksum written to $out/$svc_name.sha256"
+
 # Clean up
 if [ "$patched" = true ]; then
   mv "$bak_path" "$src_path"
@@ -417,4 +458,8 @@ if [ "$patched" = true ]; then
   rm -f "$enc_tmp"
 fi
 
-echo "Build complete for $CODE v$VERSION"
+if [ -n "$ARCH" ]; then
+  echo "Build complete for $CODE v$VERSION (arch: $ARCH)"
+else
+  echo "Build complete for $CODE v$VERSION"
+fi

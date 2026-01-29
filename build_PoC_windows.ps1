@@ -47,9 +47,15 @@ param(
 
 py -m pip install --upgrade pip
 
-# Install Python packages. If we're not building the GUI, skip heavy GUI deps like PySide6
-$packages = @('pyinstaller','psutil','requests','cryptography','sounddevice','pyserial','numpy','matplotlib','h3','pillow','shapely','geoip2')
-if ($BuildGUI) { $packages += 'PySide6' }
+# Install Python packages.
+# Keep a minimal base set for service-only builds; add heavy/GUI deps only when building GUI.
+$basePackages = @('pyinstaller','psutil','requests','cryptography','h3','pillow','pandas','pyarrow')
+$optionalPackages = @('sounddevice','pyserial','numpy','matplotlib','shapely','geoip2')
+if ($BuildGUI) {
+  $packages = $basePackages + $optionalPackages + @('PySide6')
+} else {
+  $packages = $basePackages
+}
 
 Write-Host "Installing Python packages: $($packages -join ', ')"
 py -m pip install $packages
@@ -481,7 +487,22 @@ function Invoke-CodeSigning { param([string]$Path) if (-not (Test-Path $Path)) {
 # Build service
 $SvcName = "FRY_PoC_${Code}_v${Version}"; 
 $svcDistDir = Join-Path $PWD ("dist\\svc\\${Code}")
-$svcArgs = @('--clean','--onefile','--noconsole','--noconfirm','--name', $SvcName, '--collect-binaries','h3','--collect-all','shapely','--collect-all','geoip2','--distpath', $svcDistDir)
+$svcArgs = @('--clean','--onefile','--noconsole','--noconfirm','--name', $SvcName, '--distpath', $svcDistDir)
+
+# For GUI/full bundles include native collects; for service-only builds add explicit excludes
+if ($BuildGUI) {
+  $svcArgs += @('--collect-binaries','h3','--collect-all','shapely','--collect-all','geoip2')
+} else {
+  # Exclude heavy optional modules that are not needed for a headless/service build
+  # Note: numpy is required by pandas (for Autonomys), so it's not excluded
+  $svcArgs += @(
+    '--exclude-module','PySide6',
+    '--exclude-module','matplotlib',
+    '--exclude-module','sounddevice',
+    '--exclude-module','portaudio',
+    '--exclude-module','pyside6'
+  )
+}
   
  # ----- Icon resolution & conversion (supports .ico, .png, .jpg) -----
   $iconBase = switch ($Code.ToUpper()) { 'BM'{'BM'} 'IDM'{'DB'} 'ODM'{'DB'} 'ISM'{'GNSS'} 'OSM'{'GNSS'} 'RDN'{'NODE'} 'SVN'{'NODE'} 'SDN'{'NODE'} 'AEM'{'AEM'} 'IRM' {'RAD'} default{'frynetworks_logo'} }

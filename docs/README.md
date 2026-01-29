@@ -71,6 +71,18 @@ This service runs on miner hardware to:
 - `signtool.exe` for Windows signing
 - GeoLite2 country database for location verification
 
+### Build Command (Linux)
+
+```bash
+# Native x86_64 build
+./build_PoC_linux.sh ISM 2.0.0
+
+# Cross-build for aarch64 (ARM64) via Docker
+ARCH=aarch64 ./build_PoC_linux.sh ISM 2.0.0
+```
+
+The aarch64 build requires Docker with `--platform linux/arm64` support (Docker Desktop or `binfmt_misc` + QEMU on Linux). Output: `release/ISM/FRY_PoC_ISM_v2.0.0_linux_aarch64`.
+
 ### Build Command (Windows)
 
 ```powershell
@@ -543,3 +555,4 @@ Proprietary - Fry Networks LLC
 For build issues or installer integration questions, refer to:
 - `docs/BUILD_GUIDE.md` - Comprehensive build instructions
 - `docs/ENCRYPTED_MINER_CONFIG_SOLUTION.md` - Security architecture details
+- `docs/ISM_DropWireless_Runbook.md` - DropWireless ISM deployment guide (Linux aarch64)
