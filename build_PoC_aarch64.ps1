@@ -35,7 +35,7 @@ if (-not $Skip1Password) {
     }
 
     Write-Host "Resolving credentials from 1Password..."
-    $bearer       = (op read "op://VPS/Hardware_API/API_BEARER_TOKEN" 2>$null).Trim()
+    $bearer       = (op read "op://HardwareAPI/Hardware_API/API_BEARER_TOKEN" 2>$null).Trim()
     $signingKey   = (op read "op://VSCode/hardware_exe/local_signing_key_hex" 2>$null).Trim()
     $githubToken  = (op read "op://VSCode/hardware_exe/Github_token" 2>$null).Trim()
     $autonomysKey = (op read "op://DataStorage/AutoDrive/AUTONOMYS_API_KEY" 2>$null).Trim()

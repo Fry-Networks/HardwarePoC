@@ -53,7 +53,7 @@ def collect_and_write_bandwidth_live(miner_code: str) -> bool:
         bw = collect_bandwidth_live()
         if bw:
             row = {
-                "timestamp": dt.datetime.now().isoformat(),
+                "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
                 **bw
             }
             return append_row("bandwidth", miner_code, row)

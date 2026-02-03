@@ -4,7 +4,7 @@ param(
   [int]$VersionCheckSec = 600,
   [switch]$Use1Password = $true,
   [switch]$UseGithub = $true,
-  [string]$OPRefBearerToken = "op://VPS/Hardware_API/API_BEARER_TOKEN",
+  [string]$OPRefBearerToken = "op://HardwareAPI/Hardware_API/API_BEARER_TOKEN",
   [string]$OPRefSigningKey = "op://VSCode/hardware_exe/local_signing_key_hex",
   [string]$OPRefUpdateRepo = "op://VSCode/hardware_exe/Github_repo_test",
   [string]$OPRefGithubToken = "op://VSCode/hardware_exe/Github_token",
@@ -20,8 +20,8 @@ param(
   [string]$OPRefDiiiscoNodeKey = "op://Hardware/Diiisco/node_key",
   [string]$OPRefSpaceAcresFarmerKey = "op://Hardware/SpaceAcres/farmer_key",
   [string]$OPRefSpaceAcresRewardAddr = "op://Hardware/SpaceAcres/reward_address",
-  [string]$OPRefBrightApiToken = "op://Hardware/Bright/api_token",
-  [string]$OPRefHoneygainApiKey = "op://Hardware/Honeygain/api_key",
+  [string]$OPRefBrightApiToken = "op://Bandwidth Miners/Bright Data SDK Login/APP_ID",
+  [string]$OPRefHoneygainApiKey = "op://Bandwidth Miners/Honeygain SDK API/credential",
 
   [string]$OPRefMystPayoutAddr = "op://Bandwidth Miners/Mysterium SDK API/MYST_PAYOUT_ADDR",
   [string]$OPRefMystRegistrationToken = "op://Bandwidth Miners/Mysterium SDK API/MYST_REG_TOKEN",
@@ -29,6 +29,8 @@ param(
 
   # Autonomys Auto Drive
   [string]$OPRefAutonomysApiKey = "op://DataStorage/AutoDrive/AUTONOMYS_API_KEY",
+  [string]$AutonomysApiKey = "",           # Direct Autonomys API key value (bypasses 1Password)
+  [bool]$AutonomysUploadEnabled = $true,  # Enable Autonomys upload at runtime
 
   [int]$IntervalSeconds = 600,
   [string]$TlsCAFile = "",
@@ -47,17 +49,47 @@ param(
 
 py -m pip install --upgrade pip
 
-# Install Python packages.
-# Keep a minimal base set for service-only builds; add heavy/GUI deps only when building GUI.
-$basePackages = @('pyinstaller','psutil','requests','cryptography','h3','pillow','pandas','pyarrow')
-$optionalPackages = @('sounddevice','pyserial','numpy','matplotlib','shapely','geoip2')
-if ($BuildGUI) {
-  $packages = $basePackages + $optionalPackages + @('PySide6')
-} else {
-  $packages = $basePackages
+# ---------- Group Map (needed early for per-group package selection) ----------
+$groupMap = @{
+  'BM'  = 'Bandwidth'
+  'IDM' = 'Decibel'
+  'ODM' = 'Decibel'
+  'ISM' = 'Satellite'
+  'OSM' = 'Satellite'
+  'RDN' = 'Node'
+  'SDN' = 'Node'
+  'SVN' = 'Node'
+  'AEM' = 'AI'
+  'IRM' = 'Radiation'
 }
+$group = $groupMap[$Code.ToUpper()]
+if (-not $group) { $group = 'Unknown' }
 
-Write-Host "Installing Python packages: $($packages -join ', ')"
+# Install Python packages per miner group to minimise bundle size.
+$corePackages = @('pyinstaller','psutil','requests','cryptography','h3','pillow','pandas','pyarrow')
+$commonOptional = @('shapely','geoip2','boto3')
+
+# Per-group extra packages (hardware-specific)
+$groupExtraPackages = @{
+  'Bandwidth' = @()
+  'Decibel'   = @('sounddevice','numpy')
+  'Satellite' = @('pyserial')
+  'Node'      = @()
+  'AI'        = @()
+  'Radiation' = @('pyserial')
+}
+$extraPkgs = $groupExtraPackages[$group]
+if (-not $extraPkgs) { $extraPkgs = @() }
+
+if ($BuildGUI) {
+  $packages = $corePackages + $commonOptional + $extraPkgs + @('numpy','matplotlib','PySide6')
+} else {
+  $packages = $corePackages + $commonOptional + $extraPkgs
+}
+# Deduplicate
+$packages = $packages | Select-Object -Unique
+
+Write-Host "Installing Python packages for $($Code.ToUpper()) ($group): $($packages -join ', ')"
 py -m pip install $packages
 
 # ---------- Metadata Mapping ----------
@@ -190,18 +222,7 @@ Write-Host "=== Building $Code v$Version ==="
 
 # Generate config_profile.py for the specific miner type and version
 $configProfilePath = Join-Path $PWD "config_profile.py"
-$groupMap = @{
-  'BM'  = 'Bandwidth'
-  'IDM' = 'Decibel'
-  'ODM' = 'Decibel'
-  'ISM' = 'Satellite'
-  'OSM' = 'Satellite'
-  'RDN' = 'Node'
-  'SDN' = 'Node'
-  'SVN' = 'Node'
-  'AEM' = 'AI'
-  'IRM' = 'Radiation'
-}
+# $groupMap already defined above (used for per-group package selection)
 $displayNameMap = @{
   'BM'  = 'Bandwidth Miner'
   'IDM' = 'Indoor Decibel Miner'
@@ -227,10 +248,9 @@ $metricLabelMap = @{
   'IRM' = 'Radiation'
 }
 
-$group = $groupMap[$Code.ToUpper()]
+# $group already resolved above
 $displayName = $displayNameMap[$Code.ToUpper()]
 $metricLabel = $metricLabelMap[$Code.ToUpper()]
-if (-not $group) { $group = 'Unknown' }
 if (-not $displayName) { $displayName = "$Code Miner" }
 if (-not $metricLabel) { $metricLabel = 'Metric' }
 
@@ -426,9 +446,12 @@ try {
       }
     } catch { Write-Warning "Honeygain credentials unavailable: $_" }
 
-    # Autonomys Auto Drive
+    # Autonomys Auto Drive: direct value > 1Password reference
     try {
-      if ($OPRefAutonomysApiKey) {
+      if ($AutonomysApiKey) {
+        $toolCreds.autonomys_api_key = $AutonomysApiKey.Trim()
+        Write-Host "Autonomys API key configured (direct)"
+      } elseif ($OPRefAutonomysApiKey) {
         $val = (& op read $OPRefAutonomysApiKey 2>$null).Trim()
         if ($val) {
           $toolCreds.autonomys_api_key = $val
@@ -437,9 +460,9 @@ try {
       }
     } catch { Write-Warning "Autonomys credentials unavailable: $_" }
 
-    # If we embedded an Autonomys API key, also enable uploads at runtime
+    # If we embedded an Autonomys API key or caller enabled uploads, flag it
     try {
-      if ($toolCreds.ContainsKey('autonomys_api_key')) {
+      if ($AutonomysUploadEnabled -or $toolCreds.ContainsKey('autonomys_api_key')) {
         $cfg.autonomys_upload_enabled = $true
         Write-Host "Autonomys upload enabled (embedded)"
       }
@@ -449,7 +472,18 @@ try {
       $cfg.tool_credentials = $toolCreds
     }
   }
-  
+
+  # Handle direct Autonomys values when 1Password is disabled (e.g., batch builds)
+  if (-not $Use1Password -and $AutonomysApiKey) {
+    if (-not $cfg.tool_credentials) { $cfg.tool_credentials = @{} }
+    $cfg.tool_credentials.autonomys_api_key = $AutonomysApiKey.Trim()
+    Write-Host "Autonomys API key configured (direct, no 1Password)"
+    if ($AutonomysUploadEnabled) {
+      $cfg.autonomys_upload_enabled = $true
+      Write-Host "Autonomys upload enabled (direct)"
+    }
+  }
+
   $cfg | ConvertTo-Json -Compress | Set-Content -Encoding UTF8 $tmpCfg
 
   $makeEncrypted = $null
@@ -489,19 +523,36 @@ $SvcName = "FRY_PoC_${Code}_v${Version}";
 $svcDistDir = Join-Path $PWD ("dist\\svc\\${Code}")
 $svcArgs = @('--clean','--onefile','--noconsole','--noconfirm','--name', $SvcName, '--distpath', $svcDistDir)
 
-# For GUI/full bundles include native collects; for service-only builds add explicit excludes
+# Ensure critical geo/PoL dependencies are bundled (service builds too)
+$svcArgs += @('--collect-all','h3','--collect-all','shapely','--collect-all','geoip2')
+
+# For GUI/full bundles include native collects; for service-only builds exclude per miner group
 if ($BuildGUI) {
-  $svcArgs += @('--collect-binaries','h3','--collect-all','shapely','--collect-all','geoip2')
+  $svcArgs += @('--collect-binaries','h3')
 } else {
-  # Exclude heavy optional modules that are not needed for a headless/service build
-  # Note: numpy is required by pandas (for Autonomys), so it's not excluded
-  $svcArgs += @(
-    '--exclude-module','PySide6',
-    '--exclude-module','matplotlib',
-    '--exclude-module','sounddevice',
-    '--exclude-module','portaudio',
-    '--exclude-module','pyside6'
-  )
+  # All heavy modules that can be excluded when a miner group doesn't need them
+  $allHeavyModules = @('sounddevice','_sounddevice_data','portaudio',
+                       'pyserial','serial',
+                       'matplotlib','PySide6','pyside6',
+                       'tkinter','_tkinter','unittest','test','xmlrpc','pydoc')
+
+  # Modules each group NEEDS (beyond core). Everything else gets excluded.
+  $groupRequiredModules = @{
+    'Bandwidth' = @()
+    'Decibel'   = @('sounddevice','_sounddevice_data','portaudio','numpy')
+    'Satellite' = @('pyserial','serial')
+    'Node'      = @()
+    'AI'        = @()
+    'Radiation' = @('pyserial','serial')
+  }
+  $requiredMods = $groupRequiredModules[$group]
+  if (-not $requiredMods) { $requiredMods = @() }
+
+  $excludeModules = $allHeavyModules | Where-Object { $_ -notin $requiredMods }
+  foreach ($mod in $excludeModules) {
+    $svcArgs += @('--exclude-module', $mod)
+  }
+  Write-Host "Excluding modules for $($Code.ToUpper()) ($group): $($excludeModules -join ', ')"
 }
   
  # ----- Icon resolution & conversion (supports .ico, .png, .jpg) -----

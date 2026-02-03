@@ -45,10 +45,10 @@ param(
     [Parameter(Mandatory=$true)]
     [string]$Version,
     
-    [string]$OPRefBearerToken = "op://VPS/Hardware_API/API_BEARER_TOKEN",
+    [string]$OPRefBearerToken = "op://HardwareAPI/Hardware_API/API_BEARER_TOKEN",
     
     [string]$OPRefSigningKey = "op://VSCode/hardware_exe/local_signing_key_hex",
-    [string]$OPRefAutonomysKey = "op://VPS/Hardware_API/AUTONOMYS_API_KEY",
+    [string]$OPRefAutonomysKey = "op://DataStorage/AutoDrive/AUTONOMYS_API_KEY",
     
     [int]$IntervalSeconds = 600,
     

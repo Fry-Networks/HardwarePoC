@@ -493,6 +493,26 @@ def _get_enabled_tools() -> List[str]:
     return enabled
 
 
+def _is_running_as_service() -> bool:
+    """Return True if this process is running as a managed service.
+
+    Windows: checks for Session 0 (all services run there).
+    Linux/aarch64: checks for INVOCATION_ID env var set by systemd.
+    """
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            session_id = ctypes.c_ulong()
+            if ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session_id)):
+                return session_id.value == 0
+        else:
+            # systemd sets INVOCATION_ID for every service unit it manages
+            return bool(os.environ.get("INVOCATION_ID"))
+    except Exception:
+        pass
+    return True  # Detection failed: fail-open
+
+
 def _detect_virtual_machine() -> Dict[str, Any]:
     """Best-effort virtual machine detection across major platforms."""
     info: Dict[str, Any] = {"vm": None, "evidence": [], "method": "heuristic"}
@@ -650,8 +670,16 @@ MEASUREMENT_EXPECTATIONS: dict[str, List[str]] = {
     "ODM": ["Decibel"],
 }
 SDK_NAMES: Tuple[str, ...] = ("bright", "honeygain", "mysterium")
+_CONFIG_FILE_TO_SDK: Dict[str, str] = {
+    "brd_config.json": "bright",
+    "honeygain.json": "honeygain",
+    "mysterium.json": "mysterium",
+}
 _TRUE_SET = {"1", "true", "yes", "y", "on", "approved", "allow", "allowed", "enabled"}
 _FALSE_SET = {"0", "false", "no", "n", "off", "deny", "denied", "blocked"}
+
+# Allowed Windows service names that can be managed via IPC ops_queue
+ALLOWED_SERVICE_NAMES: frozenset = frozenset({"MysteriumNode"})
 
 class ApiHealthBackoff:
     """Simple backoff controller that pauses API traffic while the health endpoint fails."""
@@ -1290,15 +1318,18 @@ def load_config() -> Dict[str, Any]:
         return cfg
     return {}
 
-def required_versions_from_db(client) -> Dict[str, str]:
-    """Return software_version_needed and poc_version_needed for this miner code from PoC.versions.
-    Returns dict with 'software_version' and 'poc_version' keys (may be empty if unavailable)."""
+def required_versions_from_db(client) -> Dict[str, Any]:
+    """Return software_version_needed, poc_version_needed, and rewards multiplier
+    parameters for this miner code from PoC.versions.
+    Returns dict with 'software_version', 'poc_version', 'multiplier_base',
+    and 'multiplier_per_tool' keys (may be empty if unavailable)."""
     try:
         doc = client["PoC"]["versions"].find_one(
-            {"miner_code": MINER_CODE}, 
-            {"software_version_needed": 1, "poc_version_needed": 1, "_id": 0}
+            {"miner_code": MINER_CODE},
+            {"software_version_needed": 1, "poc_version_needed": 1,
+             "multiplier_base": 1, "multiplier_per_tool": 1, "_id": 0}
         )
-        result: Dict[str, str] = {}
+        result: Dict[str, Any] = {}
         if isinstance(doc, dict):
             software = doc.get("software_version_needed")
             poc = doc.get("poc_version_needed")
@@ -1306,6 +1337,12 @@ def required_versions_from_db(client) -> Dict[str, str]:
                 result["software_version"] = software
             if isinstance(poc, str) and poc:
                 result["poc_version"] = poc
+            mb = doc.get("multiplier_base")
+            if isinstance(mb, (int, float)):
+                result["multiplier_base"] = float(mb)
+            mpt = doc.get("multiplier_per_tool")
+            if isinstance(mpt, (int, float)):
+                result["multiplier_per_tool"] = float(mpt)
         return result
     except Exception:
         return {}
@@ -1369,6 +1406,8 @@ def _compute_rewards_multiplier(
     bright_active: bool,
     honeygain_active: bool,
     mysterium_active: bool,
+    bm_base: float = 1.0,
+    bm_per_tool: float = 0.1,
 ) -> float:
     """Compute per-slot rewards multiplier based on gating and active tools."""
     # RDN, SDN, SVN: only check mac_match and poc_ok (no pod_ok required)
@@ -1386,8 +1425,7 @@ def _compute_rewards_multiplier(
             + int(bool(honeygain_active))
             + int(bool(mysterium_active))
         )
-        base = 0.25
-        return min(1.0, base + 0.25 * tool_count)
+        return bm_base + bm_per_tool * tool_count
     # Non-BM/AEM: gate passed -> full multiplier
     return 1.0
 
@@ -1763,6 +1801,8 @@ def write_status(
     hex_registered: Optional[str] = None,
     pol_override: Optional[Dict[str, Any]] = None,
     pod_status: Optional[bool] = None,
+    bm_base: float = 1.0,
+    bm_per_tool: float = 0.1,
 ) -> None:
     # --- time / slot basics ---
     day = day_iso(ts)  # "YYYY-MM-DD"
@@ -2065,6 +2105,8 @@ def write_status(
         bright_active,
         honeygain_active,
         mysterium_active,
+        bm_base=bm_base,
+        bm_per_tool=bm_per_tool,
     )
 
     # --- unified slot snapshot for the graph ---
@@ -2252,7 +2294,7 @@ def _parse_bool_flag(value: Any) -> Optional[bool]:
 def read_encrypted_sdk_config() -> Dict[str, Any]:
     """Read SDK approval config from encrypted file (installer-managed)."""
     try:
-        config_path = os.path.join(app_dir(), "config", "sdk_config.enc")
+        config_path = os.path.join(data_dir(), "config", "sdk_config.enc")
         if not os.path.exists(config_path):
             return {}
         with open(config_path, "r", encoding="utf-8") as f:
@@ -2279,6 +2321,59 @@ def read_encrypted_sdk_config() -> Dict[str, Any]:
     except Exception:
         pass
     return {}
+
+def _write_encrypted_sdk_config(payload: Dict[str, Any]) -> bool:
+    """Write SDK approval config to encrypted file."""
+    try:
+        from cryptography.fernet import Fernet
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        import base64
+
+        salt = b'sdk_config_salt_v1'
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+        )
+        password = "sdk_config_encryption_key_v1".encode()
+        key = base64.urlsafe_b64encode(kdf.derive(password))
+        f = Fernet(key)
+        encrypted = f.encrypt(json.dumps(payload).encode()).decode()
+
+        config_path = os.path.join(data_dir(), "config", "sdk_config.enc")
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        temp_path = f"{config_path}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as fh:
+            json.dump({"data": encrypted}, fh)
+        os.replace(temp_path, config_path)
+        return True
+    except Exception:
+        log.exception("Failed to write sdk_config.enc")
+        return False
+
+def _update_sdk_approval(sdk_name: str, approved: bool) -> bool:
+    """Read current sdk_config.enc, update one SDK's approval, write back."""
+    payload = read_encrypted_sdk_config()
+    payload[sdk_name] = approved
+    ok = _write_encrypted_sdk_config(payload)
+    if ok:
+        log_step("sdk_approval_updated", {"sdk": sdk_name, "approved": approved})
+    return ok
+
+def _update_sdk_rewards_params(bm_base: float, bm_per_tool: float) -> bool:
+    """Write bm_base_reward and bm_per_tool_reward into sdk_config.enc for GUI."""
+    payload = read_encrypted_sdk_config()
+    old_base = payload.get("bm_base_reward")
+    old_per_tool = payload.get("bm_per_tool_reward")
+    changed = (old_base != bm_base or old_per_tool != bm_per_tool)
+    payload["bm_base_reward"] = bm_base
+    payload["bm_per_tool_reward"] = bm_per_tool
+    ok = _write_encrypted_sdk_config(payload)
+    if ok and changed:
+        log_step("sdk_rewards_params_updated", {"bm_base_reward": bm_base, "bm_per_tool_reward": bm_per_tool})
+    return ok
 
 def read_sdk_approval_state() -> Dict[str, bool]:
     """Read SDK approval flags from encrypted config only."""
@@ -2383,6 +2478,39 @@ def detect_local_mac() -> str:
         except Exception:
             psutil = None
         if psutil:
+            # Prefer interface that owns the default route (active internet path)
+            try:
+                import socket
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    sock.connect(("8.8.8.8", 53))
+                    local_ip = sock.getsockname()[0]
+                finally:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                if isinstance(local_ip, str) and local_ip:
+                    addrs = psutil.net_if_addrs()
+                    for ifname, lst in addrs.items():
+                        ip_match = False
+                        for addr in lst:
+                            ip = getattr(addr, "address", None)
+                            if isinstance(ip, str) and ip == local_ip:
+                                ip_match = True
+                                break
+                        if not ip_match:
+                            continue
+                        for addr in lst:
+                            mac = getattr(addr, "address", None) or ""
+                            if not isinstance(mac, str) or not mac:
+                                continue
+                            norm = re.sub(r"[^0-9A-Fa-f]", "", mac)
+                            if len(norm) == 12 and norm != "000000000000":
+                                return ":".join(norm[i:i+2].upper() for i in range(0, 12, 2))
+            except Exception:
+                pass
+
             addrs = psutil.net_if_addrs()
             for ifname, lst in addrs.items():
                 for addr in lst:
@@ -2799,6 +2927,8 @@ def write_week_local(
     pol_status: Optional[bool] = None,     # PoL (Proof of Location)
     gui_version: Optional[str] = None,
     skip_slot: bool = False,
+    bm_base: float = 1.0,
+    bm_per_tool: float = 0.1,
 ) -> None:
     """
     One file per rewards-week (Fri 00:00 UTC → next Fri 00:00 UTC).
@@ -2941,6 +3071,8 @@ def write_week_local(
                 bright_active,
                 honeygain_active,
                 mysterium_active,
+                bm_base=bm_base,
+                bm_per_tool=bm_per_tool,
             )
         else:
             multiplier = _compute_rewards_multiplier(
@@ -2952,6 +3084,8 @@ def write_week_local(
                 bright_active,
                 honeygain_active,
                 mysterium_active,
+                bm_base=bm_base,
+                bm_per_tool=bm_per_tool,
             )
     except Exception:
         multiplier = None
@@ -4042,13 +4176,141 @@ def _setup_diiisco_firewall() -> bool:
 
 def _setup_spaceacres_firewall() -> bool:
     """Setup firewall rules for Space Acres (Substrate RPC).
-    
+
     Returns:
         True if rule added successfully, False otherwise
     """
     success = _add_firewall_rule("SpaceAcres_RPC_TCP", DEFAULT_RPC_PORT, "TCP", "in")
     log_step("privileged_spaceacres_firewall_setup", {"success": success})
     return success
+
+
+def _start_windows_service(service_name: str) -> Tuple[bool, str]:
+    """Start a Windows service via nssm or sc.
+
+    Args:
+        service_name: Name of the Windows service (must be in ALLOWED_SERVICE_NAMES)
+
+    Returns:
+        Tuple of (success, message)
+    """
+    if not service_name:
+        return False, "service_name required"
+
+    if service_name not in ALLOWED_SERVICE_NAMES:
+        return False, f"service {service_name} not in allowed list"
+
+    # Try NSSM first (if available), then fall back to sc
+    try:
+        nssm_path = os.path.join(data_dir(), "nssm.exe")
+        if os.path.exists(nssm_path):
+            result = subprocess.run(
+                [nssm_path, "start", service_name],
+                capture_output=True,
+                timeout=30,
+                encoding="utf-8",
+                errors="ignore",
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
+            )
+            if result.returncode == 0:
+                log_step("privileged_service_started", {"service": service_name, "method": "nssm"})
+                return True, f"Service {service_name} started via nssm"
+            # Log but continue to try sc
+            log_step("privileged_service_start_nssm_failed", {
+                "service": service_name,
+                "returncode": result.returncode,
+                "stderr": (result.stderr or "")[:200],
+            })
+    except Exception as exc:
+        log_step("privileged_service_start_nssm_exception", {"service": service_name, "error": str(exc)})
+
+    # Fallback to sc
+    try:
+        result = subprocess.run(
+            ["sc", "start", service_name],
+            capture_output=True,
+            timeout=30,
+            encoding="utf-8",
+            errors="ignore",
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
+        )
+        if result.returncode == 0:
+            log_step("privileged_service_started", {"service": service_name, "method": "sc"})
+            return True, f"Service {service_name} started via sc"
+        log_step("privileged_service_start_failed", {
+            "service": service_name,
+            "returncode": result.returncode,
+            "stdout": (result.stdout or "")[:200],
+            "stderr": (result.stderr or "")[:200],
+        })
+        return False, f"Failed to start service: {(result.stderr or result.stdout or '')[:200]}"
+    except Exception as exc:
+        log_step("privileged_service_start_exception", {"service": service_name, "error": str(exc)})
+        return False, f"Exception starting service: {exc}"
+
+
+def _stop_windows_service(service_name: str) -> Tuple[bool, str]:
+    """Stop a Windows service via nssm or sc.
+
+    Args:
+        service_name: Name of the Windows service (must be in ALLOWED_SERVICE_NAMES)
+
+    Returns:
+        Tuple of (success, message)
+    """
+    if not service_name:
+        return False, "service_name required"
+
+    if service_name not in ALLOWED_SERVICE_NAMES:
+        return False, f"service {service_name} not in allowed list"
+
+    # Try NSSM first, then fall back to sc
+    try:
+        nssm_path = os.path.join(data_dir(), "nssm.exe")
+        if os.path.exists(nssm_path):
+            result = subprocess.run(
+                [nssm_path, "stop", service_name],
+                capture_output=True,
+                timeout=30,
+                encoding="utf-8",
+                errors="ignore",
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
+            )
+            if result.returncode == 0:
+                log_step("privileged_service_stopped", {"service": service_name, "method": "nssm"})
+                return True, f"Service {service_name} stopped via nssm"
+            # Log but continue to try sc
+            log_step("privileged_service_stop_nssm_failed", {
+                "service": service_name,
+                "returncode": result.returncode,
+                "stderr": (result.stderr or "")[:200],
+            })
+    except Exception as exc:
+        log_step("privileged_service_stop_nssm_exception", {"service": service_name, "error": str(exc)})
+
+    # Fallback to sc
+    try:
+        result = subprocess.run(
+            ["sc", "stop", service_name],
+            capture_output=True,
+            timeout=30,
+            encoding="utf-8",
+            errors="ignore",
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
+        )
+        if result.returncode == 0:
+            log_step("privileged_service_stopped", {"service": service_name, "method": "sc"})
+            return True, f"Service {service_name} stopped via sc"
+        log_step("privileged_service_stop_failed", {
+            "service": service_name,
+            "returncode": result.returncode,
+            "stdout": (result.stdout or "")[:200],
+            "stderr": (result.stderr or "")[:200],
+        })
+        return False, f"Failed to stop service: {(result.stderr or result.stdout or '')[:200]}"
+    except Exception as exc:
+        log_step("privileged_service_stop_exception", {"service": service_name, "error": str(exc)})
+        return False, f"Exception stopping service: {exc}"
 
 
 # IPC helper: write result marker for processed ops
@@ -4160,7 +4422,25 @@ def _process_ops_queue_request(request_path: str) -> None:
                 raise ValueError("write_config requires relative_path and content")
             
             success = _write_config_file(relative_path, content)
-            
+            if success:
+                sdk_name = _CONFIG_FILE_TO_SDK.get(os.path.basename(relative_path))
+                if sdk_name:
+                    # Parse the config file content to determine approval status
+                    approval_status = True  # Default to true if parsing fails
+                    try:
+                        config_data = json.loads(content)
+                        if isinstance(config_data, dict):
+                            # Check enabled flag (primary indicator)
+                            if "enabled" in config_data:
+                                approval_status = bool(config_data.get("enabled", False))
+                            # Also check consent flag if present (both should be true for approval)
+                            if "consent" in config_data and not config_data.get("consent", False):
+                                approval_status = False
+                    except Exception:
+                        # If parsing fails, assume enabled (legacy behavior)
+                        pass
+                    _update_sdk_approval(sdk_name, approval_status)
+
         elif op == "write_measurement":
             tool = request.get("tool")
             data_b64 = request.get("data_b64")
@@ -4216,7 +4496,27 @@ def _process_ops_queue_request(request_path: str) -> None:
             except Exception as e:
                 error_msg = str(e)
                 success = False
-            
+
+        elif op == "start_service":
+            service_name = request.get("service_name", "")
+
+            if not service_name:
+                raise ValueError("start_service requires service_name")
+
+            success, msg = _start_windows_service(service_name)
+            if not success:
+                error_msg = msg
+
+        elif op == "stop_service":
+            service_name = request.get("service_name", "")
+
+            if not service_name:
+                raise ValueError("stop_service requires service_name")
+
+            success, msg = _stop_windows_service(service_name)
+            if not success:
+                error_msg = msg
+
         else:
             # Unknown operation: log and mark failure without raising to preserve result marker
             error_msg = f"Unknown operation: {op}"
@@ -4287,6 +4587,8 @@ def _ops_queue_daemon_loop() -> None:
         "setup_diiisco_firewall",
         "setup_spaceacres_firewall",
         "reload_config",
+        "start_service",
+        "stop_service",
     ]})
     
     request_count = 0
@@ -4689,6 +4991,10 @@ def main() -> None:
     _init_service_file_logging()
     refresh_software_version(force=True)
 
+    # Exit silently if not running as a Windows service (Session 0)
+    if not _is_running_as_service():
+        sys.exit(0)
+
     # Exit silently in virtualized environments (policy)
     try:
         vm_info = _detect_virtual_machine()
@@ -4831,6 +5137,12 @@ def main() -> None:
                 required_versions = required_versions_from_db(client)
                 software_required = required_versions.get("software_version")
                 poc_required = required_versions.get("poc_version")
+                bm_multiplier_base = float(required_versions.get("multiplier_base", 1.0))
+                bm_multiplier_per_tool = float(required_versions.get("multiplier_per_tool", 0.1))
+                try:
+                    _update_sdk_rewards_params(bm_multiplier_base, bm_multiplier_per_tool)
+                except Exception:
+                    pass
 
                 is_software_outdated = False
                 is_poc_outdated = False
@@ -5201,6 +5513,8 @@ def main() -> None:
                     poi_data=poi_snapshot,
                     pol_status=pol_status,
                     gui_version=GUI_VERSION,
+                    bm_base=bm_multiplier_base,
+                    bm_per_tool=bm_multiplier_per_tool,
                 )
             except Exception:
                 pass
@@ -5220,6 +5534,12 @@ def main() -> None:
 
                 software_required = required_versions.get("software_version")
                 poc_required = required_versions.get("poc_version")
+                bm_multiplier_base = float(required_versions.get("multiplier_base", 1.0))
+                bm_multiplier_per_tool = float(required_versions.get("multiplier_per_tool", 0.1))
+                try:
+                    _update_sdk_rewards_params(bm_multiplier_base, bm_multiplier_per_tool)
+                except Exception:
+                    pass
 
                 outdated = False
                 try:
@@ -5304,6 +5624,8 @@ def main() -> None:
                     hex_registered=pol_hex_registered,
                     pol_override=pending_pol_update,
                     pod_status=pod_slot_ok,
+                    bm_base=bm_multiplier_base,
+                    bm_per_tool=bm_multiplier_per_tool,
                 )
                 pending_pol_update = None
 
