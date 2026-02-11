@@ -1507,15 +1507,15 @@ def _compute_rewards_multiplier(
     - BM: PoD (Proof of Data) - data upload succeeded
     - AEM: PoI (Proof of Installation) - Olostep running and enabled
 
-    SVN and BM use the same parametric formula:
+    RDN and BM use the same parametric formula:
         multiplier_base + multiplier_per_tool * tool_count
     """
-    # RDN, SDN: only check mac_match and poc_ok (no pod_ok or tools required)
-    if miner_type in ("RDN", "SDN"):
+    # SVN, SDN: only check mac_match and poc_ok (no pod_ok or tools required)
+    if miner_type in ("SVN", "SDN"):
         return 1.0 if (mac_match and poc_ok) else 0.0
 
-    # SVN: parametric like BM but gates only on mac_match + poc_ok (no pod_ok)
-    if miner_type == "SVN":
+    # RDN: parametric like BM but gates only on mac_match + poc_ok (no pod_ok)
+    if miner_type == "RDN":
         if not (mac_match and poc_ok):
             return 0.0
         tool_count = int(bool(presearch_active)) + int(bool(diiisco_active))
@@ -1533,7 +1533,7 @@ def _compute_rewards_multiplier(
             + int(bool(mysterium_active))
         )
         return multiplier_base + multiplier_per_tool * tool_count
-    # Non-BM/AEM/SVN: gate passed -> full multiplier
+    # Non-BM/AEM/RDN: gate passed -> full multiplier
     return 1.0
 
 def _get_boot_time_iso() -> Optional[str]:
@@ -2896,8 +2896,8 @@ def _tool_states_for_slot() -> Tuple[bool, bool, bool]:
     return bright_active, honeygain_active, mysterium_active
 
 
-def _svn_tool_states_for_slot() -> Tuple[bool, bool]:
-    """Return (presearch_active, diiisco_active) for SVN reward calculation.
+def _rdn_tool_states_for_slot() -> Tuple[bool, bool]:
+    """Return (presearch_active, diiisco_active) for RDN reward calculation.
 
     Checks whether each tool is enabled in config and its Docker container
     is running.
@@ -3222,16 +3222,16 @@ def write_week_local(
             tools_active.append("honeygain")
         if mysterium_active:
             tools_active.append("mysterium")
-    elif MINER_CODE == "SVN":
+    elif MINER_CODE == "RDN":
         if presearch_active:
             tools_active.append("presearch")
         if diiisco_active:
             tools_active.append("diiisco")
 
-    # Tools gate policy (BM / SVN):
-    # - If BM or SVN and zero tools selected => fail tools gate
+    # Tools gate policy (BM / RDN):
+    # - If BM or RDN and zero tools selected => fail tools gate
     tools_ok: Optional[bool]
-    if MINER_CODE in ("BM", "SVN"):
+    if MINER_CODE in ("BM", "RDN"):
         tools_ok = (len(tools_active) > 0)
     else:
         tools_ok = None
@@ -5271,7 +5271,7 @@ def _measurement_collection_loop() -> None:
                 from measurements.collector import collect_and_upload_aem
                 # AEM does not have separate fast live writer; upload interval remains 600s
                 upload_collectors["aem"] = (lambda: collect_and_upload_aem(MINER_CODE, api_client, hex_id, install_id, miner_key), intervals["aem"])
-            elif MINER_CODE == "SVN":
+            elif MINER_CODE == "RDN":
                 from measurements.collector import collect_and_write_tool_stats
                 live_collectors["tools"] = (lambda: collect_and_write_tool_stats(MINER_CODE, presearch_api_key=presearch_api_key), intervals["tools"])
 
@@ -5484,9 +5484,9 @@ def main() -> None:
         log.warning("Failed to start measurement daemon: %s", e)
 
     # ----------------------------
-    # SVN: One-time Presearch status poll to log remote_addr
+    # RDN: One-time Presearch status poll to log remote_addr
     # ----------------------------
-    if MINER_CODE == "SVN":
+    if MINER_CODE == "RDN":
         try:
             enabled_tools = _get_enabled_tools()
             if "presearch" in enabled_tools:
@@ -5980,12 +5980,12 @@ def main() -> None:
             # Status for gates: online gate is just network connectivity
             status = status_raw
 
-            # SVN tool states for this slot (declared outside try blocks so both writers can use them)
-            svn_presearch_active = False
-            svn_diiisco_active = False
-            if MINER_CODE == "SVN":
+            # RDN tool states for this slot (declared outside try blocks so both writers can use them)
+            rdn_presearch_active = False
+            rdn_diiisco_active = False
+            if MINER_CODE == "RDN":
                 try:
-                    svn_presearch_active, svn_diiisco_active = _svn_tool_states_for_slot()
+                    rdn_presearch_active, rdn_diiisco_active = _rdn_tool_states_for_slot()
                 except Exception:
                     pass
 
@@ -6026,8 +6026,8 @@ def main() -> None:
                     gui_version=GUI_VERSION,
                     multiplier_base=multiplier_base,
                     multiplier_per_tool=multiplier_per_tool,
-                    presearch_active=svn_presearch_active,
-                    diiisco_active=svn_diiisco_active,
+                    presearch_active=rdn_presearch_active,
+                    diiisco_active=rdn_diiisco_active,
                     api_available=True,  # Will be updated in DB work block if API fails
                 )
             except Exception:
@@ -6038,8 +6038,8 @@ def main() -> None:
             # ----------------------------
             api_available = True
             try:
-                # SVN: push Presearch IP status every 10 minutes
-                if MINER_CODE == "SVN":
+                # RDN: push Presearch IP status every 10 minutes
+                if MINER_CODE == "RDN":
                     try:
                         due_presearch = (
                             last_presearch_ip_update is None
@@ -6198,8 +6198,8 @@ def main() -> None:
                     pod_status=pod_slot_ok,
                     multiplier_base=multiplier_base,
                     multiplier_per_tool=multiplier_per_tool,
-                    presearch_active=svn_presearch_active,
-                    diiisco_active=svn_diiisco_active,
+                    presearch_active=rdn_presearch_active,
+                    diiisco_active=rdn_diiisco_active,
                 )
                 pending_pol_update = None
 
@@ -6314,8 +6314,8 @@ def main() -> None:
                             gui_version=GUI_VERSION,
                             multiplier_base=multiplier_base,
                             multiplier_per_tool=multiplier_per_tool,
-                            presearch_active=svn_presearch_active,
-                            diiisco_active=svn_diiisco_active,
+                            presearch_active=rdn_presearch_active,
+                            diiisco_active=rdn_diiisco_active,
                             api_available=False,
                         )
                     except Exception:
@@ -6342,8 +6342,8 @@ def main() -> None:
                         gui_version=GUI_VERSION,
                         multiplier_base=multiplier_base,
                         multiplier_per_tool=multiplier_per_tool,
-                        presearch_active=svn_presearch_active,
-                        diiisco_active=svn_diiisco_active,
+                        presearch_active=rdn_presearch_active,
+                        diiisco_active=rdn_diiisco_active,
                         api_available=False,
                     )
                 except Exception:
