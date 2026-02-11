@@ -4,12 +4,20 @@ Applies privacy-preserving transformations to measurement data before upload.
 Maintains data utility while protecting sensitive information.
 """
 
+from __future__ import annotations
+
 import logging
 from typing import Any, Dict, Optional
 from datetime import datetime
-import pandas as pd
 
 log = logging.getLogger("measurements.autonomys_redactor")
+
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+    log.warning("Parquet support not available. Install with: pip install pandas pyarrow")
 
 from .autonomys_writer import get_hex_resolution, get_parent_hex, H3_AVAILABLE
 
@@ -218,13 +226,13 @@ class DataRedactor:
         return df_redacted
 
     def redact_aem_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Redact AEM measurement DataFrame.
+        """Redact AEM Olostep Browser measurement DataFrame.
 
-        AEM (points of interest) data is less sensitive but can still
-        reveal exact locations. Apply light redaction.
+        AEM data contains process-level info (memory, process count).
+        Apply redaction to smooth exact values that could fingerprint hardware.
 
         Args:
-            df: DataFrame with AEM measurements
+            df: DataFrame with AEM hourly aggregates
 
         Returns:
             Redacted DataFrame
@@ -232,19 +240,27 @@ class DataRedactor:
         df_redacted = df.copy()
 
         if self.level == 'standard':
-            # Round to 1 decimal place
-            for col in ['poi_avg', 'poi_min', 'poi_max']:
+            # Round memory to nearest MB and activity age to nearest second
+            for col in ['mem_rss_avg_mb', 'mem_rss_min_mb', 'mem_rss_max_mb']:
                 if col in df_redacted.columns:
-                    df_redacted[col] = df_redacted[col].round(1)
+                    df_redacted[col] = df_redacted[col].round(0)
+            for col in ['activity_age_avg_s', 'activity_age_min_s', 'activity_age_max_s']:
+                if col in df_redacted.columns:
+                    df_redacted[col] = df_redacted[col].round(0)
 
         elif self.level == 'full':
-            # Add small noise and round
-            for col in ['poi_avg', 'poi_min', 'poi_max']:
+            # Bucket memory into 5 MB increments
+            for col in ['mem_rss_avg_mb', 'mem_rss_min_mb', 'mem_rss_max_mb']:
                 if col in df_redacted.columns:
-                    df_redacted[col] = df_redacted[col].apply(
-                        lambda x: self.add_noise_to_value(x, 5.0)
-                    )
-                    df_redacted[col] = df_redacted[col].round(0)
+                    df_redacted[col] = (df_redacted[col] / 5).round() * 5
+            # Round activity age to 60s increments
+            for col in ['activity_age_avg_s', 'activity_age_min_s', 'activity_age_max_s']:
+                if col in df_redacted.columns:
+                    df_redacted[col] = (df_redacted[col] / 60).round() * 60
+            # Remove process count (could fingerprint hardware)
+            for col in ['proc_count_avg', 'proc_count_min', 'proc_count_max']:
+                if col in df_redacted.columns:
+                    df_redacted.drop(columns=[col], inplace=True)
 
         return df_redacted
 

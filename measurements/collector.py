@@ -86,40 +86,42 @@ def collect_and_upload_bandwidth(miner_code: str, api_client: Optional[Any] = No
     try:
         bw = collect_bandwidth_measurement()
         if not bw:
+            log.warning("Bandwidth measurement failed (internet down or test servers unreachable)")
             return False
 
         timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
         uploaded = False
 
-        # If API client available, upload to backend first
-        if api_client and hex_id and install_id:
+        # Use "unknown" as fallback hex_id if not registered yet
+        effective_hex_id = hex_id or "unknown"
+
+        # If API client available, upload to backend
+        if api_client and install_id:
             try:
                 api_client._api.upload_measurement(
-                    hex_id=hex_id,
+                    hex_id=effective_hex_id,
                     miner_code=miner_code,
                     install_id=install_id,
                     timestamp=timestamp,
                     measurement_type="bandwidth",
                     value=bw
                 )
-                log.info("Bandwidth measurement uploaded to backend")
+                log.info("Bandwidth measurement uploaded to backend (hex_id=%s)", effective_hex_id)
                 uploaded = True
             except Exception as e:
                 log.error("Failed to upload bandwidth to backend: %s", e)
-                # If backend upload fails, don't write CSV (failed measurement)
-                return False
+                # Continue to write CSV even if upload fails - measurement was successful
 
-
-
-        # Write to CSV (only if backend upload succeeded, or if no API client available)
-        if uploaded or not api_client:
-            row = {
-                "timestamp": timestamp,
-                **bw
-            }
-            # Real/historical measurement CSV (10min cadence)
-            return append_row("bandwidth", miner_code, row, dataset="real")
-        return False
+        # Always write to CSV if measurement succeeded (PoD = measurement taken, not upload success)
+        row = {
+            "timestamp": timestamp,
+            **bw
+        }
+        # Real/historical measurement CSV (10min cadence)
+        if append_row("bandwidth", miner_code, row, dataset="real"):
+            return True
+        log.error("Failed to write bandwidth measurement to CSV")
+        return uploaded  # Return True if at least upload succeeded
         
     except Exception as e:
         log.error("Bandwidth collection failed: %s", e)
@@ -143,40 +145,42 @@ def collect_and_upload_satellite(miner_code: str, api_client: Optional[Any] = No
     try:
         sat = collect_satellite_measurement()
         if not sat:
+            log.warning("Satellite measurement failed (sensor not connected or not responding)")
             return False
 
         timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
+        uploaded = False
 
-        # If API client available, upload to backend first
-        if api_client and hex_id and install_id:
+        # Use "unknown" as fallback hex_id if not registered yet
+        effective_hex_id = hex_id or "unknown"
+
+        # If API client available, upload to backend
+        if api_client and install_id:
             try:
                 api_client._api.upload_measurement(
-                    hex_id=hex_id,
+                    hex_id=effective_hex_id,
                     miner_code=miner_code,
                     install_id=install_id,
                     timestamp=timestamp,
                     measurement_type="satellite",
                     value=sat
                 )
-                log.info("Satellite measurement uploaded to backend")
+                log.info("Satellite measurement uploaded to backend (hex_id=%s)", effective_hex_id)
                 uploaded = True
             except Exception as e:
                 log.error("Failed to upload satellite to backend: %s", e)
-                return False
-        else:
-            uploaded = False
-        
+                # Continue to write CSV even if upload fails
 
-
-        # Write to CSV (only if backend upload succeeded, or if no API client available)
-        if uploaded or not api_client:
-            row = {
-                "timestamp": timestamp,
-                **sat
-            }
-            # Real/historical measurement CSV (10min cadence)
-            return append_row("satellite", miner_code, row, dataset="real")
-        return False
+        # Always write to CSV if measurement succeeded
+        row = {
+            "timestamp": timestamp,
+            **sat
+        }
+        # Real/historical measurement CSV (10min cadence)
+        if append_row("satellite", miner_code, row, dataset="real"):
+            return True
+        log.error("Failed to write satellite measurement to CSV")
+        return uploaded
     except Exception as e:
         log.error("Satellite collection failed: %s", e)
         return False
@@ -190,42 +194,44 @@ def collect_and_upload_radiation(miner_code: str, api_client: Optional[Any] = No
     try:
         rad = collect_radiation_measurement()
         if not rad:
+            log.warning("Radiation measurement failed (sensor not connected or not responding)")
             return False
-        
+
         timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
         uploaded = False
 
-        # If API client available, upload to backend first
-        if api_client and hex_id and install_id:
+        # Use "unknown" as fallback hex_id if not registered yet
+        effective_hex_id = hex_id or "unknown"
+
+        # If API client available, upload to backend
+        if api_client and install_id:
             try:
                 api_client._api.upload_measurement(
-                    hex_id=hex_id,
+                    hex_id=effective_hex_id,
                     miner_code=miner_code,
                     install_id=install_id,
                     timestamp=timestamp,
                     measurement_type="radiation",
                     value=rad
                 )
-                log.info("Radiation measurement uploaded to backend")
+                log.info("Radiation measurement uploaded to backend (hex_id=%s)", effective_hex_id)
                 uploaded = True
             except Exception as e:
                 log.error("Failed to upload radiation to backend: %s", e)
-                return False
+                # Continue to write CSV even if upload fails
 
-        # Pod-status marking is handled by the measurement daemon via write_week_local() after
-        # a successful collector upload. Collectors do not write local pod_status files.
-
-        # Write to CSV (only if backend upload succeeded, or if no API client available)
-        if uploaded or not api_client:
-            row = {
-                "timestamp": timestamp,
-                "cpm": rad.get("cpm"),
-                "usv": rad.get("usv"),
-                "mr": rad.get("mr")
-            }
-            # Real/historical measurement CSV (10min cadence)
-            return append_row("radiation", miner_code, row, dataset="real")
-        return False
+        # Always write to CSV if measurement succeeded
+        row = {
+            "timestamp": timestamp,
+            "cpm": rad.get("cpm"),
+            "usv": rad.get("usv"),
+            "mr": rad.get("mr")
+        }
+        # Real/historical measurement CSV (10min cadence)
+        if append_row("radiation", miner_code, row, dataset="real"):
+            return True
+        log.error("Failed to write radiation measurement to CSV")
+        return uploaded
     except Exception as e:
         log.error("Radiation collection failed: %s", e)
         return False
@@ -239,13 +245,17 @@ def collect_and_upload_decibel(miner_code: str, api_client: Optional[Any] = None
     try:
         db = collect_decibel_measurement()
         if not db:
+            log.warning("Decibel measurement failed (microphone not connected or not responding)")
             return False
-        
+
         timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
         uploaded = False
 
-        # If API client available, upload to backend first
-        if api_client and hex_id and install_id:
+        # Use "unknown" as fallback hex_id if not registered yet
+        effective_hex_id = hex_id or "unknown"
+
+        # If API client available, upload to backend
+        if api_client and install_id:
             try:
                 # Ensure JSON-serializable native types (e.g., convert numpy scalars)
                 val: dict[str, Any] = dict(db) if isinstance(db, dict) else {"dbfs": db}
@@ -258,93 +268,101 @@ def collect_and_upload_decibel(miner_code: str, api_client: Optional[Any] = None
                     pass
 
                 api_client._api.upload_measurement(
-                    hex_id=hex_id,
+                    hex_id=effective_hex_id,
                     miner_code=miner_code,
                     install_id=install_id,
                     timestamp=timestamp,
                     measurement_type="decibel",
                     value=val
                 )
-                log.info("Decibel measurement uploaded to backend")
+                log.info("Decibel measurement uploaded to backend (hex_id=%s)", effective_hex_id)
                 uploaded = True
             except Exception as e:
                 log.error("Failed to upload decibel to backend: %s", e)
-                return False
+                # Continue to write CSV even if upload fails
 
-        # Write to CSV (only if backend upload succeeded, or if no API client available)
-        if uploaded or not api_client:
-            # Ensure CSV gets native types as well
-            csv_dbfs: Any = None
-            try:
-                dbfs_val = db.get("dbfs") if db else None
-                if dbfs_val is not None:
-                    csv_dbfs = float(dbfs_val)
-            except Exception:
-                csv_dbfs = None
+        # Always write to CSV if measurement succeeded
+        # Ensure CSV gets native types as well
+        csv_dbfs: Any = None
+        try:
+            dbfs_val = db.get("dbfs") if db else None
+            if dbfs_val is not None:
+                csv_dbfs = float(dbfs_val)
+        except Exception:
+            csv_dbfs = None
 
-            row = {
-                "timestamp": timestamp,
-                "dbfs": csv_dbfs
-            }
-            # Real/historical measurement CSV (10min cadence)
-            return append_row("decibel", miner_code, row, dataset="real")
-        return False
+        row = {
+            "timestamp": timestamp,
+            "dbfs": csv_dbfs
+        }
+        # Real/historical measurement CSV (10min cadence)
+        if append_row("decibel", miner_code, row, dataset="real"):
+            return True
+        log.error("Failed to write decibel measurement to CSV")
+        return uploaded
     except Exception as e:
         log.error("Decibel collection failed: %s", e)
         return False
 
 
 def collect_and_upload_aem(miner_code: str, api_client: Optional[Any] = None, hex_id: Optional[str] = None, install_id: Optional[str] = None, miner_key: Optional[str] = None) -> bool:
-    """Collect AEM data and upload to backend.
-    
-    Sends directly to backend first, then records confirmation to CSV and writes an encrypted file.
+    """Collect AEM Olostep Browser metrics and upload to backend.
+
+    Sends rich activity data (task count, memory, process stats) to backend,
+    then records to CSV.
     """
     try:
         aem = collect_aem_measurement()
         if not aem:
+            log.warning("AEM measurement failed (Olostep Browser not responding)")
             return False
-        
+
         timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
         uploaded = False
 
-        # If API client available, upload to backend first
-        if api_client and hex_id and install_id:
+        # Use "unknown" as fallback hex_id if not registered yet
+        effective_hex_id = hex_id or "unknown"
+
+        # If API client available, upload to backend
+        if api_client and install_id:
             try:
                 api_client._api.upload_measurement(
-                    hex_id=hex_id,
+                    hex_id=effective_hex_id,
                     miner_code=miner_code,
                     install_id=install_id,
                     timestamp=timestamp,
                     measurement_type="aem",
                     value=aem
                 )
-                log.info("AEM measurement uploaded to backend")
+                log.info("AEM measurement uploaded to backend (hex_id=%s)", effective_hex_id)
                 uploaded = True
             except Exception as e:
                 log.error("Failed to upload AEM to backend: %s", e)
-                return False
+                # Continue to write CSV even if upload fails
 
-        # Pod-status marking is handled by the measurement daemon via write_week_local() after
-        # a successful collector upload. Collectors do not write local pod_status files.
-
-        # Write to CSV (only if backend upload succeeded, or if no API client available)
-        if uploaded or not api_client:
-            row = {
-                "timestamp": timestamp,
-                "poi": aem.get("poi")
-            }
-            # Real/historical measurement CSV (10min cadence)
-            return append_row("aem", miner_code, row, dataset="real")
-        return False
+        # Always write to CSV if measurement succeeded
+        row = {
+            "timestamp": timestamp,
+            "poi": aem.get("poi", 0),
+            "tasks_completed": aem.get("tasks_completed", 0),
+            "last_activity_age_s": aem.get("last_activity_age_s", -1),
+            "mem_rss_mb": aem.get("mem_rss_mb", 0.0),
+            "proc_count": aem.get("proc_count", 0),
+        }
+        # Real/historical measurement CSV (10min cadence)
+        if append_row("aem", miner_code, row, dataset="real"):
+            return True
+        log.error("Failed to write AEM measurement to CSV")
+        return uploaded
     except Exception as e:
         log.error("AEM collection failed: %s", e)
         return False
 
 
-def collect_and_write_tool_stats(miner_code: str) -> bool:
+def collect_and_write_tool_stats(miner_code: str, presearch_api_key: str = "") -> bool:
     """Collect all tool stats and write to respective CSVs."""
     try:
-        tool_stats = collect_all_tool_stats()
+        tool_stats = collect_all_tool_stats(presearch_api_key=presearch_api_key)
         if not tool_stats:
             return True
         
@@ -477,9 +495,15 @@ def collect_all_by_miner_type(miner_code: str, api_client: Optional[Any] = None,
         if collect_and_upload_aem(miner_code, api_client, hex_id, install_id, miner_key):
             success = True
 
-    elif miner_code in ("RDN", "SDN", "SVN"):
+    elif miner_code == "SVN":
+        # SVN collects tool stats (presearch, diiisco)
+        if collect_and_write_tool_stats(miner_code):
+            success = True
+        else:
+            success = True  # Not an error if tools aren't running yet
+
+    elif miner_code in ("RDN", "SDN"):
         # These miner types don't collect sensor measurements
-        # They rely on tool/service activity instead
         log.debug("Miner type %s does not collect measurements", miner_code)
         success = True  # Not an error condition
 

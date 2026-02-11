@@ -153,6 +153,17 @@ class ExternalApiClient:
             return data
         return {}
 
+    def get_verified_status(self, miner_key: str) -> bool:
+        """GET {base}/credentials/{miner_key}/verified -> {"miner_key": str, "verified": bool}
+
+        Returns True if the miner is verified, False otherwise (including
+        when the endpoint is unavailable or the response is malformed).
+        """
+        data = self._request("GET", f"/credentials/{miner_key}/verified")
+        if isinstance(data, dict) and isinstance(data.get("verified"), bool):
+            return data["verified"]
+        return False
+
     def upsert_installation(self, miner_key: str, install_id: str, payload: Dict[str, Any]) -> None:
         """POST {base}/installations/{miner_key}/installations/{install_id} with heartbeat payload.
 
@@ -189,6 +200,14 @@ class ExternalApiClient:
             "value": dict(value),
         }
         self._request("POST", f"/measurements/{hex_id}", json_body=body)
+
+    def upsert_presearch_ip(self, ip: str, payload: Dict[str, Any]) -> None:
+        """PUT {base}/presearch/ip/{ip} with Presearch node status payload."""
+        if not ip:
+            raise ValueError("ip is required")
+        body = dict(payload)
+        body.setdefault("ip", ip)
+        self._request("PUT", f"/presearch/ip/{ip}", json_body=body)
 
     def acquire_installation_lease(self, miner_key: str, install_id: str, lease_seconds: int) -> bool:
         """POST {base}/installations/{miner_key}/leases/{install_id} -> {"granted": bool, "expires_at": "..."}
@@ -496,6 +515,7 @@ REQUIRED_API_METHODS = [
     'lease_status',
     'get_hardware_doc',
     'put_hardware_doc',
+    'upsert_presearch_ip',
 ]
 
 

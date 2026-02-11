@@ -385,6 +385,27 @@ def _get_tool_credentials() -> Dict[str, Any]:
         return {}
 
 
+def _get_presearch_api_key() -> str:
+    """Resolve Presearch API key from embedded credentials or service config."""
+    try:
+        creds = _get_tool_credentials()
+        api_key = creds.get("presearch_api_key", "")
+        if isinstance(api_key, str) and api_key:
+            return api_key
+    except Exception:
+        pass
+    try:
+        cfg = _load_service_config()
+        pre_cfg = cfg.get("presearch_config", {})
+        if isinstance(pre_cfg, dict):
+            api_key = pre_cfg.get("api_key") or pre_cfg.get("presearch_api_key")
+            if isinstance(api_key, str) and api_key:
+                return api_key
+    except Exception:
+        pass
+    return ""
+
+
 def _reload_service_config() -> None:
     """Reload configuration from disk (called when GUI updates config)."""
     try:
@@ -481,7 +502,12 @@ def _get_enabled_tools() -> List[str]:
             # Only include if supported by this miner type
             if poc_type not in allowed:
                 continue
-                
+
+            # Docker-based tools require Docker to be installed and running
+            if poc_type in DOCKER_TOOLS and not _is_docker_available():
+                log.warning("Tool %s is enabled but Docker is not available; skipping", poc_type)
+                continue
+
             for key in config_keys:
                 if miner_config.get(key) is True:
                     enabled.append(poc_type)
@@ -680,6 +706,61 @@ _FALSE_SET = {"0", "false", "no", "n", "off", "deny", "denied", "blocked"}
 
 # Allowed Windows service names that can be managed via IPC ops_queue
 ALLOWED_SERVICE_NAMES: frozenset = frozenset({"MysteriumNode"})
+
+# Docker container definitions: image, volumes, and credential injection per container
+DOCKER_CONTAINER_DEFS: Dict[str, Dict[str, Any]] = {
+    "presearch-node": {
+        "image": "presearch/node",
+        "volumes": ["presearch-node-storage:/app/node"],
+        "cred_key": "presearch_registration_code",   # embedded 1Password credential
+        "cred_env": "REGISTRATION_CODE",              # env var name for docker run
+    },
+    "diiisco-node": {
+        "image": "diiisco/node",
+        "volumes": ["diiisco-node-storage:/app/data"],
+        "cred_key": "diiisco_api_key",
+        "cred_env": "API_KEY",
+    },
+}
+
+# Allowed Docker container names that can be managed via IPC ops_queue
+ALLOWED_DOCKER_CONTAINERS: frozenset = frozenset(DOCKER_CONTAINER_DEFS.keys())
+
+# Docker-based tools that require Docker to be installed
+DOCKER_TOOLS: frozenset = frozenset({"presearch", "diiisco"})
+
+# Docker availability cache
+_docker_available: Optional[bool] = None
+_docker_available_ts: float = 0.0
+_DOCKER_CACHE_TTL: float = 60.0  # seconds
+
+
+def _is_docker_available() -> bool:
+    """Return True if Docker CLI is on PATH and the daemon is responding.
+
+    Used to gate Presearch and other Docker-based tools.
+    Result is cached for 60 seconds to avoid repeated subprocess calls.
+    """
+    global _docker_available, _docker_available_ts
+    now = time.time()
+    if _docker_available is not None and (now - _docker_available_ts) < _DOCKER_CACHE_TTL:
+        return _docker_available
+    try:
+        result = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            timeout=10,
+            creationflags=(subprocess.CREATE_NO_WINDOW
+                           if hasattr(subprocess, "CREATE_NO_WINDOW") else 0),
+        )
+        _docker_available = result.returncode == 0
+    except FileNotFoundError:
+        _docker_available = False
+    except Exception:
+        _docker_available = False
+    _docker_available_ts = now
+    return _docker_available
+
 
 class ApiHealthBackoff:
     """Simple backoff controller that pauses API traffic while the health endpoint fails."""
@@ -1208,14 +1289,23 @@ def upload_measurements_for_slot(
             "aem": "aem",
         }
 
+        # Determine which dates to check - if slot spans midnight, check both days
+        slot_start_date = slot_start.strftime("%Y%m%d")
+        slot_end_date = slot_end.strftime("%Y%m%d")
+        dates_to_check = [slot_end_date]
+        if slot_start_date != slot_end_date:
+            dates_to_check.append(slot_start_date)
+
         for expected_group in expected_set:
             sensor_type = sensor_type_map.get(expected_group)
             if not sensor_type:
                 continue
 
             try:
-                # Read all rows from the CSV for today
-                rows = read_all_rows(sensor_type, MINER_CODE, dataset="real")
+                # Read rows from CSV for all relevant dates (handles midnight boundary)
+                rows = []
+                for date_str in dates_to_check:
+                    rows.extend(read_all_rows(sensor_type, MINER_CODE, date_str=date_str, dataset="real"))
 
                 # Check if any measurement falls within the slot time range
                 for row in rows:
@@ -1402,31 +1492,48 @@ def _compute_rewards_multiplier(
     mac_match: bool,
     poc_ok: bool,
     pod_ok: bool,
-    poi_ok: Optional[bool],
     bright_active: bool,
     honeygain_active: bool,
     mysterium_active: bool,
-    bm_base: float = 1.0,
-    bm_per_tool: float = 0.1,
+    multiplier_base: float = 1.0,
+    multiplier_per_tool: float = 0.1,
+    *,
+    presearch_active: bool = False,
+    diiisco_active: bool = False,
 ) -> float:
-    """Compute per-slot rewards multiplier based on gating and active tools."""
-    # RDN, SDN, SVN: only check mac_match and poc_ok (no pod_ok required)
-    if miner_type in ("RDN", "SDN", "SVN"):
+    """Compute per-slot rewards multiplier based on gating and active tools.
+
+    For pod_ok:
+    - BM: PoD (Proof of Data) - data upload succeeded
+    - AEM: PoI (Proof of Installation) - Olostep running and enabled
+
+    SVN and BM use the same parametric formula:
+        multiplier_base + multiplier_per_tool * tool_count
+    """
+    # RDN, SDN: only check mac_match and poc_ok (no pod_ok or tools required)
+    if miner_type in ("RDN", "SDN"):
         return 1.0 if (mac_match and poc_ok) else 0.0
+
+    # SVN: parametric like BM but gates only on mac_match + poc_ok (no pod_ok)
+    if miner_type == "SVN":
+        if not (mac_match and poc_ok):
+            return 0.0
+        tool_count = int(bool(presearch_active)) + int(bool(diiisco_active))
+        return multiplier_base + multiplier_per_tool * tool_count
 
     # Other miners require mac_match, poc_ok, and pod_ok
     if not (mac_match and poc_ok and pod_ok):
         return 0.0
     if miner_type == "AEM":
-        return 1.0 if poi_ok else 0.0
+        return 1.0  # All gates passed
     if miner_type == "BM":
         tool_count = (
             int(bool(bright_active))
             + int(bool(honeygain_active))
             + int(bool(mysterium_active))
         )
-        return bm_base + bm_per_tool * tool_count
-    # Non-BM/AEM: gate passed -> full multiplier
+        return multiplier_base + multiplier_per_tool * tool_count
+    # Non-BM/AEM/SVN: gate passed -> full multiplier
     return 1.0
 
 def _get_boot_time_iso() -> Optional[str]:
@@ -1801,8 +1908,10 @@ def write_status(
     hex_registered: Optional[str] = None,
     pol_override: Optional[Dict[str, Any]] = None,
     pod_status: Optional[bool] = None,
-    bm_base: float = 1.0,
-    bm_per_tool: float = 0.1,
+    multiplier_base: float = 1.0,
+    multiplier_per_tool: float = 0.1,
+    presearch_active: bool = False,
+    diiisco_active: bool = False,
 ) -> None:
     # --- time / slot basics ---
     day = day_iso(ts)  # "YYYY-MM-DD"
@@ -1852,9 +1961,10 @@ def write_status(
 
     # --- AEM PoI slots (keep existing format) ---
     poi_slots: Optional[dict[str, Any]] = None
-    poi_slot_ok: Optional[bool] = None
     if miner_type_val == "AEM":
-        poi_slot_ok = bool(poi_data)
+        # For AEM, pod_slot_ok represents PoI (Proof of Installation - Olostep)
+        if poi_data is not None:
+            pod_slot_ok = bool(poi_data)
 
         poi_count = local_doc.get("poiCountDay") if isinstance(local_doc, dict) else None
         poi_total = local_doc.get("poiTotalSlotsDay") if isinstance(local_doc, dict) else None
@@ -2095,18 +2205,26 @@ def write_status(
             ("mysterium", mysterium_active),
         ) if active]
 
+    # --- SVN Docker-based tools ---
+    elif miner_type_val == "SVN":
+        selected_tools = [name for name, active in (
+            ("presearch", presearch_active),
+            ("diiisco", diiisco_active),
+        ) if active]
+
     # --- compute multiplier ---
     rewards_multiplier_value = _compute_rewards_multiplier(
         miner_type_val if isinstance(miner_type_val, str) and miner_type_val else MINER_CODE,
         mac_match,
         bool(poc_slot_ok),
-        bool(pod_slot_ok),
-        poi_slot_ok,
+        bool(pod_slot_ok),  # BM: PoD, AEM: PoI
         bright_active,
         honeygain_active,
         mysterium_active,
-        bm_base=bm_base,
-        bm_per_tool=bm_per_tool,
+        multiplier_base=multiplier_base,
+        multiplier_per_tool=multiplier_per_tool,
+        presearch_active=presearch_active,
+        diiisco_active=diiisco_active,
     )
 
     # --- unified slot snapshot for the graph ---
@@ -2115,11 +2233,9 @@ def write_status(
             "data": bool(pod_slot_ok),
             "online": (status == "online"),
             "mac_match": mac_match,
-            "pol": bool(pol_status),
-            "poi": (bool(poi_slot_ok) if miner_type_val == "AEM" else None),
         },
-        "tools_active": (selected_tools if miner_type_val == "BM" else []),
-        "tools_count": (len(selected_tools) if miner_type_val == "BM" else 0),
+        "tools_active": selected_tools,
+        "tools_count": len(selected_tools),
         "multiplier": rewards_multiplier_value,
     }
 
@@ -2291,10 +2407,10 @@ def _parse_bool_flag(value: Any) -> Optional[bool]:
             return False
     return None
 
-def read_encrypted_sdk_config() -> Dict[str, Any]:
-    """Read SDK approval config from encrypted file (installer-managed)."""
+def read_encrypted_gui_config() -> Dict[str, Any]:
+    """Read GUI config (SDK approvals + rewards params) from encrypted file."""
     try:
-        config_path = os.path.join(data_dir(), "config", "sdk_config.enc")
+        config_path = os.path.join(data_dir(), "config", "gui_config.enc")
         if not os.path.exists(config_path):
             return {}
         with open(config_path, "r", encoding="utf-8") as f:
@@ -2322,27 +2438,27 @@ def read_encrypted_sdk_config() -> Dict[str, Any]:
         pass
     return {}
 
-def _write_encrypted_sdk_config(payload: Dict[str, Any]) -> bool:
-    """Write SDK approval config to encrypted file."""
+def _write_encrypted_gui_config(payload: Dict[str, Any]) -> bool:
+    """Write GUI config (SDK approvals + rewards params) to encrypted file."""
     try:
         from cryptography.fernet import Fernet
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
         import base64
 
-        salt = b'sdk_config_salt_v1'
+        salt = b'gui_config_salt_v1'
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,
             iterations=100000,
         )
-        password = "sdk_config_encryption_key_v1".encode()
+        password = "gui_config_encryption_key_v1".encode()
         key = base64.urlsafe_b64encode(kdf.derive(password))
         f = Fernet(key)
         encrypted = f.encrypt(json.dumps(payload).encode()).decode()
 
-        config_path = os.path.join(data_dir(), "config", "sdk_config.enc")
+        config_path = os.path.join(data_dir(), "config", "gui_config.enc")
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
         temp_path = f"{config_path}.tmp"
         with open(temp_path, "w", encoding="utf-8") as fh:
@@ -2350,29 +2466,29 @@ def _write_encrypted_sdk_config(payload: Dict[str, Any]) -> bool:
         os.replace(temp_path, config_path)
         return True
     except Exception:
-        log.exception("Failed to write sdk_config.enc")
+        log.exception("Failed to write gui_config.enc")
         return False
 
 def _update_sdk_approval(sdk_name: str, approved: bool) -> bool:
-    """Read current sdk_config.enc, update one SDK's approval, write back."""
-    payload = read_encrypted_sdk_config()
+    """Read current gui_config.enc, update one SDK's approval, write back."""
+    payload = read_encrypted_gui_config()
     payload[sdk_name] = approved
-    ok = _write_encrypted_sdk_config(payload)
+    ok = _write_encrypted_gui_config(payload)
     if ok:
         log_step("sdk_approval_updated", {"sdk": sdk_name, "approved": approved})
     return ok
 
-def _update_sdk_rewards_params(bm_base: float, bm_per_tool: float) -> bool:
-    """Write bm_base_reward and bm_per_tool_reward into sdk_config.enc for GUI."""
-    payload = read_encrypted_sdk_config()
-    old_base = payload.get("bm_base_reward")
-    old_per_tool = payload.get("bm_per_tool_reward")
-    changed = (old_base != bm_base or old_per_tool != bm_per_tool)
-    payload["bm_base_reward"] = bm_base
-    payload["bm_per_tool_reward"] = bm_per_tool
-    ok = _write_encrypted_sdk_config(payload)
+def _update_sdk_rewards_params(base: float, per_tool: float) -> bool:
+    """Write base_reward and per_tool_reward into gui_config.enc for GUI."""
+    payload = read_encrypted_gui_config()
+    old_base = payload.get("base_reward")
+    old_per_tool = payload.get("per_tool_reward")
+    changed = (old_base != base or old_per_tool != per_tool)
+    payload["base_reward"] = base
+    payload["per_tool_reward"] = per_tool
+    ok = _write_encrypted_gui_config(payload)
     if ok and changed:
-        log_step("sdk_rewards_params_updated", {"bm_base_reward": bm_base, "bm_per_tool_reward": bm_per_tool})
+        log_step("sdk_rewards_params_updated", {"base_reward": base, "per_tool_reward": per_tool})
     return ok
 
 def read_sdk_approval_state() -> Dict[str, bool]:
@@ -2401,7 +2517,7 @@ def read_sdk_approval_state() -> Dict[str, bool]:
                 state[name] = maybe
 
     try:
-        encrypted_payload = read_encrypted_sdk_config()
+        encrypted_payload = read_encrypted_gui_config()
         _ingest_payload(encrypted_payload)
     except Exception:
         pass
@@ -2779,6 +2895,42 @@ def _tool_states_for_slot() -> Tuple[bool, bool, bool]:
         mysterium_active = False
     return bright_active, honeygain_active, mysterium_active
 
+
+def _svn_tool_states_for_slot() -> Tuple[bool, bool]:
+    """Return (presearch_active, diiisco_active) for SVN reward calculation.
+
+    Checks whether each tool is enabled in config and its Docker container
+    is running.
+    """
+    presearch_active = False
+    diiisco_active = False
+
+    try:
+        enabled_tools = _get_enabled_tools()
+    except Exception:
+        enabled_tools = []
+
+    if "presearch" in enabled_tools:
+        try:
+            from measurements.tools import poll_presearch
+            creds = _get_tool_credentials()
+            api_key = creds.get("presearch_api_key", "")
+            stats = poll_presearch(api_key=api_key)
+            presearch_active = bool(stats.get("running", False))
+        except Exception:
+            presearch_active = False
+
+    if "diiisco" in enabled_tools:
+        try:
+            from measurements.tools import poll_diiisco
+            stats = poll_diiisco()
+            diiisco_active = bool(stats.get("running", False))
+        except Exception:
+            diiisco_active = False
+
+    return presearch_active, diiisco_active
+
+
 def _compute_day_aggregates(day_doc: Dict[str, Any]) -> None:
     """
     Fill/refresh:
@@ -2925,10 +3077,13 @@ def write_week_local(
     mac_mismatch: Optional[bool] = None,
     poi_data: Optional[bool] = None,       # AEM only
     pol_status: Optional[bool] = None,     # PoL (Proof of Location)
+    verified: Optional[bool] = None,       # Overall verified gate
     gui_version: Optional[str] = None,
     skip_slot: bool = False,
-    bm_base: float = 1.0,
-    bm_per_tool: float = 0.1,
+    multiplier_base: float = 1.0,
+    multiplier_per_tool: float = 0.1,
+    presearch_active: bool = False,
+    diiisco_active: bool = False,
 ) -> None:
     """
     One file per rewards-week (Fri 00:00 UTC → next Fri 00:00 UTC).
@@ -2981,11 +3136,20 @@ def write_week_local(
         doc["pol_status"] = None
         doc["pol_last_updated"] = None
 
+    # Verified gate - update when explicitly passed, default to False if never set
+    if isinstance(verified, bool):
+        doc["verified"] = verified
+    elif "verified" not in doc:
+        doc["verified"] = False
+
     # Always populate GUI_version (prefer explicit arg, fallback to global)
     gv = gui_version.strip() if isinstance(gui_version, str) and gui_version.strip() else ""
     if not gv:
         gv = GUI_VERSION.strip() if isinstance(GUI_VERSION, str) and GUI_VERSION.strip() else ""
     doc["GUI_version"] = gv
+
+    # Docker availability (cached 60s, checked by service running as SYSTEM)
+    doc["docker"] = _is_docker_available()
 
     doc["date"] = _date_iso(ts_utc)
     doc["week_start"] = _iso_z(week_start)
@@ -3031,8 +3195,14 @@ def write_week_local(
     # Gates + tools
     online_ok = (status == "online")
     mac_ok = not bool(doc.get("mac_mismatch"))
-    data_ok = bool(pod_status) if pod_status is not None else None  # BM: PoD delivered (data)
-    poi_ok = bool(poi_data) if (MINER_CODE == "AEM" and poi_data is not None) else None
+    
+    # "data" gate: 
+    # - BM: pod_status (PoD - Proof of Data: upload succeeded)
+    # - AEM: poi_data (PoI - Proof of Installation: Olostep running and enabled)
+    if MINER_CODE == "AEM":
+        data_ok = bool(poi_data) if poi_data is not None else False
+    else:
+        data_ok = bool(pod_status) if pod_status is not None else False
 
     bright_active, honeygain_active, mysterium_active = _tool_states_for_slot()
     tools_active: list[str] = []
@@ -3043,60 +3213,45 @@ def write_week_local(
             tools_active.append("honeygain")
         if mysterium_active:
             tools_active.append("mysterium")
+    elif MINER_CODE == "SVN":
+        if presearch_active:
+            tools_active.append("presearch")
+        if diiisco_active:
+            tools_active.append("diiisco")
 
-    # Tools gate policy (BM):
-    # - If BM and zero tools selected => fail tools gate
+    # Tools gate policy (BM / SVN):
+    # - If BM or SVN and zero tools selected => fail tools gate
     tools_ok: Optional[bool]
-    if MINER_CODE == "BM":
+    if MINER_CODE in ("BM", "SVN"):
         tools_ok = (len(tools_active) > 0)
     else:
         tools_ok = None
 
-    # "data" gate: BM uses pod_status
-    # - pod_status=True: upload succeeded, data delivered
-    # - pod_status=False: upload failed or wasn't possible
-    # - pod_status=None: should not happen (always set in current logic)
-    data_gate_for_multiplier = bool(data_ok) if isinstance(data_ok, bool) else False
-
     multiplier: Optional[float] = None
     try:
-        if MINER_CODE == "AEM":
-            # AEM multiplier: typically depends on PoC + PoI (+ mac)
-            multiplier = _compute_rewards_multiplier(
-                MINER_CODE,
-                bool(mac_ok),
-                bool(online_ok),     # PoC in your system is basically online gate
-                True,               # pod_ok irrelevant for AEM
-                poi_ok,
-                bright_active,
-                honeygain_active,
-                mysterium_active,
-                bm_base=bm_base,
-                bm_per_tool=bm_per_tool,
-            )
-        else:
-            multiplier = _compute_rewards_multiplier(
-                MINER_CODE,
-                bool(mac_ok),
-                bool(online_ok),             # PoC
-                bool(data_gate_for_multiplier),  # PoD/data
-                None,
-                bright_active,
-                honeygain_active,
-                mysterium_active,
-                bm_base=bm_base,
-                bm_per_tool=bm_per_tool,
-            )
+        multiplier = _compute_rewards_multiplier(
+            MINER_CODE,
+            bool(mac_ok),
+            bool(online_ok),      # PoC (Proof of Connectivity)
+            bool(data_ok),        # BM: PoD, AEM: PoI
+            bright_active,
+            honeygain_active,
+            mysterium_active,
+            multiplier_base=multiplier_base,
+            multiplier_per_tool=multiplier_per_tool,
+            presearch_active=presearch_active,
+            diiisco_active=diiisco_active,
+        )
     except Exception:
         multiplier = None
 
+    # Build slot object with appropriate gates per miner type
     slot_obj: Dict[str, Any] = {
         "gates": {
-            "online": bool(online_ok),
+            "online": bool(online_ok),  # PoC (Proof of Connectivity)
             "mac": bool(mac_ok),
-            "data": bool(data_gate_for_multiplier),
-            "tools": (bool(tools_ok) if tools_ok is not None else True),
-            "pol": bool(pol_status) if isinstance(pol_status, bool) else None,
+            "data": bool(data_ok),  # BM: PoD (upload), AEM: PoI (Olostep)
+            "tools": (bool(tools_ok) if tools_ok is not None else None),  # BM only
         },
         "tools_active": tools_active,
         "number_of_tools": len(tools_active),
@@ -3133,17 +3288,28 @@ def write_week_local(
     _commit(doc)
 
 def _start_poi_local_loop(miner_key: str, interval_seconds: int, poll_seconds: int) -> None:
-    """Launch a background loop that refreshes PoI in the WEEKLY local cache more frequently (AEM only)."""
+    """Launch a background loop that refreshes PoI in the WEEKLY local cache more frequently (AEM only).
+
+    Also writes to aem_live CSV every poll_seconds for GUI status display.
+    """
     if poll_seconds <= 0:
         return
 
     def _loop() -> None:
         _POI_STATE_READY.wait(timeout=5)
         while True:
+            # Get detailed Olostep status for live CSV
+            olostep_details = None
             try:
-                installed = monitor_poi_for_aem()
+                from poi_monitor_aem import get_olostep_status_detailed
+                olostep_details = get_olostep_status_detailed()
+                installed = olostep_details.get("poi", False)
             except Exception:
                 installed = None
+                try:
+                    installed = monitor_poi_for_aem()
+                except Exception:
+                    pass
 
             try:
                 snap = _get_poi_state_snapshot()
@@ -3185,6 +3351,26 @@ def _start_poi_local_loop(miner_key: str, interval_seconds: int, poll_seconds: i
                 )
 
                 _update_poi_state(last_poi=installed)
+
+                # Write to aem_live CSV for GUI quick refresh
+                if olostep_details:
+                    try:
+                        from measurements.csv_writer import append_row
+                        # Check internet status directly for fresh value (main loop only updates every 10 min)
+                        live_status = "online" if is_internet_up(timeout=2) else "offline"
+                        append_row(
+                            "aem_live",
+                            MINER_CODE,
+                            {
+                                "timestamp": now_utc().isoformat(),
+                                "olostep_running": olostep_details.get("olostep_running", False),
+                                "olostep_enabled": olostep_details.get("olostep_enabled", False),
+                                "status": live_status,
+                            },
+                            dataset="gui",  # Use simple filename: aem_live_YYYYMMDD.csv
+                        )
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -4313,6 +4499,130 @@ def _stop_windows_service(service_name: str) -> Tuple[bool, str]:
         return False, f"Exception stopping service: {exc}"
 
 
+# ---------------------------------------------------------------------------
+# Docker container lifecycle (for Presearch, Diiisco, etc.)
+# ---------------------------------------------------------------------------
+
+def _start_docker_container(container_name: str) -> Tuple[bool, str]:
+    """Start a Docker container.  If it exists but is stopped, start it.
+    If it doesn't exist, create it with ``docker run`` using
+    ``DOCKER_CONTAINER_DEFS`` for image, volumes, and credentials.
+
+    Args:
+        container_name: Container name (must be in DOCKER_CONTAINER_DEFS)
+
+    Returns:
+        Tuple of (success, message)
+    """
+    cdef = DOCKER_CONTAINER_DEFS.get(container_name)
+    if cdef is None:
+        return False, f"container {container_name} not in allowed list"
+
+    if not _is_docker_available():
+        return False, "Docker is not installed or daemon not running"
+
+    _cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+
+    # Check if container already exists
+    try:
+        inspect = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.Status}}", container_name],
+            capture_output=True, timeout=10, encoding="utf-8", errors="ignore",
+            creationflags=_cflags,
+        )
+        if inspect.returncode == 0:
+            state = inspect.stdout.strip()
+            if state == "running":
+                return True, f"Container {container_name} is already running"
+            # Container exists but stopped -- start it
+            result = subprocess.run(
+                ["docker", "start", container_name],
+                capture_output=True, timeout=30, encoding="utf-8", errors="ignore",
+                creationflags=_cflags,
+            )
+            if result.returncode == 0:
+                log_step("docker_container_started", {"container": container_name, "method": "start"})
+                return True, f"Container {container_name} started"
+            return False, f"docker start failed: {(result.stderr or result.stdout or '')[:200]}"
+    except Exception:
+        pass
+
+    # Container doesn't exist -- docker run (first time)
+    image = cdef.get("image", "")
+    if not image:
+        return False, f"No image defined for container {container_name}"
+
+    # Build env vars from embedded credentials
+    run_env: Dict[str, str] = {}
+    cred_key = cdef.get("cred_key", "")
+    cred_env = cdef.get("cred_env", "")
+    if cred_key and cred_env:
+        try:
+            creds = _get_tool_credentials()
+            val = creds.get(cred_key, "")
+            if val:
+                run_env[cred_env] = val
+        except Exception:
+            pass
+
+    cmd: List[str] = [
+        "docker", "run", "-d",
+        "--name", container_name,
+        "--restart", "unless-stopped",
+    ]
+    for vol in cdef.get("volumes", []):
+        cmd.extend(["-v", vol])
+    for k, v in run_env.items():
+        cmd.extend(["-e", f"{k}={v}"])
+    cmd.append(image)
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, timeout=120, encoding="utf-8", errors="ignore",
+            creationflags=_cflags,
+        )
+        if result.returncode == 0:
+            log_step("docker_container_created", {"container": container_name, "image": image})
+            
+            return True, f"Container {container_name} created and started"
+        return False, f"docker run failed: {(result.stderr or result.stdout or '')[:200]}"
+    except Exception as exc:
+        log_step("docker_container_create_exception", {"container": container_name, "error": str(exc)})
+        return False, f"Exception creating container: {exc}"
+
+
+def _stop_docker_container(container_name: str) -> Tuple[bool, str]:
+    """Stop a Docker container.
+
+    Args:
+        container_name: Container name (must be in ALLOWED_DOCKER_CONTAINERS)
+
+    Returns:
+        Tuple of (success, message)
+    """
+    if container_name not in ALLOWED_DOCKER_CONTAINERS:
+        return False, f"container {container_name} not in allowed list"
+
+    if not _is_docker_available():
+        return False, "Docker is not installed or daemon not running"
+
+    _cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+
+    try:
+        result = subprocess.run(
+            ["docker", "stop", container_name],
+            capture_output=True, timeout=30, encoding="utf-8", errors="ignore",
+            creationflags=_cflags,
+        )
+        if result.returncode == 0:
+            log_step("docker_container_stopped", {"container": container_name})
+            return True, f"Container {container_name} stopped"
+        return False, f"docker stop failed: {(result.stderr or result.stdout or '')[:200]}"
+    except Exception as exc:
+        log_step("docker_container_stop_exception", {"container": container_name, "error": str(exc)})
+        return False, f"Exception stopping container: {exc}"
+
+
 # IPC helper: write result marker for processed ops
 def _write_ops_result(request_id: str, op: Optional[str], success: bool, error_msg: Optional[str] = None) -> None:
     try:
@@ -4459,14 +4769,28 @@ def _process_ops_queue_request(request_path: str) -> None:
         elif op == "add_firewall_rule":
             rule_name = request.get("rule_name")
             port = request.get("port", 0)
-            protocol = request.get("protocol", "TCP")
-            direction = request.get("direction", "in")
+            protocol = request.get("protocol", "TCP").upper()
+            direction = request.get("direction", "in").lower()
             program = request.get("program")
-            
-            if not rule_name:
-                raise ValueError("add_firewall_rule requires rule_name")
-            
-            success = _add_firewall_rule(rule_name, port, protocol, direction, program)
+
+            # Handle bidirectional rules ("in,out") by creating two separate rules
+            if direction == "in,out" or direction == "both":
+                directions = ["in", "out"]
+            else:
+                directions = [direction]
+
+            success = True
+            for dir_single in directions:
+                # Auto-generate rule name if not provided
+                if request.get("rule_name"):
+                    current_rule_name = f"{request.get('rule_name')}_{dir_single}"
+                elif port:
+                    current_rule_name = f"FRY_Port{port}_{protocol}_{dir_single}"
+                else:
+                    raise ValueError("add_firewall_rule requires rule_name or port")
+
+                if not _add_firewall_rule(current_rule_name, port, protocol, dir_single, program):
+                    success = False
             
         elif op == "remove_firewall_rule":
             rule_name = request.get("rule_name")
@@ -4514,6 +4838,22 @@ def _process_ops_queue_request(request_path: str) -> None:
                 raise ValueError("stop_service requires service_name")
 
             success, msg = _stop_windows_service(service_name)
+            if not success:
+                error_msg = msg
+
+        elif op == "start_docker_container":
+            container_name = request.get("container_name", "")
+            if not container_name:
+                raise ValueError("start_docker_container requires container_name")
+            success, msg = _start_docker_container(container_name)
+            if not success:
+                error_msg = msg
+
+        elif op == "stop_docker_container":
+            container_name = request.get("container_name", "")
+            if not container_name:
+                raise ValueError("stop_docker_container requires container_name")
+            success, msg = _stop_docker_container(container_name)
             if not success:
                 error_msg = msg
 
@@ -4589,6 +4929,8 @@ def _ops_queue_daemon_loop() -> None:
         "reload_config",
         "start_service",
         "stop_service",
+        "start_docker_container",
+        "stop_docker_container",
     ]})
     
     request_count = 0
@@ -4746,16 +5088,22 @@ def _collect_mysterium_stats(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _collect_presearch_stats(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Collect Presearch node statistics."""
-    stats = {"status": "unknown"}
-    
+    """Collect Presearch node statistics via Docker + cloud API."""
+    stats: Dict[str, Any] = {"status": "unknown"}
     try:
-        # TODO: Implement Presearch stats collection
-        # This would query the Presearch API or Docker container
-        stats["status"] = "not_implemented"
+        api_key = ""
+        try:
+            creds = _get_tool_credentials()
+            api_key = creds.get("presearch_api_key", "")
+        except Exception:
+            pass
+
+        from measurements.tools import poll_presearch
+        result = poll_presearch(api_key=api_key)
+        stats.update(result)
+        stats["status"] = result.get("status", "unknown")
     except Exception as e:
         stats["error"] = str(e)
-    
     return stats
 
 
@@ -4869,10 +5217,20 @@ def _measurement_collection_loop() -> None:
                     log.debug("API not available for measurement upload: %s", e)
                     api_client = None
                     hex_id = None
+            
+            # Retry hex_id resolution if api_client is connected but hex_id is still None
+            # This handles cases where the proxy initially returns no hexId (syncing) but later has it
+            if api_client is not None and hex_id is None and miner_key:
+                try:
+                    hex_id = registered_hexid_from_devices(api_client, miner_key)
+                except Exception as e:
+                    log.debug("Failed to resolve hex_id on retry: %s", e)
 
             # --- Build two sets of collectors: live writers (for UI) and uploads (backend) ---
             live_collectors: dict[str, tuple[Callable[[], bool], int]] = {}
             upload_collectors: dict[str, tuple[Callable[[], bool], int]] = {}
+
+            presearch_api_key = _get_presearch_api_key()
 
             if MINER_CODE == "BM":
                 # BM: live writes at configured 'bandwidth' interval; upload every 600s
@@ -4883,7 +5241,7 @@ def _measurement_collection_loop() -> None:
                 )
                 live_collectors["bandwidth_live"] = (lambda: collect_and_write_bandwidth_live(MINER_CODE), intervals.get("bandwidth", 10))
                 upload_collectors["bandwidth"] = (lambda: collect_and_upload_bandwidth(MINER_CODE, api_client, hex_id, install_id, miner_key), 600)
-                live_collectors["tools"] = (lambda: collect_and_write_tool_stats(MINER_CODE), intervals["tools"])
+                live_collectors["tools"] = (lambda: collect_and_write_tool_stats(MINER_CODE, presearch_api_key=presearch_api_key), intervals["tools"])
 
             elif MINER_CODE in ("ISM", "OSM"):
                 from measurements.collector import collect_and_write_satellite_live, collect_and_upload_satellite
@@ -4904,6 +5262,9 @@ def _measurement_collection_loop() -> None:
                 from measurements.collector import collect_and_upload_aem
                 # AEM does not have separate fast live writer; upload interval remains 600s
                 upload_collectors["aem"] = (lambda: collect_and_upload_aem(MINER_CODE, api_client, hex_id, install_id, miner_key), intervals["aem"])
+            elif MINER_CODE == "SVN":
+                from measurements.collector import collect_and_write_tool_stats
+                live_collectors["tools"] = (lambda: collect_and_write_tool_stats(MINER_CODE, presearch_api_key=presearch_api_key), intervals["tools"])
 
             # Run due live collectors
             for sensor_type, (collector_fn, interval) in live_collectors.items():
@@ -5060,13 +5421,21 @@ def main() -> None:
         time.sleep(2)
         sys.exit(3)
 
+    # Check Docker availability at startup
+    docker_available = _is_docker_available()
+    log.info("Docker availability at startup: %s", "available" if docker_available else "not available")
+
     client: Optional[MongoProxyClient] = None
     coll = None
 
     required_versions: Dict[str, str] = {}
+    
+    # Track last Docker check time for periodic polling
+    last_docker_check_ts: float = time.time()
 
-    # miner_mac selected in GUI (persisted to shared data dir)
-    miner_mac_local: Optional[str] = read_selected_miner_mac() or None
+    # miner_mac will be detected in the main loop once we're fully initialized
+    # At startup, leave it as None to avoid incorrect comparisons
+    miner_mac_local: Optional[str] = None
     mac_registered: Optional[str] = None
 
     # Seed local state (best-effort)
@@ -5106,6 +5475,22 @@ def main() -> None:
         log.warning("Failed to start measurement daemon: %s", e)
 
     # ----------------------------
+    # SVN: One-time Presearch status poll to log remote_addr
+    # ----------------------------
+    if MINER_CODE == "SVN":
+        try:
+            enabled_tools = _get_enabled_tools()
+            if "presearch" in enabled_tools:
+                from measurements.tools import poll_presearch
+                api_key = _get_presearch_api_key()
+                if api_key:
+                    poll_presearch(api_key=api_key)
+                else:
+                    log.info("Presearch enabled but no API key available for status poll")
+        except Exception as e:
+            log.debug("Presearch startup poll failed: %s", e)
+
+    # ----------------------------
     # Connect + lease + bootstrap doc
     # ----------------------------
     while client is None:
@@ -5137,10 +5522,10 @@ def main() -> None:
                 required_versions = required_versions_from_db(client)
                 software_required = required_versions.get("software_version")
                 poc_required = required_versions.get("poc_version")
-                bm_multiplier_base = float(required_versions.get("multiplier_base", 1.0))
-                bm_multiplier_per_tool = float(required_versions.get("multiplier_per_tool", 0.1))
+                multiplier_base = float(required_versions.get("multiplier_base", 1.0))
+                multiplier_per_tool = float(required_versions.get("multiplier_per_tool", 0.1))
                 try:
-                    _update_sdk_rewards_params(bm_multiplier_base, bm_multiplier_per_tool)
+                    _update_sdk_rewards_params(multiplier_base, multiplier_per_tool)
                 except Exception:
                     pass
 
@@ -5205,6 +5590,15 @@ def main() -> None:
                     _update_poi_state(mac_registered=mac_registered, mac_mismatch=boot_mismatch)
                 except Exception:
                     pass
+                
+                # AEM: Check Olostep status early for GUI
+                poi_startup: Optional[bool] = None
+                if MINER_CODE == "AEM":
+                    try:
+                        poi_startup = monitor_poi_for_aem()
+                    except Exception:
+                        poi_startup = None
+                
                 try:
                     write_week_local(
                         miner_key,
@@ -5214,6 +5608,8 @@ def main() -> None:
                         pod_status=None,
                         mac_registered=mac_registered,
                         mac_mismatch=boot_mismatch,
+                        poi_data=poi_startup,
+                        verified=verified_status,
                         gui_version=GUI_VERSION,
                         skip_slot=True,
                     )
@@ -5387,6 +5783,66 @@ def main() -> None:
         pass
 
     # ----------------------------
+    # Initial checks: MAC and PoL (persistent status)
+    # ----------------------------
+    try:
+        init_miner_mac: Optional[str] = None
+        init_mac_registered: Optional[str] = None
+        init_mac_mismatch = False
+        init_pol_status: Optional[bool] = None
+        
+        # Detect local MAC
+        try:
+            init_miner_mac = detect_local_mac()
+        except Exception:
+            init_miner_mac = None
+        
+        # Read registered MAC
+        try:
+            init_mac_registered = registered_mac_from_devices(client, miner_key)
+        except Exception:
+            init_mac_registered = None
+        
+        # Compare MACs
+        if init_miner_mac and init_mac_registered:
+            norm_active = re.sub(r"[^0-9a-f]", "", (init_miner_mac or "").lower())
+            norm_registered = re.sub(r"[^0-9a-f]", "", init_mac_registered.lower())
+            init_mac_mismatch = bool(norm_active and norm_registered and norm_active != norm_registered)
+        
+        # Check PoL (Proof of Location)
+        try:
+            pol_block = read_location_cache(client, miner_key)
+            init_pol_status = pol_block.get("status") if isinstance(pol_block, dict) else None
+        except Exception:
+            init_pol_status = None
+        
+        # Update state with initial values
+        try:
+            update_kwargs = {
+                "mac_registered": init_mac_registered,
+                "mac_mismatch": init_mac_mismatch,
+                "interval": interval,
+            }
+            _update_poi_state(**update_kwargs)
+            log.info("Initial status: mac_mismatch=%s, pol=%s", init_mac_mismatch, init_pol_status)
+        except Exception:
+            pass
+    except Exception as e:
+        log.warning("Initial status checks failed: %s", e)
+
+    # ----------------------------
+    # Initial verified status check
+    # ----------------------------
+    verified_status: bool = False
+    last_verified_check: Optional[dt.datetime] = None
+    try:
+        verified_status = client.get_verified_status(miner_key)
+        last_verified_check = now_utc()
+        log.info("Initial verified status: %s", verified_status)
+    except Exception:
+        verified_status = False
+
+    # ----------------------------
     # Initial measurement collection (for first PoC update)
     # ----------------------------
     try:
@@ -5403,6 +5859,22 @@ def main() -> None:
         log.warning("Initial measurement collection failed: %s", e)
 
     # ----------------------------
+    # Write initial Docker status to weekly file (for GUI visibility)
+    # ----------------------------
+    try:
+        write_week_local(
+            miner_key,
+            now_utc(),
+            "offline",
+            interval,
+            verified=verified_status,
+            gui_version=GUI_VERSION,
+            skip_slot=True,
+        )
+    except Exception as e:
+        log.debug("Failed to write initial Docker status to weekly file: %s", e)
+
+    # ----------------------------
     # Main monitoring loop
     # ----------------------------
     warned_version = False
@@ -5410,10 +5882,29 @@ def main() -> None:
     next_slot_time: Optional[dt.datetime] = None
     # Track last Autonomys daily upload target (YYYYMMDD) to avoid duplicate runs
     last_autonomys_target: Optional[str] = None
+    last_presearch_ip_update: Optional[dt.datetime] = None
+    # Docker check interval: 5 minutes (300 seconds)
+    _DOCKER_PERIODIC_CHECK_INTERVAL: float = 300.0
 
     while True:
         refresh_software_version()
         now_loop = now_utc()
+        
+        # Periodic Docker availability check (every 5 minutes)
+        now_ts = time.time()
+        if (now_ts - last_docker_check_ts) >= _DOCKER_PERIODIC_CHECK_INTERVAL:
+            try:
+                docker_status = _is_docker_available()
+                if docker_status != docker_available:
+                    docker_available = docker_status
+                    log.warning(
+                        "Docker availability changed: %s",
+                        "now available" if docker_available else "now unavailable",
+                    )
+            except Exception as e:
+                log.debug("Docker periodic check failed: %s", e)
+            last_docker_check_ts = now_ts
+        
         if next_slot_time is None:
             next_slot_time = next_boundary(now_loop, interval)
         if now_loop + dt.timedelta(seconds=1) < next_slot_time:
@@ -5475,9 +5966,17 @@ def main() -> None:
                 except Exception:
                     pass
 
+            # Status for gates: online gate is just network connectivity
             status = status_raw
-            if MINER_CODE == "AEM":
-                status = "online" if (status_raw == "online" and bool(poi_snapshot)) else "offline"
+
+            # SVN tool states for this slot (declared outside try blocks so both writers can use them)
+            svn_presearch_active = False
+            svn_diiisco_active = False
+            if MINER_CODE == "SVN":
+                try:
+                    svn_presearch_active, svn_diiisco_active = _svn_tool_states_for_slot()
+                except Exception:
+                    pass
 
             # ----------------------------
             # Local weekly cache (ALWAYS)
@@ -5512,9 +6011,12 @@ def main() -> None:
                     mac_mismatch=local_mismatch,
                     poi_data=poi_snapshot,
                     pol_status=pol_status,
+                    verified=verified_status,
                     gui_version=GUI_VERSION,
-                    bm_base=bm_multiplier_base,
-                    bm_per_tool=bm_multiplier_per_tool,
+                    multiplier_base=multiplier_base,
+                    multiplier_per_tool=multiplier_per_tool,
+                    presearch_active=svn_presearch_active,
+                    diiisco_active=svn_diiisco_active,
                 )
             except Exception:
                 pass
@@ -5523,6 +6025,49 @@ def main() -> None:
             # DB work
             # ----------------------------
             try:
+                # SVN: push Presearch IP status every 10 minutes
+                if MINER_CODE == "SVN":
+                    try:
+                        due_presearch = (
+                            last_presearch_ip_update is None
+                            or (slot_ts - last_presearch_ip_update).total_seconds() >= 600
+                        )
+                        if due_presearch:
+                            enabled_tools = _get_enabled_tools()
+                            if "presearch" in enabled_tools:
+                                api_key = _get_presearch_api_key()
+                                if api_key:
+                                    from measurements.tools import fetch_presearch_nodes, get_public_ip
+                                    nodes = fetch_presearch_nodes(api_key)
+                                    if nodes:
+                                        local_ip = get_public_ip()
+                                        ip_value = local_ip
+                                        nodes_for_ip = [n for n in nodes if n.get("remote_addr") == local_ip]
+                                        if ip_value and nodes_for_ip:
+                                            from external_api import get_global_api_client
+                                            payload_nodes = []
+                                            for node in nodes_for_ip:
+                                                payload_nodes.append(
+                                                    {
+                                                        "miner_key": miner_key,
+                                                        "node_key": node.get("node_key", ""),
+                                                        "connected": bool(node.get("connected")),
+                                                        "blocked": bool(node.get("blocked")),
+                                                        "description": node.get("description", ""),
+                                                    }
+                                                )
+                                            payload = {
+                                                "ip": ip_value,
+                                                "timestamp": now_utc().isoformat(),
+                                                "nodes": payload_nodes,
+                                            }
+                                            client_api = get_global_api_client()
+                                            if hasattr(client_api, "upsert_presearch_ip"):
+                                                client_api.upsert_presearch_ip(ip_value, payload)
+                                    last_presearch_ip_update = slot_ts
+                    except Exception as e:
+                        log.debug("Presearch IP status update failed: %s", e)
+
                 # Refresh required versions once per UTC hour
                 try:
                     hour_start = slot_ts.replace(minute=0, second=0, microsecond=0)
@@ -5534,10 +6079,10 @@ def main() -> None:
 
                 software_required = required_versions.get("software_version")
                 poc_required = required_versions.get("poc_version")
-                bm_multiplier_base = float(required_versions.get("multiplier_base", 1.0))
-                bm_multiplier_per_tool = float(required_versions.get("multiplier_per_tool", 0.1))
+                multiplier_base = float(required_versions.get("multiplier_base", 1.0))
+                multiplier_per_tool = float(required_versions.get("multiplier_per_tool", 0.1))
                 try:
-                    _update_sdk_rewards_params(bm_multiplier_base, bm_multiplier_per_tool)
+                    _update_sdk_rewards_params(multiplier_base, multiplier_per_tool)
                 except Exception:
                     pass
 
@@ -5609,6 +6154,20 @@ def main() -> None:
                 except Exception:
                     pass
 
+                # Refresh verified status periodically (every 600s)
+                try:
+                    due_verified = (
+                        last_verified_check is None
+                        or (slot_ts - last_verified_check).total_seconds() >= 600
+                    )
+                    if due_verified:
+                        v = client.get_verified_status(miner_key)
+                        if isinstance(v, bool):
+                            verified_status = v
+                        last_verified_check = slot_ts
+                except Exception:
+                    pass
+
                 # Write slot snapshot to DB
                 write_status(
                     coll,
@@ -5624,8 +6183,10 @@ def main() -> None:
                     hex_registered=pol_hex_registered,
                     pol_override=pending_pol_update,
                     pod_status=pod_slot_ok,
-                    bm_base=bm_multiplier_base,
-                    bm_per_tool=bm_multiplier_per_tool,
+                    multiplier_base=multiplier_base,
+                    multiplier_per_tool=multiplier_per_tool,
+                    presearch_active=svn_presearch_active,
+                    diiisco_active=svn_diiisco_active,
                 )
                 pending_pol_update = None
 

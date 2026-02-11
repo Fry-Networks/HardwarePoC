@@ -27,7 +27,7 @@ class FakeAPI:
         ("collect_and_upload_satellite", "collect_satellite_measurement", {"sats": 5}, "satellite"),
         ("collect_and_upload_radiation", "collect_radiation_measurement", {"cpm": 2, "usv": 0.1, "mr": 0.0}, "radiation"),
         ("collect_and_upload_decibel", "collect_decibel_measurement", {"dbfs": -20.0}, "decibel"),
-        ("collect_and_upload_aem", "collect_aem_measurement", {"poi": True}, "aem"),
+        ("collect_and_upload_aem", "collect_aem_measurement", {"poi": 1, "tasks_completed": 3, "last_activity_age_s": 120.5, "mem_rss_mb": 36.2, "proc_count": 6}, "aem"),
     ],
 )
 def test_upload_rate_limited_for_all(monkeypatch, func_name, collect_patch, return_value, measurement_type):

@@ -37,6 +37,9 @@ class MongoProxyClient:
     def __getitem__(self, name: str) -> "MongoProxyDatabase":
         return MongoProxyDatabase(self._api, name)
 
+    def get_verified_status(self, miner_key: str) -> bool:
+        return self._api.get_verified_status(miner_key)
+
     def close(self) -> None:
         return None
 

@@ -128,6 +128,39 @@ if ($OPRefAutonomysKey -and $OPRefAutonomysKey -ne "") {
     }
 }
 
+# Resolve tool credentials from 1Password
+$toolCreds = @{}
+$toolCredRefs = @{
+    presearch_registration_code = "op://Storage Validator Nodes/Presearch/registration_code"
+    presearch_api_key           = "op://Storage Validator Nodes/Presearch/api_key"
+    diiisco_api_key             = "op://Hardware/Diiisco/api_key"
+    diiisco_node_key            = "op://Hardware/Diiisco/node_key"
+    spaceacres_farmer_key       = "op://Hardware/SpaceAcres/farmer_key"
+    spaceacres_reward_address   = "op://Hardware/SpaceAcres/reward_address"
+    bright_api_token            = "op://Bandwidth Miners/Bright Data SDK Login/APP_ID"
+    honeygain_api_key           = "op://Bandwidth Miners/Honeygain SDK API/credential"
+    myst_api_key                = "op://Bandwidth Miners/Mysterium SDK API/MYST_API_KEY"
+    myst_payout_addr            = "op://Bandwidth Miners/Mysterium SDK API/MYST_PAYOUT_ADDR"
+    myst_registration_token     = "op://Bandwidth Miners/Mysterium SDK API/MYST_REG_TOKEN"
+}
+foreach ($key in $toolCredRefs.Keys) {
+    try {
+        $val = (& op read $toolCredRefs[$key] 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $val) {
+            $toolCreds[$key] = $val.Trim()
+        } else {
+            Write-Warning "Tool credential '$key' not found at $($toolCredRefs[$key])"
+        }
+    } catch {
+        Write-Warning "Tool credential '$key' unavailable: $_"
+    }
+}
+if ($toolCreds.Count -gt 0) {
+    Write-Host "[OK] Tool credentials retrieved: $($toolCreds.Keys -join ', ')" -ForegroundColor Green
+} else {
+    Write-Warning "No tool credentials were retrieved"
+}
+
 # Build function for a single miner type
 function Build-Miner {
     param(
@@ -168,7 +201,11 @@ function Build-Miner {
         if ($BuildParams.AutonomysApiKey) {
             $params.AutonomysApiKey = $BuildParams.AutonomysApiKey
         }
-        
+        # Pass resolved tool credentials
+        if ($BuildParams.ToolCredentials -and $BuildParams.ToolCredentials.Count -gt 0) {
+            $params.ToolCredentials = $BuildParams.ToolCredentials
+        }
+
         & $buildScript @params
         
         if ($LASTEXITCODE -ne 0) {
@@ -206,6 +243,7 @@ $buildParams = @{
     Sign = $Sign
     AutonomysUploadEnabled = $true
     AutonomysApiKey = $autonomysKey
+    ToolCredentials = $toolCreds
 }
 
 Write-Host "`n============================================================" -ForegroundColor Cyan
@@ -253,7 +291,18 @@ if ($Parallel) {
             if ($BuildParams.Sign) {
                 $params.Sign = $true
             }
-            
+            # Inject Autonomys upload enable flag and API key
+            if ($BuildParams.AutonomysUploadEnabled) {
+                $params.AutonomysUploadEnabled = $BuildParams.AutonomysUploadEnabled
+            }
+            if ($BuildParams.AutonomysApiKey) {
+                $params.AutonomysApiKey = $BuildParams.AutonomysApiKey
+            }
+            # Pass resolved tool credentials
+            if ($BuildParams.ToolCredentials -and $BuildParams.ToolCredentials.Count -gt 0) {
+                $params.ToolCredentials = $BuildParams.ToolCredentials
+            }
+
             $startTime = Get-Date
             try {
                 & $BuildScript @params 2>&1 | Out-String

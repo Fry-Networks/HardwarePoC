@@ -49,7 +49,7 @@ DOCKER_IMAGE=${DOCKER_IMAGE:-"python:3.11-slim"}
 # Install Python packages
 "$PYTHON_BIN" -m pip install --upgrade pip
 
-base_packages=(pyinstaller psutil requests cryptography h3 pillow)
+base_packages=(pyinstaller psutil requests cryptography h3 pillow pandas pyarrow)
 optional_packages=(sounddevice pyserial numpy matplotlib shapely geoip2)
 packages=()
 if [ "$BUILD_GUI" = true ]; then
@@ -369,9 +369,9 @@ svc_args=(--clean --onefile --noconsole --noconfirm --name "$svc_name" --distpat
 
 # For GUI/full bundles include native collects; for service-only builds add explicit excludes
 if [ "$BUILD_GUI" = true ]; then
-  svc_args+=(--collect-binaries h3 --collect-all shapely --collect-all geoip2)
+  svc_args+=(--collect-binaries h3 --collect-all shapely --collect-all geoip2 --collect-all pyarrow)
 else
-  svc_args+=(--exclude-module pyarrow --exclude-module pandas --exclude-module PySide6 --exclude-module matplotlib --exclude-module numpy --exclude-module sounddevice --exclude-module portaudio --exclude-module pyside6)
+  svc_args+=(--collect-all pyarrow --exclude-module PySide6 --exclude-module matplotlib --exclude-module numpy --exclude-module sounddevice --exclude-module portaudio --exclude-module pyside6 --exclude-module numba --exclude-module pyarrow.tests)
 fi
 
 # Icon resolution

@@ -3,6 +3,8 @@
 Reads CSV measurement data and aggregates it into hourly parquet files.
 """
 
+from __future__ import annotations
+
 import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -223,10 +225,18 @@ def aggregate_decibel_hourly(rows: List[Dict[str, Any]]) -> pd.DataFrame:
 
 
 def aggregate_aem_hourly(rows: List[Dict[str, Any]]) -> pd.DataFrame:
-    """Aggregate AEM measurements into hourly data.
+    """Aggregate AEM Olostep Browser measurements into hourly data.
+
+    Metrics:
+    - poi mean -> uptime_ratio (0.0-1.0), fraction of interval Olostep was active
+    - tasks_completed sum -> total Mellowtel tasks per hour
+    - last_activity_age_s mean/min/max -> recency of Mellowtel work
+    - mem_rss_mb mean/min/max -> browser resource usage
+    - proc_count mean/min/max -> process stability
 
     Args:
-        rows: List of measurement dicts with timestamp, poi
+        rows: List of measurement dicts with timestamp, poi, tasks_completed,
+              last_activity_age_s, mem_rss_mb, proc_count
 
     Returns:
         DataFrame with hourly aggregates
@@ -240,15 +250,30 @@ def aggregate_aem_hourly(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
     df['hour'] = df['timestamp'].dt.hour
-    df['poi'] = pd.to_numeric(df['poi'], errors='coerce')
+
+    # Convert all numeric columns (handles old-schema rows with missing columns)
+    for col in ['poi', 'tasks_completed', 'last_activity_age_s', 'mem_rss_mb', 'proc_count']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        else:
+            df[col] = 0
 
     hourly = df.groupby('hour').agg({
-        'poi': ['mean', 'min', 'max', 'count']
+        'poi': 'mean',
+        'tasks_completed': 'sum',
+        'last_activity_age_s': ['mean', 'min', 'max'],
+        'mem_rss_mb': ['mean', 'min', 'max'],
+        'proc_count': ['mean', 'min', 'max', 'count'],
     }).reset_index()
 
     hourly.columns = [
         'hour',
-        'poi_avg', 'poi_min', 'poi_max', 'sample_count'
+        'uptime_ratio',
+        'tasks_completed',
+        'activity_age_avg_s', 'activity_age_min_s', 'activity_age_max_s',
+        'mem_rss_avg_mb', 'mem_rss_min_mb', 'mem_rss_max_mb',
+        'proc_count_avg', 'proc_count_min', 'proc_count_max',
+        'sample_count',
     ]
 
     date = df['timestamp'].iloc[0].date()
@@ -256,8 +281,11 @@ def aggregate_aem_hourly(rows: List[Dict[str, Any]]) -> pd.DataFrame:
 
     hourly = hourly[[
         'date', 'hour',
-        'poi_avg', 'poi_min', 'poi_max',
-        'sample_count'
+        'uptime_ratio', 'tasks_completed',
+        'activity_age_avg_s', 'activity_age_min_s', 'activity_age_max_s',
+        'mem_rss_avg_mb', 'mem_rss_min_mb', 'mem_rss_max_mb',
+        'proc_count_avg', 'proc_count_min', 'proc_count_max',
+        'sample_count',
     ]]
 
     return hourly
@@ -403,6 +431,14 @@ def create_hourly_metadata(
                 "day_min": float(hourly_df['dbfs_min'].min()),
                 "day_max": float(hourly_df['dbfs_max'].max())
             }
+        }
+    elif measurement_type == 'aem':
+        total_tasks = int(hourly_df['tasks_completed'].sum())
+        metadata["summary"] = {
+            "uptime_ratio": float(hourly_df['uptime_ratio'].mean()),
+            "tasks_completed_total": total_tasks,
+            "peak_tasks_hour": int(hourly_df.loc[hourly_df['tasks_completed'].idxmax(), 'hour']) if total_tasks > 0 else -1,
+            "avg_memory_mb": float(hourly_df['mem_rss_avg_mb'].mean()),
         }
 
     return metadata

@@ -14,8 +14,8 @@ param(
   [bool]$SoftwareUptodate = $true,
   [SecureString]$OPRefPfxPassword = $null,
   # Tool Credentials (embedded at build time from 1Password)
-  [string]$OPRefPresearchRegCode = "op://Hardware/Presearch/registration_code",
-  [string]$OPRefPresearchApiKey = "op://Hardware/Presearch/api_key",
+  [string]$OPRefPresearchRegCode = "op://Storage Validator Nodes/Presearch/registration_code",
+  [string]$OPRefPresearchApiKey = "op://Storage Validator Nodes/Presearch/api_key",
   [string]$OPRefDiiiscoApiKey = "op://Hardware/Diiisco/api_key",
   [string]$OPRefDiiiscoNodeKey = "op://Hardware/Diiisco/node_key",
   [string]$OPRefSpaceAcresFarmerKey = "op://Hardware/SpaceAcres/farmer_key",
@@ -31,6 +31,7 @@ param(
   [string]$OPRefAutonomysApiKey = "op://DataStorage/AutoDrive/AUTONOMYS_API_KEY",
   [string]$AutonomysApiKey = "",           # Direct Autonomys API key value (bypasses 1Password)
   [bool]$AutonomysUploadEnabled = $true,  # Enable Autonomys upload at runtime
+  [hashtable]$ToolCredentials = @{},      # Direct tool credentials hashtable (bypasses 1Password, used by batch builds)
 
   [int]$IntervalSeconds = 600,
   [string]$TlsCAFile = "",
@@ -356,16 +357,20 @@ try {
     try {
       if ($OPRefMysteriumApiKey) {
         $val = (& op read $OPRefMysteriumApiKey 2>$null).Trim()
-        if ($val) { 
+        if ($val) {
           $toolCreds.mysterium_api_key = $val
           Write-Host "Mysterium API key configured"
+        } else {
+          Write-Warning "Mysterium API key not found at $OPRefMysteriumApiKey"
         }
       }
       if ($OPRefMysteriumIdentity) {
         $val = (& op read $OPRefMysteriumIdentity 2>$null).Trim()
-        if ($val) { 
+        if ($val) {
           $toolCreds.mysterium_identity = $val
           Write-Host "Mysterium identity configured"
+        } else {
+          Write-Warning "Mysterium identity not found at $OPRefMysteriumIdentity"
         }
       }
     } catch { Write-Warning "Mysterium credentials unavailable: $_" }
@@ -374,16 +379,20 @@ try {
     try {
       if ($OPRefPresearchRegCode) {
         $val = (& op read $OPRefPresearchRegCode 2>$null).Trim()
-        if ($val) { 
+        if ($val) {
           $toolCreds.presearch_registration_code = $val
           Write-Host "Presearch registration code configured"
+        } else {
+          Write-Warning "Presearch registration code not found at $OPRefPresearchRegCode"
         }
       }
       if ($OPRefPresearchApiKey) {
         $val = (& op read $OPRefPresearchApiKey 2>$null).Trim()
-        if ($val) { 
+        if ($val) {
           $toolCreds.presearch_api_key = $val
           Write-Host "Presearch API key configured"
+        } else {
+          Write-Warning "Presearch API key not found at $OPRefPresearchApiKey"
         }
       }
     } catch { Write-Warning "Presearch credentials unavailable: $_" }
@@ -392,16 +401,20 @@ try {
     try {
       if ($OPRefDiiiscoApiKey) {
         $val = (& op read $OPRefDiiiscoApiKey 2>$null).Trim()
-        if ($val) { 
+        if ($val) {
           $toolCreds.diiisco_api_key = $val
           Write-Host "Diiisco API key configured"
+        } else {
+          Write-Warning "Diiisco API key not found at $OPRefDiiiscoApiKey"
         }
       }
       if ($OPRefDiiiscoNodeKey) {
         $val = (& op read $OPRefDiiiscoNodeKey 2>$null).Trim()
-        if ($val) { 
+        if ($val) {
           $toolCreds.diiisco_node_key = $val
           Write-Host "Diiisco node key configured"
+        } else {
+          Write-Warning "Diiisco node key not found at $OPRefDiiiscoNodeKey"
         }
       }
     } catch { Write-Warning "Diiisco credentials unavailable: $_" }
@@ -410,16 +423,20 @@ try {
     try {
       if ($OPRefSpaceAcresFarmerKey) {
         $val = (& op read $OPRefSpaceAcresFarmerKey 2>$null).Trim()
-        if ($val) { 
+        if ($val) {
           $toolCreds.spaceacres_farmer_key = $val
           Write-Host "Space Acres farmer key configured"
+        } else {
+          Write-Warning "Space Acres farmer key not found at $OPRefSpaceAcresFarmerKey"
         }
       }
       if ($OPRefSpaceAcresRewardAddr) {
         $val = (& op read $OPRefSpaceAcresRewardAddr 2>$null).Trim()
-        if ($val) { 
+        if ($val) {
           $toolCreds.spaceacres_reward_address = $val
           Write-Host "Space Acres reward address configured"
+        } else {
+          Write-Warning "Space Acres reward address not found at $OPRefSpaceAcresRewardAddr"
         }
       }
     } catch { Write-Warning "Space Acres credentials unavailable: $_" }
@@ -428,9 +445,11 @@ try {
     try {
       if ($OPRefBrightApiToken) {
         $val = (& op read $OPRefBrightApiToken 2>$null).Trim()
-        if ($val) { 
+        if ($val) {
           $toolCreds.bright_api_token = $val
           Write-Host "Bright API token configured"
+        } else {
+          Write-Warning "Bright API token not found at $OPRefBrightApiToken"
         }
       }
     } catch { Write-Warning "Bright credentials unavailable: $_" }
@@ -442,6 +461,8 @@ try {
         if ($val) {
           $toolCreds.honeygain_api_key = $val
           Write-Host "Honeygain API key configured"
+        } else {
+          Write-Warning "Honeygain API key not found at $OPRefHoneygainApiKey"
         }
       }
     } catch { Write-Warning "Honeygain credentials unavailable: $_" }
@@ -456,6 +477,8 @@ try {
         if ($val) {
           $toolCreds.autonomys_api_key = $val
           Write-Host "Autonomys API key configured"
+        } else {
+          Write-Warning "Autonomys API key not found at $OPRefAutonomysApiKey"
         }
       }
     } catch { Write-Warning "Autonomys credentials unavailable: $_" }
@@ -473,12 +496,21 @@ try {
     }
   }
 
-  # Handle direct Autonomys values when 1Password is disabled (e.g., batch builds)
-  if (-not $Use1Password -and $AutonomysApiKey) {
-    if (-not $cfg.tool_credentials) { $cfg.tool_credentials = @{} }
-    $cfg.tool_credentials.autonomys_api_key = $AutonomysApiKey.Trim()
-    Write-Host "Autonomys API key configured (direct, no 1Password)"
-    if ($AutonomysUploadEnabled) {
+  # Handle direct tool credentials when 1Password is disabled (e.g., batch builds)
+  if (-not $Use1Password) {
+    if ($ToolCredentials.Count -gt 0) {
+      if (-not $cfg.tool_credentials) { $cfg.tool_credentials = @{} }
+      foreach ($key in $ToolCredentials.Keys) {
+        $cfg.tool_credentials[$key] = $ToolCredentials[$key]
+      }
+      Write-Host "Tool credentials configured (direct): $($ToolCredentials.Keys -join ', ')"
+    }
+    if ($AutonomysApiKey) {
+      if (-not $cfg.tool_credentials) { $cfg.tool_credentials = @{} }
+      $cfg.tool_credentials.autonomys_api_key = $AutonomysApiKey.Trim()
+      Write-Host "Autonomys API key configured (direct, no 1Password)"
+    }
+    if ($AutonomysUploadEnabled -or ($cfg.tool_credentials -and $cfg.tool_credentials.ContainsKey('autonomys_api_key'))) {
       $cfg.autonomys_upload_enabled = $true
       Write-Host "Autonomys upload enabled (direct)"
     }
@@ -524,7 +556,7 @@ $svcDistDir = Join-Path $PWD ("dist\\svc\\${Code}")
 $svcArgs = @('--clean','--onefile','--noconsole','--noconfirm','--name', $SvcName, '--distpath', $svcDistDir)
 
 # Ensure critical geo/PoL dependencies are bundled (service builds too)
-$svcArgs += @('--collect-all','h3','--collect-all','shapely','--collect-all','geoip2')
+$svcArgs += @('--collect-all','h3','--collect-all','shapely','--collect-all','geoip2','--collect-all','pyarrow')
 
 # For GUI/full bundles include native collects; for service-only builds exclude per miner group
 if ($BuildGUI) {
@@ -534,7 +566,8 @@ if ($BuildGUI) {
   $allHeavyModules = @('sounddevice','_sounddevice_data','portaudio',
                        'pyserial','serial',
                        'matplotlib','PySide6','pyside6',
-                       'tkinter','_tkinter','unittest','test','xmlrpc','pydoc')
+                       'tkinter','_tkinter','unittest','test','xmlrpc','pydoc',
+                       'numba','pyarrow.tests')
 
   # Modules each group NEEDS (beyond core). Everything else gets excluded.
   $groupRequiredModules = @{
