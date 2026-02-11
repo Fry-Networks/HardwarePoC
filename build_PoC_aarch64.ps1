@@ -90,7 +90,7 @@ apt-get update -qq && apt-get install -y -qq \
 
 # Install Python packages
 pip install --quiet --upgrade pip
-pip install --quiet pyinstaller psutil requests cryptography h3 pillow
+pip install --quiet pyinstaller psutil requests cryptography h3 pillow pandas pyarrow
 
 # Metadata maps
 declare -A GROUP_MAP=( [BM]=Bandwidth [IDM]=Decibel [ODM]=Decibel [ISM]=Satellite [OSM]=Satellite [RDN]=Node [SDN]=Node [SVN]=Node [AEM]=AI [IRM]=Radiation )
@@ -191,10 +191,12 @@ python3 -m PyInstaller \
   --clean --onefile --noconsole --noconfirm \
   --name "$SVC_NAME" \
   --distpath "$svc_dist_dir" \
-  --exclude-module pyarrow --exclude-module pandas \
+  --collect-all pyarrow \
   --exclude-module PySide6 --exclude-module matplotlib \
   --exclude-module numpy --exclude-module sounddevice \
   --exclude-module portaudio --exclude-module pyside6 \
+  --exclude-module numba \
+  --exclude-module pyarrow.tests \
   miner_online_simple.py
 
 # Move to release
