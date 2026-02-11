@@ -3084,6 +3084,7 @@ def write_week_local(
     multiplier_per_tool: float = 0.1,
     presearch_active: bool = False,
     diiisco_active: bool = False,
+    api_available: Optional[bool] = None,  # Hardware API availability
 ) -> None:
     """
     One file per rewards-week (Fri 00:00 UTC → next Fri 00:00 UTC).
@@ -3150,6 +3151,14 @@ def write_week_local(
 
     # Docker availability (cached 60s, checked by service running as SYSTEM)
     doc["docker"] = _is_docker_available()
+
+    # Hardware API availability (for GUI warnings)
+    if isinstance(api_available, bool):
+        doc["api_available"] = api_available
+        doc["api_last_updated"] = _iso_z(ts_utc)
+    elif "api_available" not in doc:
+        doc["api_available"] = True  # Default to true if never set
+        doc["api_last_updated"] = None
 
     doc["date"] = _date_iso(ts_utc)
     doc["week_start"] = _iso_z(week_start)
@@ -5293,7 +5302,7 @@ def _measurement_collection_loop() -> None:
                                 if norm and norm in expected:
                                     # Upload collectors use a 10-minute slot (600s)
                                     try:
-                                        write_week_local(miner_key, now_utc(), "online", 600, pod_status=True)
+                                        write_week_local(miner_key, now_utc(), "online", 600, pod_status=True, api_available=True)
                                     except Exception as e:
                                         log.debug("Failed to mark weekly pod_status: %s", e)
                         except Exception:
@@ -5498,7 +5507,7 @@ def main() -> None:
             client = connect_mongo(api_base, tlsCAFile, cfg)
             coll = client["PoC"]["hardware"]
 
-            # Ensure lease is valid
+            # Ensure lease is valid (best-effort during API outages)
             if not verify_or_acquire_installation_lease(
                 client, miner_key, install_id, lease_seconds=lease_seconds
             ):
@@ -5507,9 +5516,9 @@ def main() -> None:
                     miner_key,
                     install_id,
                 )
-                log.error("Cannot start service without valid lease.")
-                time.sleep(2)
-                sys.exit(9)
+                log.error("Continuing without lease - will retry on next slot (API may be down)")
+                # Don't exit - allow service to run in degraded mode
+                # Measurements will still be collected locally
 
             # Upsert installation record (per-machine)
             try:
@@ -5612,6 +5621,7 @@ def main() -> None:
                         verified=verified_status,
                         gui_version=GUI_VERSION,
                         skip_slot=True,
+                        api_available=None,
                     )
                 except Exception:
                     pass
@@ -5870,6 +5880,7 @@ def main() -> None:
             verified=verified_status,
             gui_version=GUI_VERSION,
             skip_slot=True,
+            api_available=None,
         )
     except Exception as e:
         log.debug("Failed to write initial Docker status to weekly file: %s", e)
@@ -6017,13 +6028,15 @@ def main() -> None:
                     multiplier_per_tool=multiplier_per_tool,
                     presearch_active=svn_presearch_active,
                     diiisco_active=svn_diiisco_active,
+                    api_available=True,  # Will be updated in DB work block if API fails
                 )
             except Exception:
                 pass
 
             # ----------------------------
-            # DB work
+            # DB work (resilient to API outages)
             # ----------------------------
+            api_available = True
             try:
                 # SVN: push Presearch IP status every 10 minutes
                 if MINER_CODE == "SVN":
@@ -6255,7 +6268,7 @@ def main() -> None:
                 except Exception:
                     pass
 
-                # Renew lease; reacquire if needed
+                # Renew lease; reacquire if needed (best-effort during API outages)
                 try:
                     renewed = renew_installation_lease(client, miner_key, install_id, lease_seconds=lease_seconds)
                     if not renewed:
@@ -6263,50 +6276,97 @@ def main() -> None:
                         if not verify_or_acquire_installation_lease(
                             client, miner_key, install_id, lease_seconds=lease_seconds, max_retries=5
                         ):
-                            log.error("Lost global lease for %s and failed to reacquire; exiting.", miner_key)
-                            time.sleep(2)
-                            sys.exit(8)
-                        log.info("Successfully reacquired lease for %s", miner_key)
+                            log.warning("Lost global lease for %s; will retry next slot (API may be down)", miner_key)
+                            api_available = False
+                        else:
+                            log.info("Successfully reacquired lease for %s", miner_key)
                 except Exception as e:
                     msg = str(e)
                     is_api_down = any(x in msg.lower() for x in ["502", "503", "504", "bad gateway", "timeout", "connection"])
                     if is_api_down:
-                        log.warning("External API unreachable during lease renewal: %s", msg)
-                        if not verify_or_acquire_installation_lease(
-                            client, miner_key, install_id, lease_seconds=lease_seconds, max_retries=5
-                        ):
-                            log.error("Failed to reacquire lease for %s; exiting.", miner_key)
-                            time.sleep(2)
-                            sys.exit(8)
-                        log.info("Successfully reacquired lease for %s after API recovery", miner_key)
+                        log.warning("Hardware API unreachable during lease renewal: %s (continuing in degraded mode)", msg)
+                        api_available = False
                     else:
-                        log.error("Failed to renew lease for %s: %s; exiting.", miner_key, e)
-                        time.sleep(2)
-                        sys.exit(8)
+                        log.error("Failed to renew lease for %s: %s (continuing with retry)", miner_key, e)
+                        api_available = False
 
+                if api_available:
+                    try:
+                        api_health_backoff.reset()
+                        log.debug("Hardware API healthy")
+                    except Exception:
+                        pass
+                else:
+                    log.info("Hardware API unavailable - measurements continue locally, DB updates will resume when API recovers")
+                    # Update weekly cache with API unavailable status for GUI warning
+                    try:
+                        write_week_local(
+                            miner_key,
+                            slot_ts,
+                            status,
+                            interval,
+                            pod_status=pod_slot_ok,
+                            mac_registered=mac_registered,
+                            mac_mismatch=local_mismatch,
+                            poi_data=poi_snapshot,
+                            pol_status=pol_status,
+                            verified=verified_status,
+                            gui_version=GUI_VERSION,
+                            multiplier_base=multiplier_base,
+                            multiplier_per_tool=multiplier_per_tool,
+                            presearch_active=svn_presearch_active,
+                            diiisco_active=svn_diiisco_active,
+                            api_available=False,
+                        )
+                    except Exception:
+                        pass
+            except Exception as db_err:
+                log.warning("DB operations failed: %s (measurements continue locally)", db_err)
+                api_available = False
+                # Update weekly cache with API unavailable status for GUI warning
                 try:
-                    api_health_backoff.reset()
+                    norm_active = re.sub(r"[^0-9a-f]", "", (miner_mac_local or "").lower())
+                    norm_registered = re.sub(r"[^0-9a-f]", "", (mac_registered or "").lower())
+                    local_mismatch = bool(norm_active and norm_registered and norm_active != norm_registered)
+                    write_week_local(
+                        miner_key,
+                        slot_ts,
+                        status,
+                        interval,
+                        pod_status=pod_slot_ok,
+                        mac_registered=mac_registered,
+                        mac_mismatch=local_mismatch,
+                        poi_data=poi_snapshot,
+                        pol_status=pol_status,
+                        verified=verified_status,
+                        gui_version=GUI_VERSION,
+                        multiplier_base=multiplier_base,
+                        multiplier_per_tool=multiplier_per_tool,
+                        presearch_active=svn_presearch_active,
+                        diiisco_active=svn_diiisco_active,
+                        api_available=False,
+                    )
                 except Exception:
                     pass
-            except Exception:
-                pass
 
         except ApiError as e:
-            log.error("API error: %s", e)
+            log.warning("Hardware API error: %s (continuing in degraded mode)", e)
             try:
                 api_health_backoff.record_failure()
                 api_health_backoff.wait_for_health(api_base)
             except Exception:
                 pass
+            # Try to reconnect but don't exit if it fails
             try:
                 client = connect_mongo(api_base, tlsCAFile, cfg)
                 coll = client["PoC"]["hardware"]
+                log.info("Hardware API reconnected successfully")
                 try:
                     api_health_backoff.reset()
                 except Exception:
                     pass
             except Exception as e2:
-                log.error("Reconnect failed: %s", e2)
+                log.warning("Hardware API still unreachable: %s (will retry next slot)", e2)
 
         except Exception as e:
             log.error("Iteration failed: %s", e)
