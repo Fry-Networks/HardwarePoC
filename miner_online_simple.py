@@ -2487,7 +2487,9 @@ def _update_sdk_rewards_params(base: float, per_tool: float) -> bool:
     payload["base_reward"] = base
     payload["per_tool_reward"] = per_tool
     ok = _write_encrypted_gui_config(payload)
-    # Removed noisy log_step - params update every hour but rarely change
+    # Only log when values actually change
+    if ok and changed:
+        log_step("sdk_rewards_params_updated", {"base_reward": base, "per_tool_reward": per_tool})
     return ok
 
 def read_sdk_approval_state() -> Dict[str, bool]:
