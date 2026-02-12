@@ -5532,10 +5532,12 @@ def main() -> None:
                 poc_required = required_versions.get("poc_version")
                 multiplier_base = float(required_versions.get("multiplier_base", 1.0))
                 multiplier_per_tool = float(required_versions.get("multiplier_per_tool", 0.1))
-                try:
-                    _update_sdk_rewards_params(multiplier_base, multiplier_per_tool)
-                except Exception:
-                    pass
+                # Only update GUI config for miner types that use parametric rewards
+                if MINER_CODE in ("BM", "RDN"):
+                    try:
+                        _update_sdk_rewards_params(multiplier_base, multiplier_per_tool)
+                    except Exception:
+                        pass
 
                 is_software_outdated = False
                 is_poc_outdated = False
@@ -6093,10 +6095,12 @@ def main() -> None:
                 poc_required = required_versions.get("poc_version")
                 multiplier_base = float(required_versions.get("multiplier_base", 1.0))
                 multiplier_per_tool = float(required_versions.get("multiplier_per_tool", 0.1))
-                try:
-                    _update_sdk_rewards_params(multiplier_base, multiplier_per_tool)
-                except Exception:
-                    pass
+                # Only update GUI config for miner types that use parametric rewards
+                if MINER_CODE in ("BM", "RDN"):
+                    try:
+                        _update_sdk_rewards_params(multiplier_base, multiplier_per_tool)
+                    except Exception:
+                        pass
 
                 outdated = False
                 try:
