@@ -443,7 +443,7 @@ if [ "$SIGN" = true ]; then
 fi
 
 # Move to release
-out="release/$CODE"
+out="release/$VERSION"
 mkdir -p "$out"
 mv "$svc_built" "$out/$svc_name"
 

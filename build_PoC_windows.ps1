@@ -665,7 +665,7 @@ if ($BuildGUI) {
   }
 
   # Move to release
-  $out = "release\$Code"; New-Item -ItemType Directory -Force -Path $out | Out-Null
+  $out = "release\$Version"; New-Item -ItemType Directory -Force -Path $out | Out-Null
   if ($guiDistDir -and $GuiName) {
     $guiBuilt = Join-Path $guiDistDir ("{0}.exe" -f $GuiName)
     if (Test-Path $guiBuilt) { Move-Item -Force $guiBuilt "$out\$GuiName.exe" }

@@ -378,7 +378,7 @@ Write-Host "Total time: $($overallElapsed.TotalMinutes.ToString('F1')) minutes"
 if ($successful.Count -gt 0) {
     Write-Host "`n[OK] Successful builds:" -ForegroundColor Green
     foreach ($result in $successful) {
-        $exePath = "release\$($result.Code)\FRY_PoC_$($result.Code)_v$Version.exe"
+        $exePath = "release\$Version\FRY_PoC_$($result.Code)_v$Version.exe"
         $exists = Test-Path $exePath
         $status = if ($exists) { "[OK]" } else { "[?]" }
         Write-Host "  $status $($result.Code) ($($result.Duration.TotalSeconds.ToString('F1'))s)" -ForegroundColor Green

@@ -1718,6 +1718,15 @@ def upsert_installation_record(
             "last_seen_at": now_utc(),
             "is_installed": True,
         }
+        
+        # Capture external IP (best-effort)
+        try:
+            ext_ip = _public_ip(timeout=3.0)
+            if ext_ip:
+                payload_set["external_ip"] = ext_ip
+        except Exception:
+            pass
+        
         if isinstance(software_version_needed, str) and software_version_needed:
             payload_set["software_version_needed"] = software_version_needed
         if isinstance(poc_version_needed, str) and poc_version_needed:

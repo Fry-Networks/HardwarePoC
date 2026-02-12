@@ -70,7 +70,7 @@ if ($dockerPath -match '^([A-Za-z]):(.*)') {
     $dockerPath = '/' + $Matches[1].ToLower() + $Matches[2]
 }
 $svcName = "FRY_PoC_${Code}_v${Version}_linux_aarch64"
-$relDir  = "release/$Code"
+$relDir  = "release/$Version"
 
 Write-Host "Starting Docker build..." -ForegroundColor Cyan
 Write-Host "  Volume mount: ${dockerPath}:/build"
@@ -200,7 +200,7 @@ python3 -m PyInstaller \
   miner_online_simple.py
 
 # Move to release
-out="release/$CODE"
+out="release/$VERSION"
 mkdir -p "$out"
 mv "$svc_dist_dir/$SVC_NAME" "$out/$SVC_NAME"
 
@@ -241,14 +241,14 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-$outputPath = Join-Path $projectDir "release\$Code\$svcName"
+$outputPath = Join-Path $projectDir "release\$Version\$svcName"
 $sha256Path = "${outputPath}.sha256"
 
 if (Test-Path $outputPath) {
     Write-Host ""
     Write-Host "Build successful!" -ForegroundColor Green
-    Write-Host "  Binary:  release\$Code\$svcName"
-    Write-Host "  SHA256:  release\$Code\$svcName.sha256"
+    Write-Host "  Binary:  release\$Version\$svcName"
+    Write-Host "  SHA256:  release\$Version\$svcName.sha256"
     Write-Host ""
     Write-Host "Copy these to the drop/ directory for DropWireless delivery." -ForegroundColor Yellow
 } else {
