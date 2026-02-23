@@ -43,7 +43,8 @@ _presearch_cloud_last_call: float = 0.0
 _presearch_cloud_cache: Optional[Dict[str, Any]] = None
 _presearch_remote_addr_last_log: float = 0.0
 _presearch_last_remote_addrs: Optional[list[str]] = None
-DIIISCO_DEFAULT_PORT = 8080
+DIIISCO_MONITORING_PORT = 3001
+OLLAMA_DEFAULT_PORT = 11434
 SPACE_ACRES_DEFAULT_RPC_PORT = 9944
 
 
@@ -398,53 +399,53 @@ def get_public_ip() -> str:
 # ============================================================================
 
 def poll_diiisco() -> Dict[str, Any]:
-    """Poll Diiisco node status via Docker container.
-    
+    """Poll DIIISCO Docker Compose stack (Ollama + DIIISCO node).
+
+    Monitors both containers:
+    - Ollama health via :11434/api/tags
+    - DIIISCO monitoring via :3001/stats
+
     Returns dict with keys:
     - enabled: bool
     - running: bool
     - connected: bool
-    - node_id: str | None
-    - peer_count: int
-    - discoveries_count: int
+    - ollama_healthy: bool
+    - cpu_usage: dict | None
+    - memory_usage: dict | None
+    - uptime: float | None
+    - model: str | None
     - error: str | None
     """
-    result = {
+    result: Dict[str, Any] = {
         "enabled": False,
         "running": False,
         "connected": False,
-        "node_id": None,
-        "peer_count": 0,
-        "discoveries_count": 0,
+        "ollama_healthy": False,
+        "cpu_usage": None,
+        "memory_usage": None,
+        "uptime": None,
+        "model": None,
         "error": None,
     }
-    
-    # Check if diiisco-node container is running
-    try:
-        completed = subprocess.run(
-            ["docker", "ps", "--filter", "name=diiisco-node", "--format", "{{.Names}}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if completed.returncode == 0 and "diiisco-node" in completed.stdout:
-            result["enabled"] = True
-            result["running"] = True
-    except Exception as e:
-        result["error"] = f"Docker check failed: {e}"
-        return result
-    
-    # Poll Diiisco API (if running)
-    if result["running"]:
-        port = int(os.environ.get("DIIISCO_API_PORT", DIIISCO_DEFAULT_PORT))
-        if _port_reachable(port):
-            api_data = _get_json(f"http://127.0.0.1:{port}/api/status")
-            if api_data:
-                result["connected"] = api_data.get("connected", False)
-                result["node_id"] = api_data.get("node_id")
-                result["peer_count"] = api_data.get("peer_count", 0)
-                result["discoveries_count"] = api_data.get("discoveries_count", 0)
-    
+
+    # Check Ollama health at :11434/api/tags
+    if _port_reachable(OLLAMA_DEFAULT_PORT):
+        ollama_data = _get_json(f"http://127.0.0.1:{OLLAMA_DEFAULT_PORT}/api/tags")
+        if ollama_data is not None:
+            result["ollama_healthy"] = True
+
+    # Check DIIISCO monitoring at :3001/stats
+    if _port_reachable(DIIISCO_MONITORING_PORT):
+        result["enabled"] = True
+        result["running"] = True
+        stats = _get_json(f"http://127.0.0.1:{DIIISCO_MONITORING_PORT}/stats")
+        if stats:
+            result["connected"] = True
+            result["cpu_usage"] = stats.get("cpu")
+            result["memory_usage"] = stats.get("memory")
+            result["uptime"] = stats.get("uptime")
+            result["model"] = stats.get("model")
+
     return result
 
 

@@ -15,9 +15,9 @@ log = logging.getLogger("measurements.autonomys_redactor")
 try:
     import pandas as pd
     PANDAS_AVAILABLE = True
-except ImportError:
+except Exception as _pandas_err:
     PANDAS_AVAILABLE = False
-    log.warning("Parquet support not available. Install with: pip install pandas pyarrow")
+    log.warning("Parquet support not available. Install with: pip install pandas pyarrow (reason: %s)", _pandas_err)
 
 from .autonomys_writer import get_hex_resolution, get_parent_hex, H3_AVAILABLE
 

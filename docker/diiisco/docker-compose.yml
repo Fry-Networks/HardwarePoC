@@ -1,0 +1,40 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    environment:
+      OLLAMA_CPU_ONLY: "1"
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  diiisco:
+    build: ./diiisco
+    container_name: diiisco-node
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      ALGO_ADDRESS: "${ALGO_ADDRESS}"
+      ALGO_MNEMONIC: "${ALGO_MNEMONIC}"
+      OLLAMA_HOST: "http://ollama:11434"
+      MODEL_NAME: "phi2"
+      ENABLE_MONITORING: "true"
+      MONITOR_INTERVAL: "30"
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+    volumes:
+      - diiisco_data:/app/data
+
+volumes:
+  ollama_models:
+  diiisco_data:

@@ -16,8 +16,8 @@ param(
   # Tool Credentials (embedded at build time from 1Password)
   [string]$OPRefPresearchRegCode = "op://Storage Validator Nodes/Presearch/registration_code",
   [string]$OPRefPresearchApiKey = "op://Storage Validator Nodes/Presearch/api_key",
-  [string]$OPRefDiiiscoApiKey = "op://Hardware/Diiisco/api_key",
-  [string]$OPRefDiiiscoNodeKey = "op://Hardware/Diiisco/node_key",
+  [string]$OPRefDiiiscoAlgoAdd = "op://Hardware/Diiisco/algo_address",
+  [string]$OPRefDiiiscoAlgoPP = "op://Hardware/Diiisco/algo_mnemonic",
   [string]$OPRefSpaceAcresFarmerKey = "op://Hardware/SpaceAcres/farmer_key",
   [string]$OPRefSpaceAcresRewardAddr = "op://Hardware/SpaceAcres/reward_address",
   [string]$OPRefBrightApiToken = "op://Bandwidth Miners/Bright Data SDK Login/APP_ID",
@@ -92,6 +92,15 @@ $packages = $packages | Select-Object -Unique
 
 Write-Host "Installing Python packages for $($Code.ToUpper()) ($group): $($packages -join ', ')"
 py -m pip install $packages
+
+# Install Autonomys integration requirements (single source of truth for parquet/cloud deps)
+$autonomysReqs = Join-Path $PSScriptRoot "requirements-autonomys.txt"
+if (Test-Path $autonomysReqs) {
+  Write-Host "Installing Autonomys requirements from $autonomysReqs"
+  py -m pip install -r $autonomysReqs
+} else {
+  Write-Warning "requirements-autonomys.txt not found at $autonomysReqs - skipping"
+}
 
 # ---------- Metadata Mapping ----------
 $MetaByCode = @{
@@ -397,24 +406,24 @@ try {
       }
     } catch { Write-Warning "Presearch credentials unavailable: $_" }
     
-    # Diiisco
+    # Diiisco (Algorand credentials)
     try {
-      if ($OPRefDiiiscoApiKey) {
-        $val = (& op read $OPRefDiiiscoApiKey 2>$null).Trim()
+      if ($OPRefDiiiscoAlgoAdd) {
+        $val = (& op read $OPRefDiiiscoAlgoAdd 2>$null).Trim()
         if ($val) {
-          $toolCreds.diiisco_api_key = $val
-          Write-Host "Diiisco API key configured"
+          $toolCreds.diiisco_algo_add = $val
+          Write-Host "Diiisco Algorand address configured"
         } else {
-          Write-Warning "Diiisco API key not found at $OPRefDiiiscoApiKey"
+          Write-Warning "Diiisco Algorand address not found at $OPRefDiiiscoAlgoAdd"
         }
       }
-      if ($OPRefDiiiscoNodeKey) {
-        $val = (& op read $OPRefDiiiscoNodeKey 2>$null).Trim()
+      if ($OPRefDiiiscoAlgoPP) {
+        $val = (& op read $OPRefDiiiscoAlgoPP 2>$null).Trim()
         if ($val) {
-          $toolCreds.diiisco_node_key = $val
-          Write-Host "Diiisco node key configured"
+          $toolCreds.diiisco_algo_pp = $val
+          Write-Host "Diiisco Algorand mnemonic configured"
         } else {
-          Write-Warning "Diiisco node key not found at $OPRefDiiiscoNodeKey"
+          Write-Warning "Diiisco Algorand mnemonic not found at $OPRefDiiiscoAlgoPP"
         }
       }
     } catch { Write-Warning "Diiisco credentials unavailable: $_" }
@@ -556,7 +565,7 @@ $svcDistDir = Join-Path $PWD ("dist\\svc\\${Code}")
 $svcArgs = @('--clean','--onefile','--noconsole','--noconfirm','--name', $SvcName, '--distpath', $svcDistDir)
 
 # Ensure critical geo/PoL dependencies are bundled (service builds too)
-$svcArgs += @('--collect-all','h3','--collect-all','shapely','--collect-all','geoip2','--collect-all','pyarrow')
+$svcArgs += @('--collect-all','h3','--collect-all','shapely','--collect-all','geoip2','--collect-all','pyarrow','--collect-all','pandas')
 
 # For GUI/full bundles include native collects; for service-only builds exclude per miner group
 if ($BuildGUI) {
@@ -566,7 +575,7 @@ if ($BuildGUI) {
   $allHeavyModules = @('sounddevice','_sounddevice_data','portaudio',
                        'pyserial','serial',
                        'matplotlib','PySide6','pyside6',
-                       'tkinter','_tkinter','unittest','test','xmlrpc','pydoc',
+                       'tkinter','_tkinter','unittest','test','xmlrpc',
                        'numba','pyarrow.tests')
 
   # Modules each group NEEDS (beyond core). Everything else gets excluded.
@@ -630,6 +639,18 @@ if ($BuildGUI) {
     Write-Warning "GeoLite2-Country.mmdb not found; runtime country checks will require external MAXMIND_DB_PATH"
   }
   if ($TlsCAFile) { $svcArgs += @('--add-data', ("{0};." -f $TlsCAFile)) }
+
+  # Bundle DIIISCO Docker Compose stack for RDN builds
+  if ($Code.ToUpper() -eq 'RDN') {
+    $diiiscoDir = Join-Path $PWD 'docker\diiisco'
+    if (Test-Path $diiiscoDir) {
+      $svcArgs += @('--add-data', ("{0};docker\diiisco" -f $diiiscoDir))
+      Write-Host "Bundling DIIISCO Docker Compose stack from $diiiscoDir"
+    } else {
+      Write-Warning "DIIISCO Docker Compose directory not found at $diiiscoDir"
+    }
+  }
+
   # ---------- NEW: per-code metadata + version file for Service ----------
   $meta = Get-ExecutableMetadata -Code $Code -CompanyName $CompanyName -OverrideProductName $ProductName -OverrideFileDescription $FileDescription
   $svcVerFile = Join-Path $PWD ("_tmp_version_svc_${Code}.txt")

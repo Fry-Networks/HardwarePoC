@@ -138,6 +138,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("miner-online")
 _CRIT_FAILURES: dict[str, int] = {}
 
+# Global API availability tracking to prevent spamming when API is down
+_API_DOWN_SINCE: Optional[float] = None  # Timestamp when API first became unavailable
+_API_THROTTLE_INTERVAL = 60.0  # Only retry API calls once per minute when known to be down
+
 SOFTWARE_VERSION_REFRESH_SECONDS = 600
 _SOFTWARE_VERSION_LAST_REFRESH = 0.0
 
@@ -145,7 +149,9 @@ _SOFTWARE_VERSION_LAST_REFRESH = 0.0
 MYST_TEQUILAPI_PORT = 4050
 MYST_WIREGUARD_PORT = 51820
 PRESEARCH_API_PORT = 80
-DIIISCO_API_PORT = 8080
+DIIISCO_MONITORING_PORT = 3001
+DIIISCO_NODE_PORT = 3000
+OLLAMA_PORT = 11434
 DEFAULT_RPC_PORT = 9944  # Default Substrate RPC port (Space Acres)
 
 def refresh_software_version(force: bool = False) -> str:
@@ -185,6 +191,19 @@ def _record_critical_failure(key: str, msg: str, *, threshold: int = 2, exit_cod
                 _write_stop_reason(msg, miner_key=miner_key)
             except Exception:
                 pass
+            # Update weekly status to show API unavailable before exiting
+            try:
+                if miner_key and ("hexId" in key or "mac" in key or "api" in key.lower()):
+                    write_week_local(
+                        miner_key,
+                        now_utc(),
+                        "online",
+                        600,
+                        api_available=False,
+                        skip_slot=True,
+                    )
+            except Exception:
+                pass
             sys.exit(exit_code)
         else:
             log.warning("%s (hit %d/%d)", msg, count, threshold)
@@ -195,6 +214,44 @@ def _record_critical_failure(key: str, msg: str, *, threshold: int = 2, exit_cod
 
 def _reset_critical_failure(key: str) -> None:
     _CRIT_FAILURES.pop(key, None)
+
+
+def _mark_api_down() -> None:
+    """Mark the API as down to enable throttling of API requests."""
+    global _API_DOWN_SINCE
+    if _API_DOWN_SINCE is None:
+        _API_DOWN_SINCE = time.time()
+
+
+def _mark_api_up() -> None:
+    """Mark the API as available again."""
+    global _API_DOWN_SINCE
+    _API_DOWN_SINCE = None
+
+
+def _should_throttle_api() -> bool:
+    """Check if we should throttle API requests due to known downtime.
+    
+    Returns:
+        True if API is known to be down and we should wait before retrying
+    """
+    global _API_DOWN_SINCE
+    if _API_DOWN_SINCE is None:
+        return False
+    
+    elapsed = time.time() - _API_DOWN_SINCE
+    return elapsed < _API_THROTTLE_INTERVAL
+
+
+def _is_api_error(error_msg: str) -> bool:
+    """Check if an error message indicates API unavailability."""
+    msg_lower = str(error_msg).lower()
+    return any(x in msg_lower for x in [
+        "connection", "timeout", "refused", "unreachable",
+        "502", "503", "504", "bad gateway", "timed out",
+        "failed to establish", "max retries exceeded"
+    ])
+
 
 def _write_stop_reason(reason: str, *, miner_key: Optional[str] = None) -> None:
     """Persist last stop reason for GUI consumption."""
@@ -369,7 +426,7 @@ def _get_tool_credentials() -> Dict[str, Any]:
     Credentials are embedded at build time from 1Password and include:
     - mysterium_api_key, mysterium_identity
     - presearch_registration_code
-    - diiisco_api_key
+    - diiisco_algo_add, diiisco_algo_pp
     - spaceacres_farmer_key, spaceacres_reward_address
     - bright_api_token
     - honeygain_api_key
@@ -716,10 +773,13 @@ DOCKER_CONTAINER_DEFS: Dict[str, Dict[str, Any]] = {
         "cred_env": "REGISTRATION_CODE",              # env var name for docker run
     },
     "diiisco-node": {
-        "image": "diiisco/node",
-        "volumes": ["diiisco-node-storage:/app/data"],
-        "cred_key": "diiisco_api_key",
-        "cred_env": "API_KEY",
+        "compose": True,
+        "compose_dir": "docker/diiisco",
+        "containers": ["ollama", "diiisco-node"],
+        "creds": {
+            "diiisco_algo_add": "ALGO_ADDRESS",
+            "diiisco_algo_pp": "ALGO_MNEMONIC",
+        },
     },
 }
 
@@ -732,7 +792,7 @@ DOCKER_TOOLS: frozenset = frozenset({"presearch", "diiisco"})
 # Docker availability cache
 _docker_available: Optional[bool] = None
 _docker_available_ts: float = 0.0
-_DOCKER_CACHE_TTL: float = 60.0  # seconds
+_DOCKER_CACHE_TTL: float = 10.0  # seconds
 
 
 def _is_docker_available() -> bool:
@@ -1236,7 +1296,7 @@ def upload_measurements_for_slot(
         # AEM uses PoI; PoD not enforced.
         return True, delivered_groups
     try:
-        hex_registered = registered_hexid_from_devices(client, miner_key)
+        hex_registered = registered_hexid_from_devices(client, miner_key, allow_degraded=True)
     except Exception:
         hex_registered = None
     else:
@@ -1857,12 +1917,14 @@ def verify_or_acquire_installation_lease(client: MongoProxyClient, miner_key: st
             if api_client.verify_lease_ownership(miner_key, install_id):
                 if attempt > 0:
                     log.info("Lease verified after %d retries", attempt)
+                _mark_api_up()  # API is working
                 return True
             
             # Lease doesn't exist or is held by someone else - try to acquire it
             log.info("No valid lease found, attempting to acquire...")
             if api_client.acquire_installation_lease(miner_key, install_id, lease_seconds):
                 log.info("Successfully acquired installation lease")
+                _mark_api_up()  # API is working
                 return True
             
             # Someone else holds it - this is a real conflict
@@ -1880,19 +1942,21 @@ def verify_or_acquire_installation_lease(client: MongoProxyClient, miner_key: st
             
         except Exception as e:
             error_msg = str(e)
-            is_api_down = any(x in error_msg.lower() for x in ["502", "503", "504", "bad gateway", "timeout", "connection"])
+            is_api_down = _is_api_error(error_msg)
             
-            if is_api_down and attempt < max_retries - 1:
-                # API is down - wait with exponential backoff before retry
-                wait_seconds = min(60, 2 ** attempt)  # 1, 2, 4, 8, 16, 32, 60, 60...
-                log.warning("External API unreachable (attempt %d/%d): %s", attempt + 1, max_retries, error_msg)
-                log.info("Waiting %d seconds for API to recover...", wait_seconds)
-                time.sleep(wait_seconds)
-                continue
-            else:
-                # Non-recoverable error or max retries reached
-                log.error("Lease verification/acquisition failed: %s", e)
-                return False
+            if is_api_down:
+                _mark_api_down()  # Mark API as down globally
+                if attempt < max_retries - 1:
+                    # API is down - wait with exponential backoff before retry
+                    wait_seconds = min(60, 2 ** attempt)  # 1, 2, 4, 8, 16, 32, 60, 60...
+                    log.warning("External API unreachable (attempt %d/%d): %s", attempt + 1, max_retries, error_msg)
+                    log.info("Waiting %d seconds for API to recover...", wait_seconds)
+                    time.sleep(wait_seconds)
+                    continue
+            
+            # Non-recoverable error or max retries reached
+            log.error("Lease verification/acquisition failed: %s", e)
+            return False
     
     log.error("Failed to verify or acquire lease after %d attempts", max_retries)
     return False
@@ -2416,12 +2480,31 @@ def _parse_bool_flag(value: Any) -> Optional[bool]:
             return False
     return None
 
+def _get_gui_config_schema() -> Dict[str, Any]:
+    """Get default schema for gui_config.enc based on miner type."""
+    schema = {
+        "base_reward": 1.0,
+        "per_tool_reward": 0.1,
+    }
+    
+    # Add SDK approval flags based on miner type
+    if MINER_CODE == "BM":
+        schema["honeygain"] = False
+        schema["bright"] = False
+        schema["mysterium"] = False
+    elif MINER_CODE == "RDN":
+        schema["presearch"] = False
+        schema["diiisco"] = False
+    # All other miner types (AEM, IDM, IRM, ISM, ODM, OSM, SDN, SVN) only have base/per_tool
+    
+    return schema
+
 def read_encrypted_gui_config() -> Dict[str, Any]:
     """Read GUI config (SDK approvals + rewards params) from encrypted file."""
     try:
         config_path = os.path.join(data_dir(), "config", "gui_config.enc")
         if not os.path.exists(config_path):
-            return {}
+            return _get_gui_config_schema()
         with open(config_path, "r", encoding="utf-8") as f:
             encrypted_data = json.load(f)
         from cryptography.fernet import Fernet
@@ -2429,23 +2512,26 @@ def read_encrypted_gui_config() -> Dict[str, Any]:
         from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
         import base64
 
-        salt = b'sdk_config_salt_v1'
+        salt = b'gui_config_salt_v1'
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,
             iterations=100000,
         )
-        password = "sdk_config_encryption_key_v1".encode()
+        password = "gui_config_encryption_key_v1".encode()
         key = base64.urlsafe_b64encode(kdf.derive(password))
         f = Fernet(key)
         decrypted = f.decrypt(encrypted_data['data'].encode())
         payload = json.loads(decrypted)
         if isinstance(payload, dict):
-            return payload
+            # Merge with schema to ensure all expected keys exist
+            schema = _get_gui_config_schema()
+            schema.update(payload)
+            return schema
     except Exception:
         pass
-    return {}
+    return _get_gui_config_schema()
 
 def _write_encrypted_gui_config(payload: Dict[str, Any]) -> bool:
     """Write GUI config (SDK approvals + rewards params) to encrypted file."""
@@ -2489,7 +2575,7 @@ def _update_sdk_approval(sdk_name: str, approved: bool) -> bool:
 
 def _update_sdk_rewards_params(base: float, per_tool: float) -> bool:
     """Write base_reward and per_tool_reward into gui_config.enc for GUI."""
-    payload = read_encrypted_gui_config()
+    payload = read_encrypted_gui_config()  # This now includes schema defaults
     old_base = payload.get("base_reward")
     old_per_tool = payload.get("per_tool_reward")
     changed = (old_base != base or old_per_tool != per_tool)
@@ -3137,7 +3223,17 @@ def write_week_local(
     else:
         doc["mac_registered"] = doc.get("mac_registered", "")
 
-    doc["mac_mismatch"] = bool(mac_mismatch) if mac_mismatch is not None else bool(doc.get("mac_mismatch", False))
+    # If mac_registered is empty, set mac_mismatch to null
+    if not doc["mac_registered"]:
+        doc["mac_mismatch"] = None
+    else:
+        doc["mac_mismatch"] = bool(mac_mismatch) if mac_mismatch is not None else bool(doc.get("mac_mismatch", False))
+
+    # Overall online status (derived from 'status' parameter: "online", "offline", etc.)
+    if isinstance(status, str) and status.strip():
+        doc["online_status"] = status.strip()
+    elif "online_status" not in doc:
+        doc["online_status"] = "unknown"
 
     # PoL (Proof of Location) - update when provided, otherwise preserve existing
     if isinstance(pol_status, bool):
@@ -3651,8 +3747,14 @@ def check_country_once(h3_index: Optional[str], *, area_threshold: float = COUNT
         "country_dataset_ready": dataset_ready,
     }
 
-def registered_hexid_from_devices(client: MongoProxyClient, miner_key: str) -> Optional[str]:
-    """Return hexId (res7) from main.devices for this miner_key."""
+def registered_hexid_from_devices(client: MongoProxyClient, miner_key: str, *, allow_degraded: bool = False) -> Optional[str]:
+    """Return hexId (res7) from main.devices for this miner_key.
+    
+    Args:
+        client: Database client
+        miner_key: Miner identifier
+        allow_degraded: If True, don't exit on failure (for degraded mode operation)
+    """
     try:
         coll = client["main"]["devices"]
         if hasattr(coll, "find_one"):
@@ -3670,9 +3772,20 @@ def registered_hexid_from_devices(client: MongoProxyClient, miner_key: str) -> O
                 _reset_critical_failure(f"hexid-missing-{miner_key}")
                 return v
         msg = f"No hexId returned for {miner_key} from /credentials"
-        _record_critical_failure(f"hexid-missing-{miner_key}", msg, miner_key=miner_key)
+        if allow_degraded:
+            count = _CRIT_FAILURES.get(f"hexid-missing-{miner_key}", 0) + 1
+            _CRIT_FAILURES[f"hexid-missing-{miner_key}"] = count
+            log.warning("%s (hit %d, degraded mode)", msg, count)
+        else:
+            _record_critical_failure(f"hexid-missing-{miner_key}", msg, miner_key=miner_key)
     except Exception as e:
-        _record_critical_failure(f"hexid-error-{miner_key}", f"Failed to fetch hexId for {miner_key}: {e}", miner_key=miner_key)
+        msg_err = f"Failed to fetch hexId for {miner_key}: {e}"
+        if allow_degraded:
+            count = _CRIT_FAILURES.get(f"hexid-error-{miner_key}", 0) + 1
+            _CRIT_FAILURES[f"hexid-error-{miner_key}"] = count
+            log.warning("%s (hit %d, degraded mode)", msg_err, count)
+        else:
+            _record_critical_failure(f"hexid-error-{miner_key}", msg_err, miner_key=miner_key)
     return None
 
 def write_location_daily(
@@ -3694,7 +3807,7 @@ def write_location_daily(
     """
 
     area_threshold = COUNTRY_AREA_THRESHOLD
-    hex7 = registered_hexid_from_devices(client, miner_key)
+    hex7 = registered_hexid_from_devices(client, miner_key, allow_degraded=True)
 
     try:
         country_check = check_country_once(hex7, area_threshold=area_threshold)
@@ -3785,9 +3898,14 @@ def write_location_daily(
         pass
     return None
 
-def registered_mac_from_devices(client: MongoProxyClient, miner_key: str) -> Optional[str]:
-    """Return the registered MAC for a miner_key from creds.hardware.miner_mac.
-    Returns None if not present or on error."""
+def registered_mac_from_devices(client: MongoProxyClient, miner_key: str, *, allow_degraded: bool = False) -> Optional[str]:
+    """Return miner_mac (registered MAC) from creds.hardware for this miner_key.
+    
+    Args:
+        client: Database client
+        miner_key: Miner identifier
+        allow_degraded: If True, don't exit on failure (for degraded mode operation)
+    """
     try:
         coll = client["creds"]["hardware"]
         if hasattr(coll, "find_one"):
@@ -3807,9 +3925,20 @@ def registered_mac_from_devices(client: MongoProxyClient, miner_key: str) -> Opt
                     _reset_critical_failure(f"mac-missing-{miner_key}")
                     return v
         msg = f"No registered MAC returned for {miner_key} from /credentials"
-        _record_critical_failure(f"mac-missing-{miner_key}", msg, miner_key=miner_key)
+        if allow_degraded:
+            count = _CRIT_FAILURES.get(f"mac-missing-{miner_key}", 0) + 1
+            _CRIT_FAILURES[f"mac-missing-{miner_key}"] = count
+            log.warning("%s (hit %d, degraded mode)", msg, count)
+        else:
+            _record_critical_failure(f"mac-missing-{miner_key}", msg, miner_key=miner_key)
     except Exception as e:
-        _record_critical_failure(f"mac-error-{miner_key}", f"Failed to fetch registered MAC for {miner_key}: {e}", miner_key=miner_key)
+        msg_err = f"Failed to fetch registered MAC for {miner_key}: {e}"
+        if allow_degraded:
+            count = _CRIT_FAILURES.get(f"mac-error-{miner_key}", 0) + 1
+            _CRIT_FAILURES[f"mac-error-{miner_key}"] = count
+            log.warning("%s (hit %d, degraded mode)", msg_err, count)
+        else:
+            _record_critical_failure(f"mac-error-{miner_key}", msg_err, miner_key=miner_key)
     return None
 
 def group_lock_path() -> str:
@@ -4370,14 +4499,19 @@ def _setup_presearch_firewall() -> bool:
     return success
 
 def _setup_diiisco_firewall() -> bool:
-    """Setup firewall rules for Diiisco node.
-    
+    """Setup firewall rules for Diiisco Docker Compose stack.
+
+    Opens ports for: Ollama (11434), DIIISCO node (3000), monitoring (3001).
+
     Returns:
-        True if rule added successfully, False otherwise
+        True if all rules added successfully, False otherwise
     """
-    success = _add_firewall_rule("Diiisco_API_TCP", DIIISCO_API_PORT, "TCP", "in")
-    log_step("privileged_diiisco_firewall_setup", {"success": success})
-    return success
+    ok = True
+    ok = _add_firewall_rule("Ollama_TCP", OLLAMA_PORT, "TCP", "in") and ok
+    ok = _add_firewall_rule("Diiisco_Node_TCP", DIIISCO_NODE_PORT, "TCP", "in") and ok
+    ok = _add_firewall_rule("Diiisco_Monitor_TCP", DIIISCO_MONITORING_PORT, "TCP", "in") and ok
+    log_step("privileged_diiisco_firewall_setup", {"success": ok})
+    return ok
 
 def _setup_spaceacres_firewall() -> bool:
     """Setup firewall rules for Space Acres (Substrate RPC).
@@ -4522,10 +4656,86 @@ def _stop_windows_service(service_name: str) -> Tuple[bool, str]:
 # Docker container lifecycle (for Presearch, Diiisco, etc.)
 # ---------------------------------------------------------------------------
 
+def _resolve_compose_dir(compose_rel: str) -> Optional[str]:
+    """Resolve Docker Compose directory from bundled data or source tree."""
+    candidates = []
+    if hasattr(sys, "_MEIPASS"):
+        candidates.append(os.path.join(getattr(sys, "_MEIPASS"), compose_rel))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), compose_rel))
+    for p in candidates:
+        compose_file = os.path.join(p, "docker-compose.yml")
+        if os.path.isfile(compose_file):
+            return p
+    return None
+
+
+def _start_docker_compose(cdef: Dict[str, Any], container_name: str) -> Tuple[bool, str]:
+    """Start a Docker Compose stack defined in DOCKER_CONTAINER_DEFS."""
+    compose_dir = _resolve_compose_dir(cdef["compose_dir"])
+    if not compose_dir:
+        return False, f"Compose dir not found for {container_name}"
+
+    _cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+    compose_file = os.path.join(compose_dir, "docker-compose.yml")
+
+    # Build env with injected credentials
+    run_env = dict(os.environ)
+    creds_map = cdef.get("creds", {})
+    if creds_map:
+        try:
+            embedded = _get_tool_credentials()
+            for cred_key, env_var in creds_map.items():
+                val = embedded.get(cred_key, "")
+                if val:
+                    run_env[env_var] = val
+        except Exception:
+            pass
+
+    cmd = ["docker", "compose", "-f", compose_file, "up", "-d", "--build"]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, timeout=300, encoding="utf-8", errors="ignore",
+            creationflags=_cflags, env=run_env,
+        )
+        if result.returncode == 0:
+            log_step("docker_compose_started", {"container": container_name, "compose_dir": compose_dir})
+            return True, f"Compose stack {container_name} started"
+        return False, f"docker compose up failed: {(result.stderr or result.stdout or '')[:200]}"
+    except Exception as exc:
+        log_step("docker_compose_start_exception", {"container": container_name, "error": str(exc)})
+        return False, f"Exception starting compose stack: {exc}"
+
+
+def _stop_docker_compose(cdef: Dict[str, Any], container_name: str) -> Tuple[bool, str]:
+    """Stop a Docker Compose stack."""
+    compose_dir = _resolve_compose_dir(cdef["compose_dir"])
+    if not compose_dir:
+        return False, f"Compose dir not found for {container_name}"
+
+    _cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+    compose_file = os.path.join(compose_dir, "docker-compose.yml")
+
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "-f", compose_file, "down"],
+            capture_output=True, timeout=60, encoding="utf-8", errors="ignore",
+            creationflags=_cflags,
+        )
+        if result.returncode == 0:
+            log_step("docker_compose_stopped", {"container": container_name})
+            return True, f"Compose stack {container_name} stopped"
+        return False, f"docker compose down failed: {(result.stderr or result.stdout or '')[:200]}"
+    except Exception as exc:
+        log_step("docker_compose_stop_exception", {"container": container_name, "error": str(exc)})
+        return False, f"Exception stopping compose stack: {exc}"
+
+
 def _start_docker_container(container_name: str) -> Tuple[bool, str]:
-    """Start a Docker container.  If it exists but is stopped, start it.
-    If it doesn't exist, create it with ``docker run`` using
-    ``DOCKER_CONTAINER_DEFS`` for image, volumes, and credentials.
+    """Start a Docker container or compose stack.
+
+    For compose-based entries (``compose=True`` in DOCKER_CONTAINER_DEFS),
+    runs ``docker compose up -d``.  For single-container entries, uses
+    ``docker run`` (unchanged presearch-node behaviour).
 
     Args:
         container_name: Container name (must be in DOCKER_CONTAINER_DEFS)
@@ -4540,6 +4750,11 @@ def _start_docker_container(container_name: str) -> Tuple[bool, str]:
     if not _is_docker_available():
         return False, "Docker is not installed or daemon not running"
 
+    # Compose-based stack (diiisco-node)
+    if cdef.get("compose"):
+        return _start_docker_compose(cdef, container_name)
+
+    # Single container (presearch-node) — existing behaviour
     _cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
 
     # Check if container already exists
@@ -4602,7 +4817,6 @@ def _start_docker_container(container_name: str) -> Tuple[bool, str]:
         )
         if result.returncode == 0:
             log_step("docker_container_created", {"container": container_name, "image": image})
-            
             return True, f"Container {container_name} created and started"
         return False, f"docker run failed: {(result.stderr or result.stdout or '')[:200]}"
     except Exception as exc:
@@ -4611,7 +4825,7 @@ def _start_docker_container(container_name: str) -> Tuple[bool, str]:
 
 
 def _stop_docker_container(container_name: str) -> Tuple[bool, str]:
-    """Stop a Docker container.
+    """Stop a Docker container or compose stack.
 
     Args:
         container_name: Container name (must be in ALLOWED_DOCKER_CONTAINERS)
@@ -4625,6 +4839,12 @@ def _stop_docker_container(container_name: str) -> Tuple[bool, str]:
     if not _is_docker_available():
         return False, "Docker is not installed or daemon not running"
 
+    # Compose-based stack
+    cdef = DOCKER_CONTAINER_DEFS.get(container_name)
+    if cdef and cdef.get("compose"):
+        return _stop_docker_compose(cdef, container_name)
+
+    # Single container
     _cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
 
     try:
@@ -5127,15 +5347,20 @@ def _collect_presearch_stats(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _collect_diiisco_stats(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Collect Diiisco node statistics."""
-    stats = {"status": "unknown"}
-    
+    """Collect DIIISCO Docker Compose stack statistics (Ollama + DIIISCO node)."""
+    stats: Dict[str, Any] = {"status": "unknown"}
     try:
-        # TODO: Implement Diiisco stats collection
-        stats["status"] = "not_implemented"
+        from measurements.tools import poll_diiisco
+        result = poll_diiisco()
+        stats.update(result)
+        if result.get("running"):
+            stats["status"] = "running"
+        elif result.get("enabled"):
+            stats["status"] = "stopped"
+        else:
+            stats["status"] = "not_found"
     except Exception as e:
         stats["error"] = str(e)
-    
     return stats
 
 
@@ -5227,23 +5452,32 @@ def _measurement_collection_loop() -> None:
 
             # Try to establish API connection if not connected
             # This allows measurements to upload to backend before saving to CSV
-            if api_client is None and miner_key:
+            # Throttle to avoid spamming when API is known to be down
+            if api_client is None and miner_key and not _should_throttle_api():
                 try:
                     api_client = connect_mongo("", None, None)
                     if api_client and miner_key:
-                        hex_id = registered_hexid_from_devices(api_client, miner_key)
+                        hex_id = registered_hexid_from_devices(api_client, miner_key, allow_degraded=True)
+                        _mark_api_up()  # API is working
                 except Exception as e:
                     log.debug("API not available for measurement upload: %s", e)
                     api_client = None
                     hex_id = None
+                    if _is_api_error(str(e)):
+                        _mark_api_down()
             
             # Retry hex_id resolution if api_client is connected but hex_id is still None
             # This handles cases where the proxy initially returns no hexId (syncing) but later has it
-            if api_client is not None and hex_id is None and miner_key:
+            # Throttle to avoid spamming when API is unreachable
+            if api_client is not None and hex_id is None and miner_key and not _should_throttle_api():
                 try:
-                    hex_id = registered_hexid_from_devices(api_client, miner_key)
+                    hex_id = registered_hexid_from_devices(api_client, miner_key, allow_degraded=True)
+                    if hex_id:
+                        _mark_api_up()  # Successfully got hexId
                 except Exception as e:
                     log.debug("Failed to resolve hex_id on retry: %s", e)
+                    if _is_api_error(str(e)):
+                        _mark_api_down()
 
             # --- Build two sets of collectors: live writers (for UI) and uploads (backend) ---
             live_collectors: dict[str, tuple[Callable[[], bool], int]] = {}
@@ -5819,9 +6053,9 @@ def main() -> None:
         except Exception:
             init_miner_mac = None
         
-        # Read registered MAC
+        # Read registered MAC (allow degraded mode - don't exit if API down)
         try:
-            init_mac_registered = registered_mac_from_devices(client, miner_key)
+            init_mac_registered = registered_mac_from_devices(client, miner_key, allow_degraded=True)
         except Exception:
             init_mac_registered = None
         
@@ -5871,7 +6105,7 @@ def main() -> None:
         from measurements.collector import collect_all_by_miner_type
         hex_registered = None
         try:
-            hex_registered = registered_hexid_from_devices(client, miner_key)
+            hex_registered = registered_hexid_from_devices(client, miner_key, allow_degraded=True)
         except Exception:
             pass
         if hex_registered:
@@ -5887,7 +6121,7 @@ def main() -> None:
         write_week_local(
             miner_key,
             now_utc(),
-            "offline",
+            "online",
             interval,
             verified=verified_status,
             gui_version=GUI_VERSION,
@@ -5906,8 +6140,9 @@ def main() -> None:
     # Track last Autonomys daily upload target (YYYYMMDD) to avoid duplicate runs
     last_autonomys_target: Optional[str] = None
     last_presearch_ip_update: Optional[dt.datetime] = None
-    # Docker check interval: 5 minutes (300 seconds)
-    _DOCKER_PERIODIC_CHECK_INTERVAL: float = 300.0
+    # Docker check interval: 5 seconds (fast GUI feedback)
+    _DOCKER_PERIODIC_CHECK_INTERVAL: float = 5.0
+    last_loop_status: str = "online"  # last known slot status for on-change writes
 
     while True:
         refresh_software_version()
@@ -5924,6 +6159,10 @@ def main() -> None:
                         "Docker availability changed: %s",
                         "now available" if docker_available else "now unavailable",
                     )
+                    try:
+                        write_week_local(miner_key, now_utc(), last_loop_status, interval)
+                    except Exception:
+                        log.debug("Failed to update weekly file on Docker change", exc_info=True)
             except Exception as e:
                 log.debug("Docker periodic check failed: %s", e)
             last_docker_check_ts = now_ts
@@ -6024,6 +6263,7 @@ def main() -> None:
                     pass
 
                 # NEW: weekly writer replaces write_status_local
+                last_loop_status = status
                 write_week_local(
                     miner_key,
                     slot_ts,
@@ -6153,10 +6393,16 @@ def main() -> None:
                     pass
 
                 pol_hex_registered = None
-                try:
-                    pol_hex_registered = registered_hexid_from_devices(client, miner_key)
-                except Exception:
-                    pol_hex_registered = None
+                # Throttle hexId requests when API is known to be down
+                if not _should_throttle_api():
+                    try:
+                        pol_hex_registered = registered_hexid_from_devices(client, miner_key, allow_degraded=True)
+                        if pol_hex_registered:
+                            _mark_api_up()
+                    except Exception as e:
+                        pol_hex_registered = None
+                        if _is_api_error(str(e)):
+                            _mark_api_down()
 
                 # AEM: if snapshot missing, fetch PoI
                 poi_data = poi_snapshot
@@ -6217,7 +6463,7 @@ def main() -> None:
                 )
                 pending_pol_update = None
 
-                # --- Daily Autonomys upload (run once/day shortly after midnight UTC) ---
+                # --- Daily Autonomys upload (run once/day, jittered per device) ---
                 try:
                     enabled = os.environ.get('AUTONOMYS_UPLOAD_ENABLED') or os.environ.get('AUTONOMYS_UPLOADS_ENABLED')
                     # If not present in env, check embedded config (from build-time 1Password)
@@ -6242,8 +6488,12 @@ def main() -> None:
                     if isinstance(enabled, str) and enabled.strip().lower() in _TRUE_SET:
                         # target is yesterday
                         target_date = (slot_ts - dt.timedelta(days=1)).strftime("%Y%m%d")
-                        # run once per target_date when we observe the first midnight slot
-                        if last_autonomys_target != target_date and slot_ts.hour == 0 and slot_ts.minute == 0:
+                        # Deterministic per-device jitter: spread uploads over 4h after midnight
+                        # so all devices don't hammer Autonomys simultaneously.
+                        _jitter_min = int(hashlib.sha256(miner_key.encode()).hexdigest()[:8], 16) % 240
+                        _autonomys_trigger = slot_ts.replace(hour=0, minute=0, second=0, microsecond=0) + dt.timedelta(minutes=_jitter_min)
+                        # run once per target_date once the device's jitter offset has elapsed
+                        if last_autonomys_target != target_date and slot_ts >= _autonomys_trigger:
                             try:
                                 # Import here to avoid heavy imports at module load
                                 from measurements.autonomys_orchestrator import process_yesterday_to_autonomys
@@ -6251,7 +6501,7 @@ def main() -> None:
                                 # Determine hex id to use for upload
                                 hex_for_upload = None
                                 try:
-                                    hex_for_upload = registered_hexid_from_devices(client, miner_key)
+                                    hex_for_upload = registered_hexid_from_devices(client, miner_key, allow_degraded=True)
                                 except Exception:
                                     hex_for_upload = pol_hex_registered or None
 
@@ -6292,14 +6542,17 @@ def main() -> None:
                         ):
                             log.warning("Lost global lease for %s; will retry next slot (API may be down)", miner_key)
                             api_available = False
+                            _mark_api_down()
                         else:
                             log.info("Successfully reacquired lease for %s", miner_key)
+                            _mark_api_up()
                 except Exception as e:
                     msg = str(e)
-                    is_api_down = any(x in msg.lower() for x in ["502", "503", "504", "bad gateway", "timeout", "connection"])
+                    is_api_down = _is_api_error(msg)
                     if is_api_down:
                         log.warning("Hardware API unreachable during lease renewal: %s (continuing in degraded mode)", msg)
                         api_available = False
+                        _mark_api_down()
                     else:
                         log.error("Failed to renew lease for %s: %s (continuing with retry)", miner_key, e)
                         api_available = False

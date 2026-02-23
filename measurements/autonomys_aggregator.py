@@ -17,9 +17,9 @@ try:
     import pyarrow as pa
     import pyarrow.parquet as pq
     PARQUET_AVAILABLE = True
-except ImportError:
+except Exception as _parquet_err:
     PARQUET_AVAILABLE = False
-    log.warning("Parquet support not available. Install with: pip install pandas pyarrow")
+    log.warning("Parquet support not available. Install with: pip install pandas pyarrow (reason: %s)", _parquet_err)
 
 
 def aggregate_bandwidth_hourly(rows: List[Dict[str, Any]]) -> pd.DataFrame:

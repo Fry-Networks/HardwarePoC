@@ -502,8 +502,15 @@ def collect_all_by_miner_type(miner_code: str, api_client: Optional[Any] = None,
         else:
             success = True  # Not an error if tools aren't running yet
 
-    elif miner_code in ("RDN", "SDN"):
-        # These miner types don't collect sensor measurements
+    elif miner_code == "RDN":
+        # RDN collects tool stats (presearch, diiisco)
+        if collect_and_write_tool_stats(miner_code, presearch_api_key=presearch_api_key):
+            success = True
+        else:
+            success = True  # Not an error if tools aren't running yet
+
+    elif miner_code == "SDN":
+        # SDN doesn't collect sensor measurements
         log.debug("Miner type %s does not collect measurements", miner_code)
         success = True  # Not an error condition
 

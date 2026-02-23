@@ -61,6 +61,16 @@ fi
 echo "Installing Python packages: ${packages[*]}"
 "$PYTHON_BIN" -m pip install "${packages[@]}"
 
+# Install Autonomys integration requirements (single source of truth for parquet/cloud deps)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AUTONOMYS_REQS="$SCRIPT_DIR/requirements-autonomys.txt"
+if [ -f "$AUTONOMYS_REQS" ]; then
+  echo "Installing Autonomys requirements from $AUTONOMYS_REQS"
+  "$PYTHON_BIN" -m pip install -r "$AUTONOMYS_REQS"
+else
+  echo "Warning: requirements-autonomys.txt not found at $AUTONOMYS_REQS - skipping"
+fi
+
 # Metadata maps
 declare -A GROUP_MAP=(
   [BM]='Bandwidth'
@@ -369,9 +379,9 @@ svc_args=(--clean --onefile --noconsole --noconfirm --name "$svc_name" --distpat
 
 # For GUI/full bundles include native collects; for service-only builds add explicit excludes
 if [ "$BUILD_GUI" = true ]; then
-  svc_args+=(--collect-binaries h3 --collect-all shapely --collect-all geoip2 --collect-all pyarrow)
+  svc_args+=(--collect-binaries h3 --collect-all shapely --collect-all geoip2 --collect-all pyarrow --collect-all pandas)
 else
-  svc_args+=(--collect-all pyarrow --exclude-module PySide6 --exclude-module matplotlib --exclude-module numpy --exclude-module sounddevice --exclude-module portaudio --exclude-module pyside6 --exclude-module numba --exclude-module pyarrow.tests)
+  svc_args+=(--collect-all pyarrow --collect-all pandas --exclude-module PySide6 --exclude-module matplotlib --exclude-module sounddevice --exclude-module portaudio --exclude-module pyside6 --exclude-module numba --exclude-module pyarrow.tests)
 fi
 
 # Icon resolution
@@ -406,6 +416,17 @@ else
 fi
 if [ -n "$TLS_CA_FILE" ]; then
   svc_args+=(--add-data "$TLS_CA_FILE:.")
+fi
+
+# Bundle DIIISCO Docker Compose stack for RDN builds
+if [ "$CODE" = "RDN" ]; then
+  diiisco_dir="$PWD/docker/diiisco"
+  if [ -d "$diiisco_dir" ]; then
+    svc_args+=(--add-data "$diiisco_dir:docker/diiisco")
+    echo "Bundling DIIISCO Docker Compose stack from $diiisco_dir"
+  else
+    echo "Warning: DIIISCO Docker Compose directory not found at $diiisco_dir"
+  fi
 fi
 
 # Build

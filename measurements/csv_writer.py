@@ -26,7 +26,7 @@ SCHEMAS = {
     "bright": ["timestamp", "enabled", "status"],
     "presearch": ["timestamp", "online", "earnings_usd", "status"],
     "space_acres": ["timestamp", "online", "earnings_usd", "status"],
-    "diiisco": ["timestamp", "online", "earnings_usd", "status"],
+    "diiisco": ["timestamp", "online", "ollama_healthy", "uptime", "model", "status"],
 }
 
 
