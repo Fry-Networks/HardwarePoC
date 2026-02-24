@@ -93,7 +93,7 @@ def get_autonomys_api_key() -> Optional[str]:
         tool_creds = _get_tool_credentials()
         api_key = tool_creds.get('autonomys_api_key')
         if api_key:
-            log.info("Using Autonomys API key from embedded build credentials")
+            log.debug("Using Autonomys API key from embedded build credentials")
             return api_key
     except ImportError:
         log.debug("miner_online_simple not available (likely dev environment)")
@@ -103,25 +103,25 @@ def get_autonomys_api_key() -> Optional[str]:
     # Try 1Password item "AutoDrive" (production setup)
     api_key = get_from_1password("AutoDrive", "AUTONOMYS_API_KEY")
     if api_key:
-        log.info("Using Autonomys API key from 1Password (AutoDrive)")
+        log.debug("Using Autonomys API key from 1Password (AutoDrive)")
         return api_key
 
     # Try 1Password CLI direct read (alternative path)
     api_key = get_from_1password("Hardware/Autonomys", "api_key")
     if api_key:
-        log.info("Using Autonomys API key from 1Password CLI (op://Hardware/Autonomys/api_key)")
+        log.debug("Using Autonomys API key from 1Password CLI (op://Hardware/Autonomys/api_key)")
         return api_key
 
     # Try 1Password item "Autonomys API Key" (manual setup)
     api_key = get_from_1password("Autonomys API Key", "credential")
     if api_key:
-        log.info("Using Autonomys API key from 1Password item")
+        log.debug("Using Autonomys API key from 1Password item")
         return api_key
 
     # Fall back to environment variable (development/testing)
     api_key = os.environ.get("AUTONOMYS_API_KEY")
     if api_key:
-        log.info("Using Autonomys API key from environment variable")
+        log.debug("Using Autonomys API key from environment variable")
         return api_key
 
     log.error("Autonomys API key not found in embedded config, 1Password, or environment")

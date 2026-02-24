@@ -31,7 +31,7 @@ class AutonomysRestUploader:
         self.endpoint_url = endpoint_url.rstrip('/')
         self.upload_url = f"{self.endpoint_url}/api/uploads/file"
 
-        log.info("Autonomys REST uploader initialized (endpoint: %s)", endpoint_url)
+        log.debug("Autonomys REST uploader initialized (endpoint: %s)", endpoint_url)
 
     def upload_file(
         self,
@@ -55,7 +55,7 @@ class AutonomysRestUploader:
             log.error("File not found: %s", local_path)
             return None
 
-        log.info("Using chunked upload for %s as %s (%d bytes)", local_path.name, remote_filename, local_path.stat().st_size)
+        log.debug("Using chunked upload for %s as %s (%d bytes)", local_path.name, remote_filename, local_path.stat().st_size)
         try:
             return self.upload_file_chunked(local_path=local_path, remote_filename=remote_filename)
         except Exception as e:
@@ -179,7 +179,7 @@ class AutonomysRestUploader:
         if not chunk_size:
             chunk_size = server_chunk if server_chunk and server_chunk > 0 else (4 * 1024 * 1024)
 
-        log.info("Uploading %s in chunks (uploadId=%s, chunk_size=%d)", local_path.name, upload_id, chunk_size)
+        log.debug("Uploading %s in chunks (uploadId=%s, chunk_size=%d)", local_path.name, upload_id, chunk_size)
 
         # Stream file and upload chunks
         idx = 0
@@ -201,7 +201,7 @@ class AutonomysRestUploader:
                 # common response contains 'cid'
                 cid = comp.get('cid') or comp.get('CID') or comp.get('cidString') or None
                 if cid:
-                    log.info("Chunked upload complete: %s", cid)
+                    log.debug("Chunked upload complete: %s", cid)
                     return cid
                 # else maybe entire response is the object metadata
                 return comp.get('cid') if isinstance(comp, dict) else None
@@ -286,7 +286,7 @@ def get_rest_uploader(
         import os
         api_key = os.environ.get("AUTONOMYS_API_KEY")
         if api_key:
-            log.info("Using Autonomys API key from environment variable")
+            log.debug("Using Autonomys API key from environment variable")
         else:
             try:
                 from .secrets_manager import get_autonomys_api_key

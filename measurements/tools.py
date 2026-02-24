@@ -41,7 +41,6 @@ PRESEARCH_CLOUD_API_BASE = "https://nodes.presearch.com/api/nodes/status"
 PRESEARCH_CLOUD_MIN_INTERVAL = 15.0  # seconds between cloud API calls (rate limit: 4/min)
 _presearch_cloud_last_call: float = 0.0
 _presearch_cloud_cache: Optional[Dict[str, Any]] = None
-_presearch_remote_addr_last_log: float = 0.0
 _presearch_last_remote_addrs: Optional[list[str]] = None
 DIIISCO_MONITORING_PORT = 3001
 OLLAMA_DEFAULT_PORT = 11434
@@ -302,14 +301,10 @@ def poll_presearch(api_key: str = "") -> Dict[str, Any]:
                 result["remote_addrs"] = remote_addrs
                 if len(remote_addrs) == 1:
                     result["remote_addr"] = remote_addrs[0]
-                global _presearch_remote_addr_last_log, _presearch_last_remote_addrs
-                if (
-                    _presearch_last_remote_addrs != remote_addrs
-                    or (now - _presearch_remote_addr_last_log) >= 3600
-                ):
+                global _presearch_last_remote_addrs
+                if _presearch_last_remote_addrs != remote_addrs:
                     log.info("Presearch remote_addr(s): %s", remote_addrs)
                     _presearch_last_remote_addrs = list(remote_addrs)
-                    _presearch_remote_addr_last_log = now
             _presearch_cloud_cache = {
                 "connected": connected,
                 "earnings_usd": total_earnings,
@@ -496,11 +491,13 @@ def poll_space_acres() -> Dict[str, Any]:
 # COLLECTOR
 # ============================================================================
 
-def collect_all_tool_stats(presearch_api_key: str = "") -> Dict[str, Any]:
+def collect_all_tool_stats(presearch_api_key: str = "", miner_code: str = "") -> Dict[str, Any]:
     """Collect stats from all enabled tools.
 
     Args:
         presearch_api_key: Presearch API key from 1Password embedded credentials.
+        miner_code: Miner type code. Docker-based tools (presearch, diiisco) are
+            only polled for RDN/SVN miners.
 
     Returns dict with tool names as keys and their stats as values.
     Only polls tools that are likely to be enabled based on environment or config.
@@ -522,15 +519,17 @@ def collect_all_tool_stats(presearch_api_key: str = "") -> Dict[str, Any]:
     # if honeygain_stats.get("enabled"):
     #     stats["honeygain"] = honeygain_stats
 
-    # Presearch: Poll via Docker + cloud API
-    presearch_stats = poll_presearch(api_key=presearch_api_key)
-    if presearch_stats.get("enabled"):
-        stats["presearch"] = presearch_stats
+    # Docker-based tools: only poll for miner types that use them (RDN, SVN)
+    if miner_code in ("RDN", "SVN", "SDN"):
+        # Presearch: Poll via Docker + cloud API
+        presearch_stats = poll_presearch(api_key=presearch_api_key)
+        if presearch_stats.get("enabled"):
+            stats["presearch"] = presearch_stats
 
-    # Diiisco: Poll if Docker is available
-    diiisco_stats = poll_diiisco()
-    if diiisco_stats.get("enabled"):
-        stats["diiisco"] = diiisco_stats
+        # Diiisco: Poll if Docker is available
+        diiisco_stats = poll_diiisco()
+        if diiisco_stats.get("enabled"):
+            stats["diiisco"] = diiisco_stats
 
     # Space Acres: Poll if RPC port is reachable
     space_acres_stats = poll_space_acres()

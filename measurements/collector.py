@@ -106,7 +106,7 @@ def collect_and_upload_bandwidth(miner_code: str, api_client: Optional[Any] = No
                     measurement_type="bandwidth",
                     value=bw
                 )
-                log.info("Bandwidth measurement uploaded to backend (hex_id=%s)", effective_hex_id)
+                log.info("Bandwidth measurement uploaded to backend" + ("" if hex_id else " (hex_id=unknown)"))
                 uploaded = True
             except Exception as e:
                 log.error("Failed to upload bandwidth to backend: %s", e)
@@ -165,7 +165,7 @@ def collect_and_upload_satellite(miner_code: str, api_client: Optional[Any] = No
                     measurement_type="satellite",
                     value=sat
                 )
-                log.info("Satellite measurement uploaded to backend (hex_id=%s)", effective_hex_id)
+                log.info("Satellite measurement uploaded to backend" + ("" if hex_id else " (hex_id=unknown)"))
                 uploaded = True
             except Exception as e:
                 log.error("Failed to upload satellite to backend: %s", e)
@@ -214,7 +214,7 @@ def collect_and_upload_radiation(miner_code: str, api_client: Optional[Any] = No
                     measurement_type="radiation",
                     value=rad
                 )
-                log.info("Radiation measurement uploaded to backend (hex_id=%s)", effective_hex_id)
+                log.info("Radiation measurement uploaded to backend" + ("" if hex_id else " (hex_id=unknown)"))
                 uploaded = True
             except Exception as e:
                 log.error("Failed to upload radiation to backend: %s", e)
@@ -275,7 +275,7 @@ def collect_and_upload_decibel(miner_code: str, api_client: Optional[Any] = None
                     measurement_type="decibel",
                     value=val
                 )
-                log.info("Decibel measurement uploaded to backend (hex_id=%s)", effective_hex_id)
+                log.info("Decibel measurement uploaded to backend" + ("" if hex_id else " (hex_id=unknown)"))
                 uploaded = True
             except Exception as e:
                 log.error("Failed to upload decibel to backend: %s", e)
@@ -334,7 +334,7 @@ def collect_and_upload_aem(miner_code: str, api_client: Optional[Any] = None, he
                     measurement_type="aem",
                     value=aem
                 )
-                log.info("AEM measurement uploaded to backend (hex_id=%s)", effective_hex_id)
+                log.info("AEM measurement uploaded to backend" + ("" if hex_id else " (hex_id=unknown)"))
                 uploaded = True
             except Exception as e:
                 log.error("Failed to upload AEM to backend: %s", e)
@@ -362,7 +362,7 @@ def collect_and_upload_aem(miner_code: str, api_client: Optional[Any] = None, he
 def collect_and_write_tool_stats(miner_code: str, presearch_api_key: str = "") -> bool:
     """Collect all tool stats and write to respective CSVs."""
     try:
-        tool_stats = collect_all_tool_stats(presearch_api_key=presearch_api_key)
+        tool_stats = collect_all_tool_stats(presearch_api_key=presearch_api_key, miner_code=miner_code)
         if not tool_stats:
             return True
         
@@ -504,7 +504,7 @@ def collect_all_by_miner_type(miner_code: str, api_client: Optional[Any] = None,
 
     elif miner_code == "RDN":
         # RDN collects tool stats (presearch, diiisco)
-        if collect_and_write_tool_stats(miner_code, presearch_api_key=presearch_api_key):
+        if collect_and_write_tool_stats(miner_code):
             success = True
         else:
             success = True  # Not an error if tools aren't running yet

@@ -311,21 +311,23 @@ def _init_service_file_logging() -> None:
         # Do not block startup if logging cannot initialize
         pass
 
-def log_step(step: str, data: Dict[str, Any]) -> None:
+def log_step(step: str, data: Dict[str, Any], level: str = "info") -> None:
     """Log a structured step with associated data for diagnostics.
-    
+
     This provides structured logging for key service events, particularly
     for IPC queue operations and privileged operations handling.
-    
+
     Args:
         step: Event identifier (e.g., "ops_daemon_start", "privileged_config_file_written")
         data: Additional context data for the event
+        level: Log level ("info" or "debug")
     """
+    _log_fn = log.debug if level == "debug" else log.info
     try:
-        log.info("STEP: %s | %s", step, json.dumps(data, default=str))
+        _log_fn("STEP: %s | %s", step, json.dumps(data, default=str))
     except Exception:
         try:
-            log.info("STEP: %s | %s", step, str(data))
+            _log_fn("STEP: %s | %s", step, str(data))
         except Exception:
             pass
 
@@ -474,8 +476,7 @@ def _reload_service_config() -> None:
         log_step("service_config_reloaded", {
             "configs_loaded": list(new_config.keys()),
             "timestamp": now_utc().isoformat()
-        })
-        log.info("Service configuration reloaded")
+        }, level="debug")
     except Exception as e:
         log.error("Failed to reload service configuration: %s", e)
 
@@ -5170,7 +5171,7 @@ def _ops_queue_daemon_loop() -> None:
         "stop_service",
         "start_docker_container",
         "stop_docker_container",
-    ]})
+    ]}, level="debug")
     
     request_count = 0
     error_count = 0
@@ -5426,7 +5427,7 @@ def _measurement_collection_loop() -> None:
     global _measurement_daemon_running
     _measurement_daemon_running = True
     
-    log_step("measurement_daemon_started", {"timestamp": now_utc().isoformat()})
+    log_step("measurement_daemon_started", {"timestamp": now_utc().isoformat()}, level="debug")
     
     # Track last collection time per sensor
     last_collection: dict[str, float] = {}
@@ -5483,7 +5484,7 @@ def _measurement_collection_loop() -> None:
             live_collectors: dict[str, tuple[Callable[[], bool], int]] = {}
             upload_collectors: dict[str, tuple[Callable[[], bool], int]] = {}
 
-            presearch_api_key = _get_presearch_api_key()
+            presearch_api_key = _get_presearch_api_key() if MINER_CODE == "RDN" else ""
 
             if MINER_CODE == "BM":
                 # BM: live writes at configured 'bandwidth' interval; upload every 600s
@@ -5578,11 +5579,22 @@ def _start_measurement_daemon() -> None:
         daemon_thread.start()
         
         intervals = _get_measurement_intervals()
-        log.info("Measurement collection daemon started | intervals=%s", intervals)
+        # Only log intervals relevant to this miner type
+        _relevant_keys: dict[str, tuple[str, ...]] = {
+            "BM": ("bandwidth", "tools"),
+            "ISM": ("satellite",), "OSM": ("satellite",),
+            "IRM": ("radiation",),
+            "IDM": ("decibel",), "ODM": ("decibel",),
+            "AEM": ("aem",),
+            "RDN": ("tools",), "SVN": ("tools",),
+        }
+        relevant = {k: v for k, v in intervals.items() if k in _relevant_keys.get(MINER_CODE, ())}
+        if relevant:
+            log.info("Measurement daemon started | intervals=%s", relevant)
         log_step("measurement_daemon_start", {
             "intervals": intervals,
             "miner_code": MINER_CODE
-        })
+        }, level="debug")
     except Exception as e:
         log.error("Failed to start measurement daemon: %s", e)
 
@@ -5674,17 +5686,19 @@ def main() -> None:
         time.sleep(2)
         sys.exit(3)
 
-    # Check Docker availability at startup
-    docker_available = _is_docker_available()
-    log.info("Docker availability at startup: %s", "available" if docker_available else "not available")
+    # Check Docker availability at startup (only for miner types that use Docker tools)
+    docker_available = False
+    if MINER_CODE in ("RDN", "SVN", "SDN"):
+        docker_available = _is_docker_available()
+        log.info("Docker availability at startup: %s", "available" if docker_available else "not available")
 
     client: Optional[MongoProxyClient] = None
     coll = None
 
     required_versions: Dict[str, str] = {}
-    
-    # Track last Docker check time for periodic polling
-    last_docker_check_ts: float = time.time()
+
+    # Track last Docker check time for periodic polling (RDN/SVN/SDN only)
+    last_docker_check_ts: float = time.time() if MINER_CODE in ("RDN", "SVN", "SDN") else 0.0
 
     # miner_mac will be detected in the main loop once we're fully initialized
     # At startup, leave it as None to avoid incorrect comparisons
@@ -6148,9 +6162,9 @@ def main() -> None:
         refresh_software_version()
         now_loop = now_utc()
         
-        # Periodic Docker availability check (every 5 minutes)
+        # Periodic Docker availability check (RDN/SVN/SDN only)
         now_ts = time.time()
-        if (now_ts - last_docker_check_ts) >= _DOCKER_PERIODIC_CHECK_INTERVAL:
+        if MINER_CODE in ("RDN", "SVN", "SDN") and (now_ts - last_docker_check_ts) >= _DOCKER_PERIODIC_CHECK_INTERVAL:
             try:
                 docker_status = _is_docker_available()
                 if docker_status != docker_available:
@@ -6464,58 +6478,60 @@ def main() -> None:
                 pending_pol_update = None
 
                 # --- Daily Autonomys upload (run once/day, jittered per device) ---
-                try:
-                    enabled = os.environ.get('AUTONOMYS_UPLOAD_ENABLED') or os.environ.get('AUTONOMYS_UPLOADS_ENABLED')
-                    # If not present in env, check embedded config (from build-time 1Password)
-                    if not enabled:
-                        try:
-                            embedded_cfg = load_config()
-                            b_enabled = embedded_cfg.get("autonomys_upload_enabled") or embedded_cfg.get("autonomys_uploads_enabled")
-                            if isinstance(b_enabled, bool):
-                                enabled = "true" if b_enabled else "false"
-                            elif isinstance(b_enabled, (int, float)):
-                                enabled = "true" if int(b_enabled) else "false"
-                            elif isinstance(b_enabled, str) and b_enabled.strip():
-                                enabled = b_enabled
-                            # inject API key from embedded config into env if provided
-                            tool_creds = embedded_cfg.get("tool_credentials", {})
-                            api_key = tool_creds.get("autonomys_api_key")
-                            if isinstance(api_key, str) and api_key.strip() and not os.environ.get("AUTONOMYS_API_KEY"):
-                                os.environ["AUTONOMYS_API_KEY"] = api_key.strip()
-                        except Exception:
-                            pass
-
-                    if isinstance(enabled, str) and enabled.strip().lower() in _TRUE_SET:
-                        # target is yesterday
-                        target_date = (slot_ts - dt.timedelta(days=1)).strftime("%Y%m%d")
-                        # Deterministic per-device jitter: spread uploads over 4h after midnight
-                        # so all devices don't hammer Autonomys simultaneously.
-                        _jitter_min = int(hashlib.sha256(miner_key.encode()).hexdigest()[:8], 16) % 240
-                        _autonomys_trigger = slot_ts.replace(hour=0, minute=0, second=0, microsecond=0) + dt.timedelta(minutes=_jitter_min)
-                        # run once per target_date once the device's jitter offset has elapsed
-                        if last_autonomys_target != target_date and slot_ts >= _autonomys_trigger:
+                # Skip for miner types that don't produce measurement data (RDN/SDN/SVN)
+                if MINER_CODE not in ("RDN", "SDN", "SVN"):
+                    try:
+                        enabled = os.environ.get('AUTONOMYS_UPLOAD_ENABLED') or os.environ.get('AUTONOMYS_UPLOADS_ENABLED')
+                        # If not present in env, check embedded config (from build-time 1Password)
+                        if not enabled:
                             try:
-                                # Import here to avoid heavy imports at module load
-                                from measurements.autonomys_orchestrator import process_yesterday_to_autonomys
+                                embedded_cfg = load_config()
+                                b_enabled = embedded_cfg.get("autonomys_upload_enabled") or embedded_cfg.get("autonomys_uploads_enabled")
+                                if isinstance(b_enabled, bool):
+                                    enabled = "true" if b_enabled else "false"
+                                elif isinstance(b_enabled, (int, float)):
+                                    enabled = "true" if int(b_enabled) else "false"
+                                elif isinstance(b_enabled, str) and b_enabled.strip():
+                                    enabled = b_enabled
+                                # inject API key from embedded config into env if provided
+                                tool_creds = embedded_cfg.get("tool_credentials", {})
+                                api_key = tool_creds.get("autonomys_api_key")
+                                if isinstance(api_key, str) and api_key.strip() and not os.environ.get("AUTONOMYS_API_KEY"):
+                                    os.environ["AUTONOMYS_API_KEY"] = api_key.strip()
+                            except Exception:
+                                pass
 
-                                # Determine hex id to use for upload
-                                hex_for_upload = None
+                        if isinstance(enabled, str) and enabled.strip().lower() in _TRUE_SET:
+                            # target is yesterday
+                            target_date = (slot_ts - dt.timedelta(days=1)).strftime("%Y%m%d")
+                            # Deterministic per-device jitter: spread uploads over 4h after midnight
+                            # so all devices don't hammer Autonomys simultaneously.
+                            _jitter_min = int(hashlib.sha256(miner_key.encode()).hexdigest()[:8], 16) % 240
+                            _autonomys_trigger = slot_ts.replace(hour=0, minute=0, second=0, microsecond=0) + dt.timedelta(minutes=_jitter_min)
+                            # run once per target_date once the device's jitter offset has elapsed
+                            if last_autonomys_target != target_date and slot_ts >= _autonomys_trigger:
                                 try:
-                                    hex_for_upload = registered_hexid_from_devices(client, miner_key, allow_degraded=True)
-                                except Exception:
-                                    hex_for_upload = pol_hex_registered or None
+                                    # Import here to avoid heavy imports at module load
+                                    from measurements.autonomys_orchestrator import process_yesterday_to_autonomys
 
-                                if not hex_for_upload:
-                                    log.warning("Autonomys upload skipped: no registered hexId available")
-                                else:
-                                    log.info("Starting Autonomys daily upload for %s (date=%s)", hex_for_upload, target_date)
-                                    results = process_yesterday_to_autonomys(MINER_CODE, hex_for_upload, install_id=install_id, upload_to_cloud=True)
-                                    log.info("Autonomys daily upload results: %s", results)
-                                    last_autonomys_target = target_date
-                            except Exception as e:
-                                log.error("Autonomys daily upload failed: %s", e)
-                except Exception:
-                    pass
+                                    # Determine hex id to use for upload
+                                    hex_for_upload = None
+                                    try:
+                                        hex_for_upload = registered_hexid_from_devices(client, miner_key, allow_degraded=True)
+                                    except Exception:
+                                        hex_for_upload = pol_hex_registered or None
+
+                                    if not hex_for_upload:
+                                        log.warning("Autonomys upload skipped: no registered hexId available")
+                                    else:
+                                        log.debug("Starting Autonomys daily upload for %s (date=%s)", hex_for_upload, target_date)
+                                        results = process_yesterday_to_autonomys(MINER_CODE, hex_for_upload, install_id=install_id, upload_to_cloud=True)
+                                        log.debug("Autonomys daily upload results: %s", results)
+                                        last_autonomys_target = target_date
+                                except Exception as e:
+                                    log.error("Autonomys daily upload failed: %s", e)
+                    except Exception:
+                        pass
 
                 # Refresh installation heartbeat
                 try:

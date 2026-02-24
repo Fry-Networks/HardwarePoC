@@ -85,7 +85,7 @@ def process_daily_csv_to_autonomys(
             log.debug("No data found for %s on %s", measurement_type, date_str)
             return False
 
-        log.info("Processing %d rows for %s on %s", len(rows), measurement_type, date_str)
+        log.debug("Processing %d rows for %s on %s", len(rows), measurement_type, date_str)
 
         # Aggregate to hourly
         hourly_df = aggregate_measurement_hourly(measurement_type, rows)
@@ -109,7 +109,7 @@ def process_daily_csv_to_autonomys(
         elif measurement_type == 'aem':
             hourly_df = redactor.redact_aem_data(hourly_df)
 
-        log.info("Applied %s redaction to %s data", redaction_level, measurement_type)
+        log.debug("Applied %s redaction to %s data", redaction_level, measurement_type)
 
         # Get redacted hex_id (used internally, not exposed in folder structure)
         redacted_hex_id = redactor.redact_location(hex_id,
@@ -227,7 +227,7 @@ def process_yesterday_to_autonomys(
     results = {}
 
     for measurement_type in measurement_types:
-        log.info("Processing %s for %s", measurement_type, yesterday)
+        log.debug("Processing %s for %s", measurement_type, yesterday)
         success = process_daily_csv_to_autonomys(
             miner_code=miner_code,
             measurement_type=measurement_type,
@@ -287,7 +287,7 @@ def process_today_to_autonomys(
     results = {}
 
     for measurement_type in measurement_types:
-        log.info("Processing %s for today (%s)", measurement_type, today)
+        log.debug("Processing %s for today (%s)", measurement_type, today)
         success = process_daily_csv_to_autonomys(
             miner_code=miner_code,
             measurement_type=measurement_type,
