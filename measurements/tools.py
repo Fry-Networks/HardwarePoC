@@ -42,9 +42,14 @@ PRESEARCH_CLOUD_MIN_INTERVAL = 15.0  # seconds between cloud API calls (rate lim
 _presearch_cloud_last_call: float = 0.0
 _presearch_cloud_cache: Optional[Dict[str, Any]] = None
 _presearch_last_remote_addrs: Optional[list[str]] = None
-DIIISCO_MONITORING_PORT = 3001
+DIIISCO_NODE_PORT = 8181
 OLLAMA_DEFAULT_PORT = 11434
 SPACE_ACRES_DEFAULT_RPC_PORT = 9944
+
+# Cached poll results — written by the measurement daemon, read by the
+# main PoC loop so it never blocks on Docker subprocess calls.
+_last_presearch_result: Optional[Dict[str, Any]] = None
+_last_diiisco_result: Optional[Dict[str, Any]] = None
 
 
 def _port_reachable(port: int, timeout: float = 2.0) -> bool:
@@ -66,6 +71,19 @@ def _get_json(url: str, timeout: float = 5.0) -> Optional[Dict[str, Any]]:
         return resp.json()
     except Exception as e:
         log.debug("Failed to GET %s: %s", url, e)
+        return None
+
+
+def _post_json(url: str, payload: Dict[str, Any], timeout: float = 5.0) -> Optional[Dict[str, Any]]:
+    """POST JSON to a URL and return the parsed response."""
+    if not HAVE_REQUESTS or not requests:
+        return None
+    try:
+        resp = requests.post(url, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        log.debug("Failed to POST %s: %s", url, e)
         return None
 
 
@@ -176,6 +194,11 @@ def poll_honeygain() -> Dict[str, Any]:
 # PRESEARCH
 # ============================================================================
 
+def get_cached_presearch() -> Optional[Dict[str, Any]]:
+    """Return the last cached presearch poll result (non-blocking)."""
+    return _last_presearch_result
+
+
 def poll_presearch(api_key: str = "") -> Dict[str, Any]:
     """Poll Presearch node status via Docker container state + cloud API.
 
@@ -194,7 +217,7 @@ def poll_presearch(api_key: str = "") -> Dict[str, Any]:
     - status: str    ("running", "stopped", "not_created", "docker_missing", "error")
     - error: str | None
     """
-    global _presearch_cloud_last_call, _presearch_cloud_cache
+    global _presearch_cloud_last_call, _presearch_cloud_cache, _last_presearch_result
 
     result: Dict[str, Any] = {
         "enabled": False,
@@ -316,6 +339,7 @@ def poll_presearch(api_key: str = "") -> Dict[str, Any]:
         log.debug("Presearch cloud API call failed: %s", e)
         result["online"] = result["running"]
 
+    _last_presearch_result = result
     return result
 
 
@@ -393,33 +417,84 @@ def get_public_ip() -> str:
 # DIIISCO
 # ============================================================================
 
+def _docker_container_stats(container_name: str) -> Optional[Dict[str, Any]]:
+    """Get CPU/memory stats for a Docker container via ``docker stats``.
+
+    Returns dict with ``cpu_percent`` (float) and ``mem_usage_mb`` (float),
+    or None if the container is not running or Docker is unavailable.
+    """
+    _cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+    try:
+        completed = subprocess.run(
+            ["docker", "stats", "--no-stream", "--format",
+             "{{.CPUPerc}}\t{{.MemUsage}}",
+             container_name],
+            capture_output=True, text=True, timeout=10,
+            creationflags=_cflags,
+        )
+        if completed.returncode != 0 or not completed.stdout.strip():
+            return None
+        parts = completed.stdout.strip().split("\t")
+        if len(parts) < 2:
+            return None
+        cpu_str = parts[0].replace("%", "").strip()
+        mem_str = parts[1].split("/")[0].strip()  # e.g. "52.4MiB / 16GiB"
+        cpu_percent = float(cpu_str)
+        # Parse memory value (MiB, GiB, KiB)
+        mem_mb = 0.0
+        mem_upper = mem_str.upper()
+        if "GIB" in mem_upper:
+            mem_mb = float(mem_upper.replace("GIB", "").strip()) * 1024
+        elif "MIB" in mem_upper:
+            mem_mb = float(mem_upper.replace("MIB", "").strip())
+        elif "KIB" in mem_upper:
+            mem_mb = float(mem_upper.replace("KIB", "").strip()) / 1024
+        elif "GB" in mem_upper:
+            mem_mb = float(mem_upper.replace("GB", "").strip()) * 1000
+        elif "MB" in mem_upper:
+            mem_mb = float(mem_upper.replace("MB", "").strip())
+        elif "KB" in mem_upper:
+            mem_mb = float(mem_upper.replace("KB", "").strip()) / 1000
+        return {"cpu_percent": round(cpu_percent, 2), "mem_usage_mb": round(mem_mb, 1)}
+    except Exception as e:
+        log.debug("docker stats failed for %s: %s", container_name, e)
+        return None
+
+
+def get_cached_diiisco() -> Optional[Dict[str, Any]]:
+    """Return the last cached diiisco poll result (non-blocking)."""
+    return _last_diiisco_result
+
+
 def poll_diiisco() -> Dict[str, Any]:
     """Poll DIIISCO Docker Compose stack (Ollama + DIIISCO node).
 
     Monitors both containers:
     - Ollama health via :11434/api/tags
-    - DIIISCO monitoring via :3001/stats
+    - DIIISCO node liveness via port 8181 reachability
+    - CPU/memory via ``docker stats`` for the diiisco-node container
 
     Returns dict with keys:
     - enabled: bool
     - running: bool
     - connected: bool
     - ollama_healthy: bool
-    - cpu_usage: dict | None
-    - memory_usage: dict | None
-    - uptime: float | None
     - model: str | None
+    - cpu_percent: float | None
+    - mem_usage_mb: float | None
+    - status: str
     - error: str | None
     """
+    global _last_diiisco_result
     result: Dict[str, Any] = {
         "enabled": False,
         "running": False,
         "connected": False,
         "ollama_healthy": False,
-        "cpu_usage": None,
-        "memory_usage": None,
-        "uptime": None,
         "model": None,
+        "cpu_percent": None,
+        "mem_usage_mb": None,
+        "status": "not_found",
         "error": None,
     }
 
@@ -428,19 +503,25 @@ def poll_diiisco() -> Dict[str, Any]:
         ollama_data = _get_json(f"http://127.0.0.1:{OLLAMA_DEFAULT_PORT}/api/tags")
         if ollama_data is not None:
             result["ollama_healthy"] = True
+            # Extract first model name from Ollama tag list
+            models = ollama_data.get("models")
+            if isinstance(models, list) and models:
+                result["model"] = models[0].get("name", "unknown")
 
-    # Check DIIISCO monitoring at :3001/stats
-    if _port_reachable(DIIISCO_MONITORING_PORT):
+    # Check DIIISCO node at :8181
+    if _port_reachable(DIIISCO_NODE_PORT):
         result["enabled"] = True
         result["running"] = True
-        stats = _get_json(f"http://127.0.0.1:{DIIISCO_MONITORING_PORT}/stats")
-        if stats:
-            result["connected"] = True
-            result["cpu_usage"] = stats.get("cpu")
-            result["memory_usage"] = stats.get("memory")
-            result["uptime"] = stats.get("uptime")
-            result["model"] = stats.get("model")
+        result["connected"] = True
+        result["status"] = "running"
 
+        # Get container resource usage via docker stats
+        stats = _docker_container_stats("diiisco-node")
+        if stats:
+            result["cpu_percent"] = stats["cpu_percent"]
+            result["mem_usage_mb"] = stats["mem_usage_mb"]
+
+    _last_diiisco_result = result
     return result
 
 
@@ -448,42 +529,221 @@ def poll_diiisco() -> Dict[str, Any]:
 # SPACE ACRES
 # ============================================================================
 
+def _query_substrate_sync_state(rpc_port: int = SPACE_ACRES_DEFAULT_RPC_PORT) -> Optional[Dict[str, Any]]:
+    """Query the Substrate node's sync state via JSON-RPC.
+
+    Makes three RPC calls:
+    - system_health: {peers, isSyncing, shouldHavePeers}
+    - system_syncState: {startingBlock, currentBlock, highestBlock}
+    - chain_getFinalizedHead + chain_getHeader: finalized block number
+
+    The node may report isSyncing=False (block imports caught up) while GRANDPA
+    finalization is still thousands of blocks behind.  The farmer cannot start
+    until finalization is reasonably close to chain head, so we expose
+    ``finalizedBlock`` and ``finalizationGap`` for callers to decide.
+
+    Returns combined dict or None if RPC unreachable.
+    """
+    if not _port_reachable(rpc_port):
+        return None
+
+    base_url = f"http://127.0.0.1:{rpc_port}"
+    result: Dict[str, Any] = {}
+
+    health = _post_json(base_url, {
+        "jsonrpc": "2.0", "id": 1, "method": "system_health", "params": []
+    })
+    if health and isinstance(health.get("result"), dict):
+        h = health["result"]
+        result["peers"] = h.get("peers", 0)
+        result["isSyncing"] = h.get("isSyncing", False)
+
+    sync = _post_json(base_url, {
+        "jsonrpc": "2.0", "id": 2, "method": "system_syncState", "params": []
+    })
+    if sync and isinstance(sync.get("result"), dict):
+        s = sync["result"]
+        result["currentBlock"] = s.get("currentBlock", 0)
+        result["highestBlock"] = s.get("highestBlock", 0)
+
+    current = result.get("currentBlock", 0)
+    highest = result.get("highestBlock", 0)
+    if highest > 0:
+        result["syncPercent"] = round((current / highest) * 100, 2)
+    else:
+        result["syncPercent"] = 0.0
+
+    # --- Finalization check ---
+    # chain_getFinalizedHead → hash, then chain_getHeader(hash) → block number
+    result["finalizedBlock"] = None
+    result["finalizationGap"] = None
+    finalized_resp = _post_json(base_url, {
+        "jsonrpc": "2.0", "id": 3, "method": "chain_getFinalizedHead", "params": []
+    })
+    fin_hash = finalized_resp.get("result") if finalized_resp else None
+    if fin_hash and isinstance(fin_hash, str):
+        header_resp = _post_json(base_url, {
+            "jsonrpc": "2.0", "id": 4, "method": "chain_getHeader", "params": [fin_hash]
+        })
+        if header_resp and isinstance(header_resp.get("result"), dict):
+            hex_num = header_resp["result"].get("number", "0x0")
+            try:
+                finalized_block = int(hex_num, 16)
+                result["finalizedBlock"] = finalized_block
+                result["finalizationGap"] = current - finalized_block
+            except (ValueError, TypeError):
+                pass
+
+    return result if result else None
+
+
+def _read_autonomys_pid(pid_filename: str) -> Optional[int]:
+    """Read a PID from ``{data_dir}/space-acres/run/<pid_filename>``.
+
+    Resolves data_dir inline to avoid importing miner_online_simple
+    (which runs as __main__ and would create a second module instance).
+    """
+    try:
+        import sys as _sys
+        if _sys.platform.startswith("win"):
+            base = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+        else:
+            base = "/var/lib"
+        # Discover MINER_CODE from config_profile (already imported by main)
+        try:
+            import config_profile as _cfg
+            miner_code = getattr(_cfg, "MINER_CODE", "")
+        except ImportError:
+            miner_code = ""
+        if _sys.platform.startswith("win"):
+            run_dir = os.path.join(base, "FryNetworks", f"miner-{miner_code}",
+                                   "space-acres", "run")
+        else:
+            run_dir = os.path.join(base, "frynetworks", f"miner-{miner_code}",
+                                   "space-acres", "run")
+        p = os.path.join(run_dir, pid_filename)
+        if not os.path.isfile(p):
+            return None
+        with open(p, "r") as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def _is_pid_alive(pid: Optional[int]) -> bool:
+    """Check whether a PID is alive (Windows-compatible)."""
+    if pid is None:
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        kernel32.CloseHandle(handle)
+        return True
+    except Exception:
+        # Fallback: try os.kill signal 0 (works on Unix, may not on Windows)
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+
 def poll_space_acres() -> Dict[str, Any]:
-    """Poll Space Acres farming status via RPC endpoint.
-    
+    """Poll Space Acres native processes (node + farmer).
+
+    Checks process liveness via ``_get_sa_process_state()`` and queries
+    the Substrate RPC at localhost:9944 for blockchain sync state.
+
     Returns dict with keys:
-    - enabled: bool
-    - running: bool
-    - syncing: bool
-    - farming: bool
-    - plotted_space_gb: float
-    - best_block: int | None
+    - enabled: bool     (at least one process is alive)
+    - running: bool     (both node and farmer are alive)
+    - node_healthy: bool (node RPC reachable)
+    - farmer_running: bool
+    - status: str       ("running", "syncing", "degraded", "stopped",
+                          "not_created", "error")
+    - isSyncing: bool | None   (from RPC, None if RPC unreachable)
+    - currentBlock: int | None
+    - highestBlock: int | None
+    - syncPercent: float | None
+    - peers: int | None
+    - finalizedBlock: int | None
+    - finalizationGap: int | None
     - error: str | None
     """
-    result = {
+    result: Dict[str, Any] = {
         "enabled": False,
         "running": False,
-        "syncing": False,
-        "farming": False,
-        "plotted_space_gb": 0.0,
-        "best_block": None,
+        "node_healthy": False,
+        "farmer_running": False,
+        "status": "unknown",
         "error": None,
+        "isSyncing": None,
+        "currentBlock": None,
+        "highestBlock": None,
+        "syncPercent": None,
+        "peers": None,
+        "finalizedBlock": None,
+        "finalizationGap": None,
     }
-    
-    # Check RPC port
-    port = int(os.environ.get("SPACE_ACRES_RPC_PORT", SPACE_ACRES_DEFAULT_RPC_PORT))
-    if not _port_reachable(port):
-        result["error"] = f"Space Acres RPC port {port} unreachable"
+
+    # Step 1: Check process liveness via PID files (avoids double-import
+    # issue when miner_online_simple runs as __main__ vs module).
+    node_alive = _is_pid_alive(_read_autonomys_pid("node.pid"))
+    farmer_alive = _is_pid_alive(_read_autonomys_pid("farmer.pid"))
+
+    if not node_alive and not farmer_alive:
+        result["status"] = "not_created"
         return result
-    
+
     result["enabled"] = True
-    result["running"] = True
-    
-    # Poll RPC endpoint (Substrate JSON-RPC)
-    # TODO: Implement proper Substrate RPC calls (system_health, system_syncState, etc.)
-    # For now, return stub
-    result["error"] = "Space Acres RPC polling not implemented"
-    
+    result["farmer_running"] = farmer_alive
+
+    # Step 2: Check node health via RPC reachability
+    if node_alive:
+        if _port_reachable(SPACE_ACRES_DEFAULT_RPC_PORT, timeout=2.0):
+            result["node_healthy"] = True
+
+    # Step 3: Query RPC for blockchain sync state
+    if result["node_healthy"]:
+        sync_state = _query_substrate_sync_state()
+        if sync_state:
+            result["isSyncing"] = sync_state.get("isSyncing")
+            result["currentBlock"] = sync_state.get("currentBlock")
+            result["highestBlock"] = sync_state.get("highestBlock")
+            result["syncPercent"] = sync_state.get("syncPercent")
+            result["peers"] = sync_state.get("peers")
+            result["finalizedBlock"] = sync_state.get("finalizedBlock")
+            result["finalizationGap"] = sync_state.get("finalizationGap")
+
+    # Determine overall status
+    # In --farmer mode, GRANDPA finalization lags behind chain head and
+    # may never fully catch up.  The farmer can plot and submit solutions
+    # against unfinalized blocks, so we treat the node as "running" once
+    # block imports are at chain head (isSyncing=false), regardless of
+    # finalizationGap.
+    is_syncing = result.get("isSyncing")
+
+    if node_alive and farmer_alive:
+        if is_syncing:
+            result["running"] = True
+            result["status"] = "syncing"
+        else:
+            result["running"] = True
+            result["status"] = "running"
+    elif node_alive:
+        if is_syncing:
+            result["status"] = "syncing"
+        else:
+            result["status"] = "degraded"
+    elif farmer_alive:
+        result["status"] = "degraded"
+    else:
+        result["status"] = "stopped"
+
     return result
 
 

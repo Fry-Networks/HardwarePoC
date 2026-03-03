@@ -19,17 +19,9 @@ PYTHON_BIN="${VENV_DIR}/bin/python3"
 CODE=${1^^}  # to upper
 VERSION=$2
 VERSION_CHECK_SEC=${3:-600}
-USE_1PASSWORD=${USE_1PASSWORD:-true}
-USE_GITHUB=${USE_GITHUB:-true}
 OP_REF_BEARER_TOKEN=${OP_REF_BEARER_TOKEN:-"op://VPS/Hardware_API/API_BEARER_TOKEN"}
 OP_REF_SIGNING_KEY=${OP_REF_SIGNING_KEY:-"op://VSCode/hardware_exe/local_signing_key_hex"}
-OP_REF_UPDATE_REPO=${OP_REF_UPDATE_REPO:-"op://VSCode/hardware_exe/Github_repo_test"}
-OP_REF_GITHUB_TOKEN=${OP_REF_GITHUB_TOKEN:-"op://VSCode/hardware_exe/Github_token"}
 OP_REF_AUTONOMYS_API_KEY=${OP_REF_AUTONOMYS_API_KEY:-"op://DataStorage/AutoDrive/AUTONOMYS_API_KEY"}
-BEARER_TOKEN=${BEARER_TOKEN:-""}
-SIGNING_KEY=${SIGNING_KEY:-""}
-GITHUB_TOKEN=${GITHUB_TOKEN:-""}
-SOFTWARE_UPTODATE=${SOFTWARE_UPTODATE:-true}
 INTERVAL_SECONDS=${INTERVAL_SECONDS:-600}
 TLS_CA_FILE=${TLS_CA_FILE:-""}
 SIGN=${SIGN:-false}
@@ -38,8 +30,6 @@ SIGN_PFX_PASSWORD=${SIGN_PFX_PASSWORD:-""}
 BUILD_GUI=${BUILD_GUI:-false}
 SIGN_SUBJECT=${SIGN_SUBJECT:-""}
 SIGN_TIMESTAMP_URL=${SIGN_TIMESTAMP_URL:-"http://timestamp.digicert.com"}
-USE_1PASSWORD_PFX=${USE_1PASSWORD_PFX:-false}
-OPEN_1P=${OPEN_1P:-false}
 COMPANY_NAME=${COMPANY_NAME:-"Fry Networks LLC"}
 PRODUCT_NAME=${PRODUCT_NAME:-""}
 FILE_DESCRIPTION=${FILE_DESCRIPTION:-""}
@@ -207,12 +197,8 @@ if [ -z "$tools_dir" ]; then
   echo "Warning: tools/ directory not found in repo root or miner_GUI; some helper scripts may be missing."
 fi
 
-# 1Password check
-needs_op=false
-if [ "$USE_1PASSWORD" = true ] && { [ -z "$BEARER_TOKEN" ] || [ -z "$SIGNING_KEY" ]; } && { [ -n "$OP_REF_BEARER_TOKEN" ] || [ -n "$OP_REF_SIGNING_KEY" ]; }; then
-  needs_op=true
-fi
-if [ "$needs_op" = true ] && ! command -v op >/dev/null; then
+# 1Password CLI is always required
+if ! command -v op >/dev/null; then
   echo "Error: 1Password CLI 'op' not found on PATH."
   exit 1
 fi
@@ -222,41 +208,15 @@ echo "=== Building $CODE v$VERSION ==="
 # API base
 api_base_url='https://hardwareapi.frynetworks.com'
 
-# Resolve tokens
+# Resolve tokens from 1Password
 bearer_token_value=""
-if [ -n "$BEARER_TOKEN" ]; then
-  bearer_token_value=$BEARER_TOKEN
-elif [ "$USE_1PASSWORD" = true ] && [ -n "$OP_REF_BEARER_TOKEN" ]; then
+if [ -n "$OP_REF_BEARER_TOKEN" ]; then
   bearer_token_value=$(op read "$OP_REF_BEARER_TOKEN" | tr -d '\n')
 fi
 
 sign_key_value=""
-if [ -n "$SIGNING_KEY" ]; then
-  sign_key_value=$SIGNING_KEY
-elif [ "$USE_1PASSWORD" = true ] && [ -n "$OP_REF_SIGNING_KEY" ]; then
+if [ -n "$OP_REF_SIGNING_KEY" ]; then
   sign_key_value=$(op read "$OP_REF_SIGNING_KEY" | tr -d '\n')
-fi
-
-repo=""
-if [ "$USE_1PASSWORD" = true ] && [ -n "$OP_REF_UPDATE_REPO" ]; then
-  repo=$(op read "$OP_REF_UPDATE_REPO" 2>/dev/null | tr -d '\n' || echo "")
-  if [ -n "$repo" ] && [[ $repo != */* ]]; then
-    echo "Error: Update repo must be 'owner/repo'"
-    exit 1
-  fi
-fi
-
-github_tok=""
-if [ "$USE_GITHUB" = true ]; then
-  if [ -n "$GITHUB_TOKEN" ]; then
-    github_tok=$GITHUB_TOKEN
-  elif [ "$USE_1PASSWORD" = true ] && [ -n "$OP_REF_GITHUB_TOKEN" ]; then
-    github_tok=$(op read "$OP_REF_GITHUB_TOKEN" 2>/dev/null | tr -d '\n' || echo "")
-  fi
-  if [ -z "$github_tok" ]; then
-    echo "Warning: No GitHub token provided, disabling GitHub integration"
-    USE_GITHUB=false
-  fi
 fi
 
 # Validate signing key
@@ -268,9 +228,9 @@ if [ -n "$sign_key_value" ]; then
   echo "Signing key OK"
 fi
 
-# Autonomys API key (1Password reference)
+# Autonomys API key from 1Password
 AUTONOMYS_API_KEY_VAL=""
-if [ "$USE_1PASSWORD" = true ] && [ -n "$OP_REF_AUTONOMYS_API_KEY" ]; then
+if [ -n "$OP_REF_AUTONOMYS_API_KEY" ]; then
   AUTONOMYS_API_KEY_VAL=$(op read "$OP_REF_AUTONOMYS_API_KEY" 2>/dev/null | tr -d '\n' || echo "")
 fi
 if [ -n "$AUTONOMYS_API_KEY_VAL" ]; then
@@ -281,16 +241,12 @@ fi
 tmp_cfg="_tmp_config.json"
 "$PYTHON_BIN" - <<EOF > "$tmp_cfg"
 import json
-use_github = "${USE_GITHUB,,}" == "true"
-software_uptodate = "${SOFTWARE_UPTODATE,,}" == "true"
 cfg = {
     "external_api": {
         "base_url": "$api_base_url",
         "timeout": 10.0
     },
-    "interval_seconds": $INTERVAL_SECONDS,
-    "use_github": use_github,
-    "software_uptodate": software_uptodate
+    "interval_seconds": $INTERVAL_SECONDS
 }
 bearer = "$bearer_token_value"
 if bearer:
@@ -301,12 +257,6 @@ if tls:
 sign = "$sign_key_value"
 if sign:
     cfg["local_signing_key_hex"] = sign
-r = "$repo"
-if r:
-    cfg["update_repo"] = r
-gh = "$github_tok"
-if gh:
-    cfg["github_token"] = gh
 autonomys_key = "${AUTONOMYS_API_KEY_VAL}"
 if autonomys_key:
   cfg.setdefault("tool_credentials", {})["autonomys_api_key"] = autonomys_key
@@ -428,6 +378,7 @@ if [ "$CODE" = "RDN" ]; then
     echo "Warning: DIIISCO Docker Compose directory not found at $diiisco_dir"
   fi
 fi
+
 
 # Build
 if [ "$ARCH" = "aarch64" ]; then

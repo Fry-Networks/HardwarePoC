@@ -2,6 +2,14 @@
 from __future__ import annotations
 import datetime as dt
 import json, os, sys, time, tempfile, logging, re, hashlib, argparse, uuid, platform, pathlib, threading, subprocess
+
+# When run as the main script (python miner_online_simple.py), Python loads
+# this file as ``__main__``.  Other modules that ``from miner_online_simple
+# import X`` would get a *second* copy of the module with its own globals,
+# so in-memory state like _sa_node_process would always be None in the
+# second copy.  Alias the module so both names share the same object.
+if __name__ == "__main__":
+    sys.modules["miner_online_simple"] = sys.modules[__name__]
 from poi_monitor_aem import monitor_poi_for_aem
 from typing import Dict, Any, Optional, Tuple, List, Callable, Iterable, cast
 
@@ -149,8 +157,7 @@ _SOFTWARE_VERSION_LAST_REFRESH = 0.0
 MYST_TEQUILAPI_PORT = 4050
 MYST_WIREGUARD_PORT = 51820
 PRESEARCH_API_PORT = 80
-DIIISCO_MONITORING_PORT = 3001
-DIIISCO_NODE_PORT = 3000
+DIIISCO_NODE_PORT = 8181
 OLLAMA_PORT = 11434
 DEFAULT_RPC_PORT = 9944  # Default Substrate RPC port (Space Acres)
 
@@ -346,6 +353,7 @@ def _read_service_config() -> Dict[str, Any]:
     - config/miner_config.json - Main miner configuration (enable/disable flags)
     - config/presearch_config.json - Presearch tool settings
     - config/diiisco_config.json - Diiisco tool settings
+    - config/space_acres_config.json - Space Acres tool settings
     - config/brd_config.json - Bright tool settings
     - config/honeygain.json - Honeygain tool settings
     - config/honeygain.enc - Honeygain API key (encrypted)
@@ -390,6 +398,7 @@ def _read_service_config() -> Dict[str, Any]:
         tool_configs = {
             'presearch_config': 'presearch_config.json',
             'diiisco_config': 'diiisco_config.json',
+            'spaceacres_config': 'space_acres_config.json',
             'brd_config': 'brd_config.json',
             'honeygain_config': 'honeygain.json'
         }
@@ -424,15 +433,17 @@ def _load_service_config() -> Dict[str, Any]:
 
 def _get_tool_credentials() -> Dict[str, Any]:
     """Get tool credentials from embedded config.
-    
+
     Credentials are embedded at build time from 1Password and include:
     - mysterium_api_key, mysterium_identity
     - presearch_registration_code
-    - diiisco_algo_add, diiisco_algo_pp
-    - spaceacres_farmer_key, spaceacres_reward_address
+    - spaceacres_reward_address
     - bright_api_token
     - honeygain_api_key
-    
+
+    Note: diiisco credentials (algo_add, algo_pp) are now in a separate
+    diiisco_creds.enc file; see _read_diiisco_creds().
+
     Returns:
         Dictionary of tool credentials (empty if not embedded)
     """
@@ -442,6 +453,63 @@ def _get_tool_credentials() -> Dict[str, Any]:
     except Exception as e:
         log.warning("Failed to load tool credentials: %s", e)
         return {}
+
+
+_diiisco_creds_cache: Optional[Dict[str, str]] = None
+
+def _read_diiisco_creds() -> Dict[str, str]:
+    """Read diiisco credentials from bundled/deployed diiisco_creds.enc.
+
+    The .enc file is Fernet-encrypted (PBKDF2, fixed salt/password).
+    Search order: PyInstaller _MEIPASS, data_dir/config/, app_dir/config/.
+    Results are cached for the lifetime of the process.
+
+    Returns:
+        Dict with 'diiisco_algo_add' and 'diiisco_algo_pp', or empty dict.
+    """
+    global _diiisco_creds_cache
+    if _diiisco_creds_cache is not None:
+        return _diiisco_creds_cache
+
+    candidates: List[str] = []
+    if hasattr(sys, "_MEIPASS"):
+        candidates.append(os.path.join(getattr(sys, "_MEIPASS"), "diiisco_creds.enc"))
+    candidates.extend(_config_file_candidates("diiisco_creds.enc"))
+
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8-sig") as fh:
+                encrypted = json.load(fh)
+            if not isinstance(encrypted, dict) or "data" not in encrypted:
+                continue
+
+            from cryptography.fernet import Fernet
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+            import base64
+
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=b"diiisco_creds_salt_v1",
+                iterations=100000,
+            )
+            key = base64.urlsafe_b64encode(kdf.derive(b"diiisco_creds_key_v1"))
+            decrypted = Fernet(key).decrypt(encrypted["data"].encode())
+            result = json.loads(decrypted)
+            if isinstance(result, dict):
+                _diiisco_creds_cache = result
+                log.debug("Loaded diiisco credentials from %s", path)
+                return result
+        except Exception:
+            log.warning("Failed to read/decrypt diiisco_creds.enc at %s", path, exc_info=True)
+            continue
+
+    log.warning("diiisco_creds.enc not found in any candidate path: %s", candidates)
+    _diiisco_creds_cache = {}
+    return {}
 
 
 def _get_presearch_api_key() -> str:
@@ -538,8 +606,9 @@ def _get_enabled_tools() -> List[str]:
         # Define which PoCs are supported by each miner type
         supported_pocs = {
             'BM': ['mysterium', 'bright', 'honeygain'],     # Bandwidth Miner
+            'RDN': ['presearch', 'diiisco'],                 # Reward Decentralization Node
             'SDN': ['spaceacres'],                           # Storage/Data Node
-            'SVN': ['presearch', 'diiisco'],                 # Storage Verification Node
+            'SVN': [],                                        # Storage Verification Node (under construction)
             'AEM': [],                                       # Agent/Edge Miner (if any)
         }
         
@@ -566,10 +635,20 @@ def _get_enabled_tools() -> List[str]:
                 log.warning("Tool %s is enabled but Docker is not available; skipping", poc_type)
                 continue
 
+            # Check miner_config enable flags (BM pattern: mysterium_enabled, etc.)
+            found = False
             for key in config_keys:
                 if miner_config.get(key) is True:
                     enabled.append(poc_type)
+                    found = True
                     break
+            if found:
+                continue
+
+            # Check per-tool config files (Docker tools: presearch_config.json, etc.)
+            tool_cfg = config.get(f"{poc_type}_config", {})
+            if isinstance(tool_cfg, dict) and tool_cfg.get("enabled") is True:
+                enabled.append(poc_type)
     
     except Exception as e:
         log.warning("Error determining enabled PoCs: %s", e)
@@ -758,6 +837,9 @@ _CONFIG_FILE_TO_SDK: Dict[str, str] = {
     "brd_config.json": "bright",
     "honeygain.json": "honeygain",
     "mysterium.json": "mysterium",
+    "presearch_config.json": "presearch",
+    "diiisco_config.json": "diiisco",
+    "space_acres_config.json": "spaceacres",
 }
 _TRUE_SET = {"1", "true", "yes", "y", "on", "approved", "allow", "allowed", "enabled"}
 _FALSE_SET = {"0", "false", "no", "n", "off", "deny", "denied", "blocked"}
@@ -776,18 +858,20 @@ DOCKER_CONTAINER_DEFS: Dict[str, Dict[str, Any]] = {
     "diiisco-node": {
         "compose": True,
         "compose_dir": "docker/diiisco",
-        "containers": ["ollama", "diiisco-node"],
+        "containers": ["diiisco-ollama", "diiisco-ollama-init", "diiisco-node"],
         "creds": {
             "diiisco_algo_add": "ALGO_ADDRESS",
             "diiisco_algo_pp": "ALGO_MNEMONIC",
         },
     },
+    # "spaceacres-node" removed — now managed as native binaries (no Docker)
 }
 
 # Allowed Docker container names that can be managed via IPC ops_queue
 ALLOWED_DOCKER_CONTAINERS: frozenset = frozenset(DOCKER_CONTAINER_DEFS.keys())
 
 # Docker-based tools that require Docker to be installed
+# (spaceacres removed — uses native binaries, no Docker dependency)
 DOCKER_TOOLS: frozenset = frozenset({"presearch", "diiisco"})
 
 # Docker availability cache
@@ -1561,6 +1645,7 @@ def _compute_rewards_multiplier(
     *,
     presearch_active: bool = False,
     diiisco_active: bool = False,
+    spaceacres_active: bool = False,
 ) -> float:
     """Compute per-slot rewards multiplier based on gating and active tools.
 
@@ -1568,12 +1653,19 @@ def _compute_rewards_multiplier(
     - BM: PoD (Proof of Data) - data upload succeeded
     - AEM: PoI (Proof of Installation) - Olostep running and enabled
 
-    RDN and BM use the same parametric formula:
+    RDN, SDN, and BM use the same parametric formula:
         multiplier_base + multiplier_per_tool * tool_count
     """
-    # SVN, SDN: only check mac_match and poc_ok (no pod_ok or tools required)
-    if miner_type in ("SVN", "SDN"):
+    # SVN: only check mac_match and poc_ok (no pod_ok or tools required)
+    if miner_type == "SVN":
         return 1.0 if (mac_match and poc_ok) else 0.0
+
+    # SDN: parametric — gates on mac_match + poc_ok, tool = spaceacres
+    if miner_type == "SDN":
+        if not (mac_match and poc_ok):
+            return 0.0
+        tool_count = int(bool(spaceacres_active))
+        return multiplier_base + multiplier_per_tool * tool_count
 
     # RDN: parametric like BM but gates only on mac_match + poc_ok (no pod_ok)
     if miner_type == "RDN":
@@ -1986,6 +2078,7 @@ def write_status(
     multiplier_per_tool: float = 0.1,
     presearch_active: bool = False,
     diiisco_active: bool = False,
+    spaceacres_active: bool = False,
 ) -> None:
     # --- time / slot basics ---
     day = day_iso(ts)  # "YYYY-MM-DD"
@@ -2286,6 +2379,12 @@ def write_status(
             ("diiisco", diiisco_active),
         ) if active]
 
+    # --- SDN Docker-based tools ---
+    elif miner_type_val == "SDN":
+        selected_tools = [name for name, active in (
+            ("spaceacres", spaceacres_active),
+        ) if active]
+
     # --- compute multiplier ---
     rewards_multiplier_value = _compute_rewards_multiplier(
         miner_type_val if isinstance(miner_type_val, str) and miner_type_val else MINER_CODE,
@@ -2299,6 +2398,7 @@ def write_status(
         multiplier_per_tool=multiplier_per_tool,
         presearch_active=presearch_active,
         diiisco_active=diiisco_active,
+        spaceacres_active=spaceacres_active,
     )
 
     # --- unified slot snapshot for the graph ---
@@ -2481,13 +2581,111 @@ def _parse_bool_flag(value: Any) -> Optional[bool]:
             return False
     return None
 
+def _detect_available_ssds() -> List[Dict[str, Any]]:
+    """Detect available SSD drives with free space for Space Acres farming.
+
+    Returns list of dicts, e.g.:
+        [{"path": "D:\\\\", "free_gb": 450.2, "total_gb": 500.0}, ...]
+
+    Windows: PowerShell Get-PhysicalDisk pipeline to find SSD volumes.
+    Linux:   /sys/block/*/queue/rotational + df for SSD mount points.
+    """
+    ssds: List[Dict[str, Any]] = []
+    _cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+
+    if sys.platform == "win32":
+        # Two-step approach:
+        # 1) Get-PhysicalDisk for SSD model names (MediaType is only reliable here)
+        # 2) WMI Win32_DiskDrive → Win32_DiskPartition → Win32_LogicalDisk for
+        #    drive letter mapping (works with dynamic/spanned/striped disks that
+        #    break the Get-PhysicalDisk | Get-Disk | Get-Partition pipeline)
+        ps_cmd = (
+            "$ssdModels = @(Get-PhysicalDisk | Where-Object MediaType -eq 'SSD' | "
+            "Select-Object -ExpandProperty FriendlyName); "
+            "Get-CimInstance Win32_DiskDrive | ForEach-Object { "
+            "  $disk = $_; "
+            "  $model = $disk.Model; "
+            "  $isSsd = $false; "
+            "  foreach ($m in $ssdModels) { if ($model -like \"*$m*\" -or $m -like \"*$model*\") { $isSsd = $true; break } }; "
+            "  if ($isSsd) { "
+            "    Get-CimAssociatedInstance -InputObject $disk -ResultClassName Win32_DiskPartition | "
+            "    ForEach-Object { "
+            "      Get-CimAssociatedInstance -InputObject $_ -ResultClassName Win32_LogicalDisk "
+            "    } "
+            "  } "
+            "} | Where-Object { $_.DeviceID -and $_.Size -gt 0 } | "
+            "Group-Object DeviceID | ForEach-Object { $_.Group[0] } | "
+            "Select-Object @{N='DriveLetter';E={$_.DeviceID -replace ':',''}}, "
+            "@{N='FreeGB';E={[math]::Round($_.FreeSpace/1GB,1)}}, "
+            "@{N='TotalGB';E={[math]::Round($_.Size/1GB,1)}} | "
+            "ConvertTo-Json -Compress"
+        )
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                capture_output=True, text=True, timeout=30, creationflags=_cflags,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                data = json.loads(r.stdout.strip())
+                if isinstance(data, dict):
+                    data = [data]
+                for item in data:
+                    dl = item.get("DriveLetter", "")
+                    if dl:
+                        ssds.append({
+                            "path": f"{dl}:\\",
+                            "free_gb": float(item.get("FreeGB", 0)),
+                            "total_gb": float(item.get("TotalGB", 0)),
+                        })
+        except Exception:
+            log.debug("SSD detection failed on Windows", exc_info=True)
+    else:
+        # Linux: check /sys/block/*/queue/rotational for SSDs
+        try:
+            sys_block = Path("/sys/block")
+            ssd_devs: set = set()
+            if sys_block.is_dir():
+                for dev_dir in sys_block.iterdir():
+                    rot_file = dev_dir / "queue" / "rotational"
+                    if rot_file.exists():
+                        val = rot_file.read_text().strip()
+                        if val == "0":
+                            ssd_devs.add(dev_dir.name)
+                    elif "nvme" in dev_dir.name:
+                        ssd_devs.add(dev_dir.name)
+
+            if ssd_devs:
+                r = subprocess.run(
+                    ["df", "--output=source,target,avail,size", "-B1"],
+                    capture_output=True, text=True, timeout=5, creationflags=_cflags,
+                )
+                if r.returncode == 0:
+                    for line in r.stdout.strip().splitlines()[1:]:
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            src, mount = parts[0], parts[1]
+                            dev_name = Path(src).name.rstrip("0123456789")
+                            if any(dev_name.startswith(sd) or sd.startswith(dev_name) for sd in ssd_devs):
+                                avail = int(parts[2])
+                                total = int(parts[3])
+                                ssds.append({
+                                    "path": mount,
+                                    "free_gb": round(avail / (1024**3), 1),
+                                    "total_gb": round(total / (1024**3), 1),
+                                })
+        except Exception:
+            log.debug("SSD detection failed on Linux", exc_info=True)
+
+    return ssds
+
+
 def _get_gui_config_schema() -> Dict[str, Any]:
     """Get default schema for gui_config.enc based on miner type."""
     schema = {
         "base_reward": 1.0,
         "per_tool_reward": 0.1,
     }
-    
+
     # Add SDK approval flags based on miner type
     if MINER_CODE == "BM":
         schema["honeygain"] = False
@@ -2496,8 +2694,11 @@ def _get_gui_config_schema() -> Dict[str, Any]:
     elif MINER_CODE == "RDN":
         schema["presearch"] = False
         schema["diiisco"] = False
-    # All other miner types (AEM, IDM, IRM, ISM, ODM, OSM, SDN, SVN) only have base/per_tool
-    
+    elif MINER_CODE == "SDN":
+        schema["spaceacres"] = False
+        schema["available_ssds"] = []        # populated by _detect_available_ssds()
+        schema["spaceacres_config"] = {}     # set by GUI via configure_spaceacres op
+
     return schema
 
 def read_encrypted_gui_config() -> Dict[str, Any]:
@@ -2996,8 +3197,10 @@ def _tool_states_for_slot() -> Tuple[bool, bool, bool]:
 def _rdn_tool_states_for_slot() -> Tuple[bool, bool]:
     """Return (presearch_active, diiisco_active) for RDN reward calculation.
 
-    Checks whether each tool is enabled in config and its Docker container
-    is running.
+    Uses cached poll results from the measurement daemon (non-blocking).
+    The measurement daemon calls poll_presearch/poll_diiisco every 60s
+    which updates the cache.  This avoids blocking the main PoC loop
+    with Docker subprocess calls.
     """
     presearch_active = False
     diiisco_active = False
@@ -3009,23 +3212,45 @@ def _rdn_tool_states_for_slot() -> Tuple[bool, bool]:
 
     if "presearch" in enabled_tools:
         try:
-            from measurements.tools import poll_presearch
-            creds = _get_tool_credentials()
-            api_key = creds.get("presearch_api_key", "")
-            stats = poll_presearch(api_key=api_key)
-            presearch_active = bool(stats.get("running", False))
+            from measurements.tools import get_cached_presearch
+            stats = get_cached_presearch()
+            if stats:
+                presearch_active = bool(stats.get("running", False))
         except Exception:
             presearch_active = False
 
     if "diiisco" in enabled_tools:
         try:
-            from measurements.tools import poll_diiisco
-            stats = poll_diiisco()
-            diiisco_active = bool(stats.get("running", False))
+            from measurements.tools import get_cached_diiisco
+            stats = get_cached_diiisco()
+            if stats:
+                diiisco_active = bool(stats.get("running", False))
         except Exception:
             diiisco_active = False
 
     return presearch_active, diiisco_active
+
+
+def _sdn_tool_states_for_slot() -> bool:
+    """Return spaceacres_active for SDN reward calculation.
+
+    Checks whether Space Acres is enabled in config and its Docker
+    containers are running.
+    """
+    try:
+        enabled_tools = _get_enabled_tools()
+    except Exception:
+        return False
+
+    if "spaceacres" not in enabled_tools:
+        return False
+
+    try:
+        from measurements.tools import poll_space_acres
+        stats = poll_space_acres()
+        return bool(stats.get("running", False))
+    except Exception:
+        return False
 
 
 def _compute_day_aggregates(day_doc: Dict[str, Any]) -> None:
@@ -3181,6 +3406,7 @@ def write_week_local(
     multiplier_per_tool: float = 0.1,
     presearch_active: bool = False,
     diiisco_active: bool = False,
+    spaceacres_active: bool = False,
     api_available: Optional[bool] = None,  # Hardware API availability
 ) -> None:
     """
@@ -3334,11 +3560,14 @@ def write_week_local(
             tools_active.append("presearch")
         if diiisco_active:
             tools_active.append("diiisco")
+    elif MINER_CODE == "SDN":
+        if spaceacres_active:
+            tools_active.append("spaceacres")
 
-    # Tools gate policy (BM / RDN):
-    # - If BM or RDN and zero tools selected => fail tools gate
+    # Tools gate policy (BM / RDN / SDN):
+    # - If BM, RDN, or SDN and zero tools selected => fail tools gate
     tools_ok: Optional[bool]
-    if MINER_CODE in ("BM", "RDN"):
+    if MINER_CODE in ("BM", "RDN", "SDN"):
         tools_ok = (len(tools_active) > 0)
     else:
         tools_ok = None
@@ -3357,6 +3586,7 @@ def write_week_local(
             multiplier_per_tool=multiplier_per_tool,
             presearch_active=presearch_active,
             diiisco_active=diiisco_active,
+            spaceacres_active=spaceacres_active,
         )
     except Exception:
         multiplier = None
@@ -4502,7 +4732,7 @@ def _setup_presearch_firewall() -> bool:
 def _setup_diiisco_firewall() -> bool:
     """Setup firewall rules for Diiisco Docker Compose stack.
 
-    Opens ports for: Ollama (11434), DIIISCO node (3000), monitoring (3001).
+    Opens ports for: Ollama (11434), DIIISCO node API (8181).
 
     Returns:
         True if all rules added successfully, False otherwise
@@ -4510,17 +4740,21 @@ def _setup_diiisco_firewall() -> bool:
     ok = True
     ok = _add_firewall_rule("Ollama_TCP", OLLAMA_PORT, "TCP", "in") and ok
     ok = _add_firewall_rule("Diiisco_Node_TCP", DIIISCO_NODE_PORT, "TCP", "in") and ok
-    ok = _add_firewall_rule("Diiisco_Monitor_TCP", DIIISCO_MONITORING_PORT, "TCP", "in") and ok
     log_step("privileged_diiisco_firewall_setup", {"success": ok})
     return ok
 
 def _setup_spaceacres_firewall() -> bool:
-    """Setup firewall rules for Space Acres (Substrate RPC).
+    """Setup firewall rules for Space Acres native binaries.
 
-    Returns:
-        True if rule added successfully, False otherwise
+    Ports: 30333 (node P2P), 30533 (farmer DSN), 9944 (node RPC, localhost).
     """
-    success = _add_firewall_rule("SpaceAcres_RPC_TCP", DEFAULT_RPC_PORT, "TCP", "in")
+    success = True
+    if not _add_firewall_rule("SpaceAcres_NodeP2P_TCP", 30333, "TCP", "in"):
+        success = False
+    if not _add_firewall_rule("SpaceAcres_FarmerDSN_TCP", 30533, "TCP", "in"):
+        success = False
+    if not _add_firewall_rule("SpaceAcres_RPC_TCP", DEFAULT_RPC_PORT, "TCP", "in"):
+        success = False
     log_step("privileged_spaceacres_firewall_setup", {"success": success})
     return success
 
@@ -4670,38 +4904,697 @@ def _resolve_compose_dir(compose_rel: str) -> Optional[str]:
     return None
 
 
-def _start_docker_compose(cdef: Dict[str, Any], container_name: str) -> Tuple[bool, str]:
-    """Start a Docker Compose stack defined in DOCKER_CONTAINER_DEFS."""
+# -- Autonomys version auto-discovery --
+_AUTONOMYS_FALLBACK_VERSION = "mainnet-2026-jan-20"
+_autonomys_latest_version: Optional[str] = None
+_autonomys_version_checked_at: float = 0.0
+_AUTONOMYS_VERSION_CACHE_S = 86400  # re-check once per 24 hours
+
+
+def _resolve_latest_autonomys_version() -> str:
+    """Return the latest stable Autonomys mainnet release tag.
+
+    Queries the GitHub releases API, picks the newest non-prerelease tag
+    starting with ``mainnet-``, and caches the result for 24 hours.
+    Falls back to ``_AUTONOMYS_FALLBACK_VERSION`` if the API is unreachable.
+    """
+    global _autonomys_latest_version, _autonomys_version_checked_at
+
+    now = time.monotonic()
+    if _autonomys_latest_version and (now - _autonomys_version_checked_at) < _AUTONOMYS_VERSION_CACHE_S:
+        return _autonomys_latest_version
+
+    try:
+        import requests as _req
+        resp = _req.get(
+            "https://api.github.com/repos/autonomys/subspace/releases",
+            params={"per_page": 20},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        for release in resp.json():
+            tag = release.get("tag_name", "")
+            if tag.startswith("mainnet-") and not release.get("prerelease", False):
+                _autonomys_latest_version = tag
+                _autonomys_version_checked_at = now
+                if tag != _AUTONOMYS_FALLBACK_VERSION:
+                    log.info("Autonomys version resolved: %s (fallback was %s)",
+                             tag, _AUTONOMYS_FALLBACK_VERSION)
+                return tag
+    except Exception as e:
+        log.debug("Failed to resolve latest Autonomys version: %s", e)
+
+    # API failed — return cached or fallback
+    return _autonomys_latest_version or _AUTONOMYS_FALLBACK_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Native Space Acres binary management (replaces Docker Compose)
+# ---------------------------------------------------------------------------
+# Instead of running subspace-node/farmer in Docker containers, we download
+# the native Windows executables from GitHub releases and manage them as
+# child processes.  This eliminates Docker networking issues (GRANDPA stalls)
+# and removes the Docker Desktop dependency for SDN miners.
+
+_AUTONOMYS_NODE_TEMPLATE = "subspace-node-windows-x86_64-skylake-{version}.exe"
+_AUTONOMYS_FARMER_TEMPLATE = "subspace-farmer-windows-x86_64-skylake-{version}.exe"
+_AUTONOMYS_DOWNLOAD_URL = (
+    "https://github.com/autonomys/subspace/releases/download/{version}/{filename}"
+)
+_AUTONOMYS_DOWNLOAD_TIMEOUT = 900  # seconds (binaries are ~50-110 MB each)
+_SA_NODE_HEALTH_TIMEOUT = 300      # 5 min for node RPC to become reachable
+_SA_NODE_HEALTH_POLL_S = 5         # seconds between health polls
+_SA_GRACEFUL_STOP_S = 15           # seconds to wait for graceful shutdown
+_SA_LOG_MAX_BYTES = 50 * 1024 * 1024  # 50 MB per log file
+_SA_LOG_MAX_FILES = 3
+
+# Process state (module-level, accessed from measurements/tools.py)
+_sa_node_process: Optional[subprocess.Popen] = None
+_sa_farmer_process: Optional[subprocess.Popen] = None
+_sa_node_log_fh: Optional[Any] = None   # open file handle for node log
+_sa_farmer_log_fh: Optional[Any] = None
+_sa_process_lock = threading.Lock()
+_sa_startup_thread: Optional[threading.Thread] = None
+
+# PID file names (under _spaceacres_dir()/run/)
+_SA_NODE_PID_FILE = "node.pid"
+_SA_FARMER_PID_FILE = "farmer.pid"
+
+# Max consecutive auto-restart attempts before giving up
+_SA_MAX_RESTART_ATTEMPTS = 5
+_sa_consecutive_restart_failures: int = 0
+
+
+def _spaceacres_dir() -> str:
+    """Base directory for all Space Acres files under data_dir()."""
+    return os.path.join(data_dir(), "space-acres")
+
+
+def _autonomys_bin_dir() -> str:
+    return os.path.join(_spaceacres_dir(), "bin")
+
+
+def _get_installed_autonomys_version() -> Optional[str]:
+    vf = os.path.join(_autonomys_bin_dir(), "current_version.txt")
+    if os.path.isfile(vf):
+        try:
+            with open(vf, "r") as f:
+                return f.read().strip() or None
+        except Exception:
+            pass
+    return None
+
+
+def _set_installed_autonomys_version(version: str) -> None:
+    bd = _autonomys_bin_dir()
+    os.makedirs(bd, exist_ok=True)
+    with open(os.path.join(bd, "current_version.txt"), "w") as f:
+        f.write(version)
+
+
+def _download_autonomys_binary(
+    filename: str,
+    version: str,
+    request_id: str = "",
+    label: str = "",
+) -> Tuple[bool, str]:
+    """Download a single Autonomys binary from GitHub releases.
+
+    Returns (success, dest_path_or_error).
+    """
+    import requests as _req
+
+    url = _AUTONOMYS_DOWNLOAD_URL.format(version=version, filename=filename)
+    dest_dir = _autonomys_bin_dir()
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, filename)
+    tmp_path = dest_path + ".tmp"
+
+    if os.path.isfile(dest_path):
+        return True, dest_path
+
+    try:
+        log.info("Downloading %s from %s", filename, url)
+        if request_id and label:
+            _write_ops_progress(request_id, "downloading", f"Downloading {label}...")
+
+        resp = _req.get(url, stream=True, timeout=_AUTONOMYS_DOWNLOAD_TIMEOUT)
+        resp.raise_for_status()
+
+        total = int(resp.headers.get("content-length", 0))
+        downloaded = 0
+        with open(tmp_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):  # 1 MB chunks
+                f.write(chunk)
+                downloaded += len(chunk)
+                if request_id and total > 0:
+                    pct = int(downloaded * 100 / total)
+                    _write_ops_progress(
+                        request_id, "downloading",
+                        f"Downloading {label}... {pct}% ({downloaded // (1024*1024)} MB / {total // (1024*1024)} MB)",
+                    )
+
+        os.replace(tmp_path, dest_path)
+        log.info("Downloaded %s (%d bytes)", filename, downloaded)
+        return True, dest_path
+
+    except Exception as e:
+        log.warning("Failed to download %s: %s", filename, e)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return False, str(e)
+
+
+def _ensure_autonomys_binaries(version: str, request_id: str = "") -> Tuple[bool, str, str]:
+    """Ensure node + farmer binaries exist for the given version.
+
+    Returns (success, node_exe_path, farmer_exe_path).
+    On failure: (False, error_message, "").
+    """
+    node_fn = _AUTONOMYS_NODE_TEMPLATE.format(version=version)
+    farmer_fn = _AUTONOMYS_FARMER_TEMPLATE.format(version=version)
+
+    ok, node_path = _download_autonomys_binary(node_fn, version, request_id, "consensus node")
+    if not ok:
+        return False, node_path, ""
+
+    ok, farmer_path = _download_autonomys_binary(farmer_fn, version, request_id, "farmer")
+    if not ok:
+        return False, farmer_path, ""
+
+    # Record installed version
+    _set_installed_autonomys_version(version)
+
+    # Clean up old version binaries
+    installed = _get_installed_autonomys_version()
+    if installed:
+        bd = _autonomys_bin_dir()
+        for f in os.listdir(bd):
+            if f.startswith("subspace-") and f.endswith(".exe") and installed not in f:
+                try:
+                    os.remove(os.path.join(bd, f))
+                except OSError:
+                    pass
+
+    return True, node_path, farmer_path
+
+
+# -- CLI command builders --
+
+def _build_node_command(node_exe: str, base_path: str, node_name: str) -> List[str]:
+    return [
+        node_exe, "run",
+        "--chain", "mainnet",
+        "--base-path", base_path,
+        "--name", node_name,
+        "--farmer",
+        "--listen-on", "/ip4/0.0.0.0/tcp/30333",
+        "--rpc-listen-on", "127.0.0.1:9944",
+        "--in-peers", "125",
+        "--out-peers", "75",
+    ]
+
+
+def _build_farmer_command(
+    farmer_exe: str, reward_address: str,
+    farm_path: str, farm_size: str,
+) -> List[str]:
+    return [
+        farmer_exe, "farm",
+        "--reward-address", reward_address,
+        "--node-rpc-url", "ws://127.0.0.1:9944",
+        "--listen-on", "/ip4/0.0.0.0/tcp/30533",
+        f"path={farm_path},size={farm_size}",
+    ]
+
+
+# -- Log rotation --
+
+def _rotate_log_if_needed(log_path: str) -> None:
+    try:
+        if not os.path.isfile(log_path):
+            return
+        if os.path.getsize(log_path) < _SA_LOG_MAX_BYTES:
+            return
+        for i in range(_SA_LOG_MAX_FILES, 0, -1):
+            src = f"{log_path}.{i - 1}" if i > 1 else log_path
+            dst = f"{log_path}.{i}"
+            if os.path.isfile(src):
+                if i == _SA_LOG_MAX_FILES:
+                    os.remove(src)
+                else:
+                    os.replace(src, dst)
+    except Exception:
+        pass
+
+
+# -- PID file helpers --
+
+def _write_pid_file(name: str, pid: int) -> None:
+    run_dir = os.path.join(data_dir(), "run")
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, name), "w") as f:
+        f.write(str(pid))
+
+
+def _read_pid_file(name: str) -> Optional[int]:
+    p = os.path.join(data_dir(), "run", name)
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, "r") as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def _remove_pid_file(name: str) -> None:
+    try:
+        os.remove(os.path.join(data_dir(), "run", name))
+    except OSError:
+        pass
+
+
+# -- Space Acres PID helpers (under _spaceacres_dir()/run/) --
+
+def _write_sa_pid_file(name: str, pid: int) -> None:
+    run_dir = os.path.join(_spaceacres_dir(), "run")
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, name), "w") as f:
+        f.write(str(pid))
+
+
+def _read_sa_pid_file(name: str) -> Optional[int]:
+    p = os.path.join(_spaceacres_dir(), "run", name)
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, "r") as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def _remove_sa_pid_file(name: str) -> None:
+    try:
+        os.remove(os.path.join(_spaceacres_dir(), "run", name))
+    except OSError:
+        pass
+
+
+# -- Process lifecycle --
+
+def _terminate_process(proc: Optional[subprocess.Popen], label: str) -> None:
+    """Gracefully terminate a child process; escalate to kill after timeout."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=_SA_GRACEFUL_STOP_S)
+            log.info("Process %s (PID %d) terminated gracefully", label, proc.pid)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+            log.warning("Process %s (PID %d) killed after timeout", label, proc.pid)
+    except Exception as e:
+        log.warning("Failed to terminate %s: %s", label, e)
+
+
+def _get_sa_process_state() -> Tuple[bool, bool]:
+    """Return (node_alive, farmer_alive) — called from measurements/tools.py."""
+    node_alive = _sa_node_process is not None and _sa_node_process.poll() is None
+    farmer_alive = _sa_farmer_process is not None and _sa_farmer_process.poll() is None
+    return node_alive, farmer_alive
+
+
+def _start_spaceacres_native(request_id: str = "") -> Tuple[bool, str]:
+    """Start Space Acres node + farmer as native child processes.
+
+    Phases: download binaries → start node → wait for RPC → start farmer.
+    """
+    global _sa_node_process, _sa_farmer_process
+    global _sa_node_log_fh, _sa_farmer_log_fh
+
+    with _sa_process_lock:
+        # Already running?
+        if _sa_node_process and _sa_node_process.poll() is None:
+            return True, "Space Acres node is already running"
+
+        # -- Config --
+        gui_cfg = read_encrypted_gui_config()
+        sa_cfg = gui_cfg.get("spaceacres_config", {})
+        farm_path = sa_cfg.get("farm_path", "")
+        farm_size = sa_cfg.get("farm_size", "")
+        if not farm_path or not farm_size:
+            return False, "Space Acres not configured: missing farm_path or farm_size"
+
+        creds = _get_tool_credentials()
+        reward_address = creds.get("spaceacres_reward_address", "")
+        if not reward_address:
+            return False, "Missing spaceacres_reward_address credential"
+
+        node_name = read_miner_key() or "sdn-node"
+        version = _resolve_latest_autonomys_version()
+
+        # -- Phase 1: Ensure binaries --
+        _write_ops_progress(request_id, "downloading", "Checking Autonomys binaries...")
+        ok, node_exe, farmer_exe = _ensure_autonomys_binaries(version, request_id)
+        if not ok:
+            return False, f"Binary download failed: {node_exe}"
+
+        # -- Phase 2: Start node --
+        _write_ops_progress(request_id, "starting_node", "Starting consensus node...")
+
+        log_dir = os.path.join(_spaceacres_dir(), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        node_base_path = os.path.join(_spaceacres_dir(), "node-data")
+        os.makedirs(node_base_path, exist_ok=True)
+        os.makedirs(farm_path, exist_ok=True)
+
+        node_log = os.path.join(log_dir, "node.log")
+        _rotate_log_if_needed(node_log)
+        _sa_node_log_fh = open(node_log, "a", encoding="utf-8", errors="replace")
+
+        node_cmd = _build_node_command(node_exe, node_base_path, node_name)
+        _cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+        _BELOW_NORMAL = 0x00004000  # BELOW_NORMAL_PRIORITY_CLASS
+        _cflags |= _BELOW_NORMAL
+
+        _sa_node_process = subprocess.Popen(
+            node_cmd,
+            stdout=_sa_node_log_fh,
+            stderr=subprocess.STDOUT,
+            creationflags=_cflags,
+        )
+        _write_sa_pid_file(_SA_NODE_PID_FILE, _sa_node_process.pid)
+        log_step("spaceacres_node_started", {
+            "pid": _sa_node_process.pid,
+            "version": version,
+        })
+
+    # -- Phase 2b: Wait for node RPC (outside lock) --
+    _write_ops_progress(request_id, "waiting_for_node", "Waiting for node RPC...")
+    from measurements.tools import _port_reachable
+    start_wait = time.monotonic()
+    node_healthy = False
+    while (time.monotonic() - start_wait) < _SA_NODE_HEALTH_TIMEOUT:
+        if _sa_node_process.poll() is not None:
+            return False, f"Node exited with code {_sa_node_process.returncode}"
+        if _port_reachable(DEFAULT_RPC_PORT, timeout=2.0):
+            node_healthy = True
+            break
+        time.sleep(_SA_NODE_HEALTH_POLL_S)
+
+    if not node_healthy:
+        with _sa_process_lock:
+            _terminate_process(_sa_node_process, "node")
+            _sa_node_process = None
+        return False, "Node RPC did not become reachable within 5 minutes"
+
+    # -- Phase 3: Start farmer --
+    with _sa_process_lock:
+        _write_ops_progress(request_id, "starting_farmer", "Starting farmer...")
+
+        farmer_log = os.path.join(log_dir, "farmer.log")
+        _rotate_log_if_needed(farmer_log)
+        _sa_farmer_log_fh = open(farmer_log, "a", encoding="utf-8", errors="replace")
+
+        farmer_cmd = _build_farmer_command(farmer_exe, reward_address, farm_path, farm_size)
+        _sa_farmer_process = subprocess.Popen(
+            farmer_cmd,
+            stdout=_sa_farmer_log_fh,
+            stderr=subprocess.STDOUT,
+            creationflags=_cflags,
+        )
+        _write_sa_pid_file(_SA_FARMER_PID_FILE, _sa_farmer_process.pid)
+        log_step("spaceacres_farmer_started", {
+            "pid": _sa_farmer_process.pid,
+            "farm_path": farm_path,
+            "farm_size": farm_size,
+        })
+
+    return True, "Space Acres started (node + farmer)"
+
+
+def _stop_spaceacres_native() -> Tuple[bool, str]:
+    """Stop Space Acres native processes (farmer first, then node)."""
+    global _sa_node_process, _sa_farmer_process
+    global _sa_node_log_fh, _sa_farmer_log_fh
+
+    with _sa_process_lock:
+        _terminate_process(_sa_farmer_process, "farmer")
+        _sa_farmer_process = None
+        _remove_sa_pid_file(_SA_FARMER_PID_FILE)
+        if _sa_farmer_log_fh:
+            try:
+                _sa_farmer_log_fh.close()
+            except Exception:
+                pass
+            _sa_farmer_log_fh = None
+
+        _terminate_process(_sa_node_process, "node")
+        _sa_node_process = None
+        _remove_sa_pid_file(_SA_NODE_PID_FILE)
+        if _sa_node_log_fh:
+            try:
+                _sa_node_log_fh.close()
+            except Exception:
+                pass
+            _sa_node_log_fh = None
+
+        log_step("spaceacres_stopped", {})
+        return True, "Space Acres stopped"
+
+
+def _async_native_spaceacres_start(request_id: str, op: str) -> None:
+    """Run Space Acres native start in a background thread."""
+    global _sa_startup_thread
+
+    if _sa_startup_thread is not None and _sa_startup_thread.is_alive():
+        _write_ops_result(request_id, op, False,
+                          "Another Space Acres start operation is already in progress")
+        return
+
+    def _run() -> None:
+        try:
+            success, msg = _start_spaceacres_native(request_id=request_id)
+            error_msg = msg if not success else None
+
+            extra_result: Optional[Dict[str, Any]] = None
+            if success:
+                try:
+                    from measurements.tools import poll_space_acres
+                    poll_result = poll_space_acres()
+                    _write_spaceacres_sync_status(poll_result)
+                except Exception:
+                    poll_result = {}
+                sync_path = os.path.join(_spaceacres_dir(), "sync.json")
+                extra_result = {
+                    "sync_status_path": sync_path,
+                    "initial_status": poll_result.get("status", "syncing"),
+                }
+
+            _write_ops_result(request_id, op, success, error_msg, extra=extra_result)
+        except Exception as exc:
+            _write_ops_result(request_id, op, False, str(exc))
+
+    _sa_startup_thread = threading.Thread(
+        target=_run, name="spaceacres-native-start", daemon=True,
+    )
+    _sa_startup_thread.start()
+
+
+def _kill_orphan_autonomys_processes() -> None:
+    """Kill orphaned Autonomys processes from a previous service run."""
+    import signal
+    for pid_file, label in [
+        (_SA_FARMER_PID_FILE, "farmer"),
+        (_SA_NODE_PID_FILE, "node"),
+    ]:
+        pid = _read_sa_pid_file(pid_file)
+        if pid is not None:
+            try:
+                os.kill(pid, 0)  # check alive
+                os.kill(pid, signal.SIGTERM)
+                log.info("Killed orphan %s process PID %d", label, pid)
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                log.warning("Failed to kill orphan %s PID %d: %s", label, pid, e)
+            _remove_sa_pid_file(pid_file)
+
+    # Fallback: scan by process name
+    _cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+    for exe_pattern in ["subspace-node", "subspace-farmer"]:
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"IMAGENAME eq {exe_pattern}*", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=10, creationflags=_cflags,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().splitlines():
+                    parts = line.strip('"').split('","')
+                    if len(parts) >= 2 and exe_pattern in parts[0].lower():
+                        try:
+                            pid = int(parts[1])
+                            os.kill(pid, signal.SIGTERM)
+                            log.info("Killed orphan %s PID %d (tasklist scan)", exe_pattern, pid)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+
+# -- Async Docker Compose operations --
+# Used for non-Space-Acres compose stacks (diiisco).
+_docker_compose_lock = threading.Lock()
+
+
+def _async_docker_compose_start(
+    cdef: Dict[str, Any],
+    container_name: str,
+    request_id: str,
+    op: str,
+) -> None:
+    """Run Docker Compose start in a background thread."""
+    if not _docker_compose_lock.acquire(blocking=False):
+        _write_ops_result(request_id, op, False,
+                          "Another Docker Compose operation is already in progress")
+        return
+
+    def _run() -> None:
+        try:
+            success, msg = _start_docker_compose(cdef, container_name, request_id=request_id)
+            error_msg = msg if not success else None
+            _write_ops_result(request_id, op, success, error_msg)
+        except Exception as exc:
+            _write_ops_result(request_id, op, False, str(exc))
+        finally:
+            _docker_compose_lock.release()
+
+    t = threading.Thread(target=_run, name=f"compose-start-{container_name}", daemon=True)
+    t.start()
+
+
+def _async_docker_compose_stop(
+    cdef: Dict[str, Any],
+    container_name: str,
+    request_id: str,
+    op: str,
+) -> None:
+    """Run Docker Compose stop in a background thread."""
+    if not _docker_compose_lock.acquire(blocking=False):
+        _write_ops_result(request_id, op, False,
+                          "Another Docker Compose operation is already in progress")
+        return
+
+    def _run() -> None:
+        try:
+            success, msg = _stop_docker_compose(cdef, container_name)
+            error_msg = msg if not success else None
+            _write_ops_result(request_id, op, success, error_msg)
+        except Exception as exc:
+            _write_ops_result(request_id, op, False, str(exc))
+        finally:
+            _docker_compose_lock.release()
+
+    t = threading.Thread(target=_run, name=f"compose-stop-{container_name}", daemon=True)
+    t.start()
+
+
+def _start_docker_compose(cdef: Dict[str, Any], container_name: str, request_id: str = "") -> Tuple[bool, str]:
+    """Start a Docker Compose stack defined in DOCKER_CONTAINER_DEFS.
+
+    Splits the startup into three phases (pull → build → up) and writes
+    progress updates to ``ops_processed/{request_id}.progress.json`` so the
+    GUI can display real-time feedback during long cold-start operations.
+    """
     compose_dir = _resolve_compose_dir(cdef["compose_dir"])
     if not compose_dir:
         return False, f"Compose dir not found for {container_name}"
 
     _cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
     compose_file = os.path.join(compose_dir, "docker-compose.yml")
+    base_cmd = ["docker", "compose", "-f", compose_file]
 
     # Build env with injected credentials
     run_env = dict(os.environ)
     creds_map = cdef.get("creds", {})
     if creds_map:
         try:
-            embedded = _get_tool_credentials()
+            cred_source = _get_tool_credentials()
+            if container_name == "diiisco-node":
+                cred_source.update(_read_diiisco_creds())  # .enc overrides embedded
+            injected = []
             for cred_key, env_var in creds_map.items():
-                val = embedded.get(cred_key, "")
+                val = cred_source.get(cred_key, "")
                 if val:
                     run_env[env_var] = val
-        except Exception:
-            pass
+                    injected.append(env_var)
+            log_step("docker_compose_creds", {
+                "container": container_name,
+                "injected": injected,
+                "expected": list(creds_map.values()),
+            })
+        except Exception as exc:
+            log_step("docker_compose_creds_failed", {
+                "container": container_name,
+                "error": str(exc),
+            })
 
-    cmd = ["docker", "compose", "-f", compose_file, "up", "-d", "--build"]
+    # ── Phase 1: pull images ────────────────────────────────────────────
+    _write_ops_progress(request_id, "pulling", "Downloading container images...")
+    log_step("docker_compose_phase", {"container": container_name, "phase": "pulling"})
     try:
         result = subprocess.run(
-            cmd, capture_output=True, timeout=300, encoding="utf-8", errors="ignore",
+            base_cmd + ["pull", "--ignore-buildable"],
+            capture_output=True, timeout=600, encoding="utf-8", errors="ignore",
+            creationflags=_cflags, env=run_env,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "")[:1000]
+            return False, f"docker compose pull failed: {err}"
+    except subprocess.TimeoutExpired:
+        return False, "docker compose pull timed out (600s)"
+    except Exception as exc:
+        return False, f"Exception during docker compose pull: {exc}"
+
+    # ── Phase 2: build custom images ────────────────────────────────────
+    _write_ops_progress(request_id, "building", "Building application image...")
+    log_step("docker_compose_phase", {"container": container_name, "phase": "building"})
+    try:
+        result = subprocess.run(
+            base_cmd + ["build"],
+            capture_output=True, timeout=300, encoding="utf-8", errors="ignore",
+            creationflags=_cflags, env=run_env,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "")[:1000]
+            return False, f"docker compose build failed: {err}"
+    except subprocess.TimeoutExpired:
+        return False, "docker compose build timed out (300s)"
+    except Exception as exc:
+        return False, f"Exception during docker compose build: {exc}"
+
+    # ── Phase 3: start containers ───────────────────────────────────────
+    _write_ops_progress(request_id, "starting", "Starting containers...")
+    log_step("docker_compose_phase", {"container": container_name, "phase": "starting"})
+    try:
+        result = subprocess.run(
+            base_cmd + ["up", "-d"],
+            capture_output=True, timeout=300, encoding="utf-8", errors="ignore",
             creationflags=_cflags, env=run_env,
         )
         if result.returncode == 0:
             log_step("docker_compose_started", {"container": container_name, "compose_dir": compose_dir})
             return True, f"Compose stack {container_name} started"
-        return False, f"docker compose up failed: {(result.stderr or result.stdout or '')[:200]}"
+        err = (result.stderr or result.stdout or "")[:1000]
+        return False, f"docker compose up failed: {err}"
+    except subprocess.TimeoutExpired:
+        return False, "docker compose up timed out (300s)"
     except Exception as exc:
         log_step("docker_compose_start_exception", {"container": container_name, "error": str(exc)})
         return False, f"Exception starting compose stack: {exc}"
@@ -4731,7 +5624,7 @@ def _stop_docker_compose(cdef: Dict[str, Any], container_name: str) -> Tuple[boo
         return False, f"Exception stopping compose stack: {exc}"
 
 
-def _start_docker_container(container_name: str) -> Tuple[bool, str]:
+def _start_docker_container(container_name: str, request_id: str = "") -> Tuple[bool, str]:
     """Start a Docker container or compose stack.
 
     For compose-based entries (``compose=True`` in DOCKER_CONTAINER_DEFS),
@@ -4740,6 +5633,7 @@ def _start_docker_container(container_name: str) -> Tuple[bool, str]:
 
     Args:
         container_name: Container name (must be in DOCKER_CONTAINER_DEFS)
+        request_id: IPC request ID for progress reporting (compose stacks only)
 
     Returns:
         Tuple of (success, message)
@@ -4748,12 +5642,13 @@ def _start_docker_container(container_name: str) -> Tuple[bool, str]:
     if cdef is None:
         return False, f"container {container_name} not in allowed list"
 
-    if not _is_docker_available():
-        return False, "Docker is not installed or daemon not running"
+    # Skip _is_docker_available() pre-flight check — `docker info` is heavy
+    # and can time out even when Docker is responsive enough for compose/run.
+    # Let the actual docker command fail naturally with a clear error.
 
     # Compose-based stack (diiisco-node)
     if cdef.get("compose"):
-        return _start_docker_compose(cdef, container_name)
+        return _start_docker_compose(cdef, container_name, request_id=request_id)
 
     # Single container (presearch-node) — existing behaviour
     _cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
@@ -4778,7 +5673,16 @@ def _start_docker_container(container_name: str) -> Tuple[bool, str]:
             if result.returncode == 0:
                 log_step("docker_container_started", {"container": container_name, "method": "start"})
                 return True, f"Container {container_name} started"
-            return False, f"docker start failed: {(result.stderr or result.stdout or '')[:200]}"
+            # docker start failed (e.g. image deleted) -- remove broken
+            # container and fall through to docker run to re-pull
+            log_step("docker_start_failed_removing", {
+                "container": container_name,
+                "error": (result.stderr or result.stdout or "")[:200],
+            })
+            subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                capture_output=True, timeout=15, creationflags=_cflags,
+            )
     except Exception:
         pass
 
@@ -4813,7 +5717,7 @@ def _start_docker_container(container_name: str) -> Tuple[bool, str]:
 
     try:
         result = subprocess.run(
-            cmd, capture_output=True, timeout=120, encoding="utf-8", errors="ignore",
+            cmd, capture_output=True, timeout=600, encoding="utf-8", errors="ignore",
             creationflags=_cflags,
         )
         if result.returncode == 0:
@@ -4837,8 +5741,7 @@ def _stop_docker_container(container_name: str) -> Tuple[bool, str]:
     if container_name not in ALLOWED_DOCKER_CONTAINERS:
         return False, f"container {container_name} not in allowed list"
 
-    if not _is_docker_available():
-        return False, "Docker is not installed or daemon not running"
+    # Skip _is_docker_available() — let the docker command fail naturally.
 
     # Compose-based stack
     cdef = DOCKER_CONTAINER_DEFS.get(container_name)
@@ -4863,8 +5766,32 @@ def _stop_docker_container(container_name: str) -> Tuple[bool, str]:
         return False, f"Exception stopping container: {exc}"
 
 
+# IPC helper: write progress update for long-running ops (GUI polls this)
+def _write_ops_progress(request_id: str, phase: str, detail: str = "") -> None:
+    """Write a progress update file for a long-running ops request.
+
+    The GUI polls ops_processed/{request_id}.progress.json alongside .done.json
+    to show real-time phase information during Docker Compose startup.
+    """
+    if not request_id:
+        return
+    try:
+        progress = {
+            "request_id": request_id,
+            "phase": phase,
+            "detail": detail,
+            "updated_at": dt.datetime.now(UTC).isoformat(),
+        }
+        progress_path = os.path.join(data_dir(), "ops_processed", f"{request_id}.progress.json")
+        os.makedirs(os.path.dirname(progress_path), exist_ok=True)
+        with open(progress_path, "w", encoding="utf-8") as f:
+            json.dump(progress, f)
+    except Exception:
+        pass
+
+
 # IPC helper: write result marker for processed ops
-def _write_ops_result(request_id: str, op: Optional[str], success: bool, error_msg: Optional[str] = None) -> None:
+def _write_ops_result(request_id: str, op: Optional[str], success: bool, error_msg: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> None:
     try:
         result = {
             "id": request_id,
@@ -4874,6 +5801,8 @@ def _write_ops_result(request_id: str, op: Optional[str], success: bool, error_m
         }
         if error_msg:
             result["error"] = error_msg
+        if extra:
+            result.update(extra)
         result_path = os.path.join(data_dir(), "ops_processed", f"{request_id}.done.json")
         os.makedirs(os.path.dirname(result_path), exist_ok=True)
         with open(result_path, "w", encoding="utf-8") as f:
@@ -4963,6 +5892,7 @@ def _process_ops_queue_request(request_path: str) -> None:
         # Process operation
         success = False
         error_msg = None
+        extra_result = None  # extra fields to include in .done.json
         
         if op == "write_config":
             relative_path = request.get("relative_path")
@@ -4973,6 +5903,7 @@ def _process_ops_queue_request(request_path: str) -> None:
             
             success = _write_config_file(relative_path, content)
             if success:
+                _reload_service_config()
                 sdk_name = _CONFIG_FILE_TO_SDK.get(os.path.basename(relative_path))
                 if sdk_name:
                     # Parse the config file content to determine approval status
@@ -5085,17 +6016,96 @@ def _process_ops_queue_request(request_path: str) -> None:
             container_name = request.get("container_name", "")
             if not container_name:
                 raise ValueError("start_docker_container requires container_name")
-            success, msg = _start_docker_container(container_name)
-            if not success:
-                error_msg = msg
+
+            # Space Acres: native binary path (no Docker)
+            if container_name == "spaceacres-node":
+                _async_native_spaceacres_start(request_id, op)
+                try:
+                    processed_path = os.path.join(
+                        data_dir(), "ops_processed",
+                        f"{os.path.basename(request_path)}.processed",
+                    )
+                    os.replace(request_path, processed_path)
+                except Exception:
+                    try:
+                        os.remove(request_path)
+                    except Exception:
+                        pass
+                return  # done.json written by the background thread
+
+            # Other compose-based containers (diiisco) run async
+            cdef = DOCKER_CONTAINER_DEFS.get(container_name)
+            if cdef and cdef.get("compose"):
+                _async_docker_compose_start(cdef, container_name, request_id, op)
+                try:
+                    processed_path = os.path.join(
+                        data_dir(), "ops_processed",
+                        f"{os.path.basename(request_path)}.processed",
+                    )
+                    os.replace(request_path, processed_path)
+                except Exception:
+                    try:
+                        os.remove(request_path)
+                    except Exception:
+                        pass
+                return  # done.json written by the background thread
+            else:
+                success, msg = _start_docker_container(container_name, request_id=request_id)
+                if not success:
+                    error_msg = msg
 
         elif op == "stop_docker_container":
             container_name = request.get("container_name", "")
             if not container_name:
                 raise ValueError("stop_docker_container requires container_name")
-            success, msg = _stop_docker_container(container_name)
-            if not success:
-                error_msg = msg
+
+            # Space Acres: native stop
+            if container_name == "spaceacres-node":
+                success, msg = _stop_spaceacres_native()
+                _write_spaceacres_sync_status({
+                    "status": "stopped",
+                    "node_healthy": False,
+                    "farmer_running": False,
+                })
+                if not success:
+                    error_msg = msg
+            else:
+                # Other compose-based containers
+                cdef = DOCKER_CONTAINER_DEFS.get(container_name)
+                if cdef and cdef.get("compose"):
+                    _async_docker_compose_stop(cdef, container_name, request_id, op)
+                    try:
+                        processed_path = os.path.join(
+                            data_dir(), "ops_processed",
+                            f"{os.path.basename(request_path)}.processed",
+                        )
+                        os.replace(request_path, processed_path)
+                    except Exception:
+                        try:
+                            os.remove(request_path)
+                        except Exception:
+                            pass
+                    return  # done.json written by the background thread
+                else:
+                    success, msg = _stop_docker_container(container_name)
+                    if not success:
+                        error_msg = msg
+
+        elif op == "configure_spaceacres":
+            farm_path = request.get("farm_path", "")
+            farm_size = request.get("farm_size", "")
+            if not farm_path or not farm_size:
+                raise ValueError("configure_spaceacres requires farm_path and farm_size")
+            payload = read_encrypted_gui_config()
+            payload["spaceacres_config"] = {
+                "farm_path": farm_path,
+                "farm_size": farm_size,
+            }
+            success = _write_encrypted_gui_config(payload)
+            if success:
+                log_step("spaceacres_configured", {"farm_path": farm_path, "farm_size": farm_size})
+            else:
+                error_msg = "Failed to write spaceacres config to gui_config.enc"
 
         else:
             # Unknown operation: log and mark failure without raising to preserve result marker
@@ -5105,7 +6115,7 @@ def _process_ops_queue_request(request_path: str) -> None:
         
         # Write result marker
         if request_id:
-            _write_ops_result(request_id, op, success, error_msg)
+            _write_ops_result(request_id, op, success, error_msg, extra=extra_result)
         
         # Move processed file
         processed_name = os.path.basename(request_path)
@@ -5171,6 +6181,7 @@ def _ops_queue_daemon_loop() -> None:
         "stop_service",
         "start_docker_container",
         "stop_docker_container",
+        "configure_spaceacres",
     ]}, level="debug")
     
     request_count = 0
@@ -5347,36 +6358,353 @@ def _collect_presearch_stats(config: Dict[str, Any]) -> Dict[str, Any]:
     return stats
 
 
-def _collect_diiisco_stats(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Collect DIIISCO Docker Compose stack statistics (Ollama + DIIISCO node)."""
-    stats: Dict[str, Any] = {"status": "unknown"}
+
+# -- Space Acres stall detection --
+_sa_last_finalized_block: Optional[int] = None       # last seen finalized block
+_sa_finalized_stall_since: Optional[float] = None    # monotonic time when finalization stall started
+_sa_last_current_block: Optional[int] = None         # last seen currentBlock (sync stall tracking)
+_sa_sync_stall_since: Optional[float] = None         # monotonic time when sync stall started
+_sa_last_restart_at: float = 0.0                      # monotonic time of last auto-restart
+_sa_finalized_at_last_restart: Optional[int] = None  # finalized block when last restart was triggered
+_SA_STALL_THRESHOLD_S = 300   # 5 min with no progress -> stalled
+_SA_RESTART_COOLDOWN_S = 900  # don't auto-restart more than once per 15 min
+# After DSN snap sync, GRANDPA finalization must catch up by receiving
+# justifications from peers.  This can take hours for large gaps.  Skip
+# finalization-stall restarts while the gap exceeds this threshold.
+_SA_INITIAL_SYNC_GAP_THRESHOLD = 1000
+
+
+def _collect_spaceacres_stats(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Collect Space Acres statistics via native process polling.
+
+    Includes stall detection for two phases:
+
+    1. **Sync stall**: ``currentBlock`` hasn't changed for
+       ``_SA_STALL_THRESHOLD_S`` while the node reports ``isSyncing=True``.
+
+    2. **Finalization stall**: ``finalizedBlock`` hasn't changed for
+       ``_SA_STALL_THRESHOLD_S`` while the node is in "finalizing" state.
+
+    In both cases the node process is automatically restarted (once per
+    ``_SA_RESTART_COOLDOWN_S``, up to ``_SA_MAX_RESTART_ATTEMPTS`` times).
+    """
+    global _sa_last_finalized_block, _sa_finalized_stall_since
+    global _sa_last_current_block, _sa_sync_stall_since
+    global _sa_last_restart_at, _sa_consecutive_restart_failures
+    global _sa_finalized_at_last_restart
+
+    stats = {"status": "unknown"}
     try:
-        from measurements.tools import poll_diiisco
-        result = poll_diiisco()
+        from measurements.tools import poll_space_acres
+        result = poll_space_acres()
         stats.update(result)
-        if result.get("running"):
+        if result.get("status") == "syncing":
+            stats["status"] = "syncing"
+        elif result.get("running"):
             stats["status"] = "running"
         elif result.get("enabled"):
             stats["status"] = "stopped"
         else:
             stats["status"] = "not_found"
+
+        now = time.monotonic()
+        poll_status = result.get("status", "")
+
+        # --- Sync stall detection (currentBlock stuck during syncing) ---
+        # Skip when currentBlock == 0 (initial DSN download phase — blocks
+        # will jump from 0 to millions suddenly, not a stall).
+        cur_block = result.get("currentBlock")
+        highest_block = result.get("highestBlock")
+
+        if poll_status == "syncing" and cur_block is not None and cur_block > 0:
+            # After DSN snap sync the node lands at a block millions ahead
+            # but still has thousands of blocks to import via regular sync.
+            # The transition from snap sync to peer sync can show 0 bps for
+            # a while — don't restart during this catch-up phase.
+            sync_gap = (highest_block or 0) - cur_block
+            in_initial_sync = sync_gap > _SA_INITIAL_SYNC_GAP_THRESHOLD
+
+            if _sa_last_current_block is not None and cur_block == _sa_last_current_block:
+                # currentBlock hasn't advanced since last poll
+                if _sa_sync_stall_since is None:
+                    _sa_sync_stall_since = now
+                stall_duration = now - _sa_sync_stall_since
+
+                if stall_duration >= _SA_STALL_THRESHOLD_S:
+                    if in_initial_sync:
+                        # Log but don't restart — still catching up after
+                        # snap sync.
+                        if stall_duration < _SA_STALL_THRESHOLD_S + 60:
+                            log.info(
+                                "Space Acres sync at block %s (gap %s) "
+                                "— post-snap-sync catch-up, skipping restart",
+                                cur_block, sync_gap,
+                            )
+                    else:
+                        stats["status"] = "stalled"
+                        result["status"] = "stalled"
+                        log.warning(
+                            "Space Acres sync stalled at block %s for %.0fs (0 bps)",
+                            cur_block, stall_duration,
+                        )
+                        if (now - _sa_last_restart_at) >= _SA_RESTART_COOLDOWN_S:
+                            _sa_last_restart_at = now
+                            _sa_sync_stall_since = None
+                            _auto_restart_spaceacres_node("sync_stalled")
+            else:
+                # Sync progressed -> reset stall tracking + restart counter
+                _sa_sync_stall_since = None
+                _sa_consecutive_restart_failures = 0
+
+            _sa_last_current_block = cur_block
+        else:
+            # Not syncing -> reset sync stall tracking
+            if poll_status != "syncing":
+                _sa_sync_stall_since = None
+                _sa_last_current_block = cur_block
+
+        # --- Finalization stall detection (finalizedBlock stuck) ---
+        fin_block = result.get("finalizedBlock")
+        fin_gap = result.get("finalizationGap")
+
+        if poll_status in ("finalizing", "degraded") and fin_block is not None:
+            # After DSN snap sync, GRANDPA must catch up by receiving
+            # justifications from peers — this can take hours for large
+            # gaps.  Don't trigger restarts during this initial catch-up;
+            # restarts only reset the GRANDPA state and make it worse.
+            in_initial_sync = (fin_gap is not None
+                               and fin_gap > _SA_INITIAL_SYNC_GAP_THRESHOLD)
+
+            if _sa_last_finalized_block is not None and fin_block == _sa_last_finalized_block:
+                # Finalized block hasn't changed since last poll
+                if _sa_finalized_stall_since is None:
+                    _sa_finalized_stall_since = now
+                stall_duration = now - _sa_finalized_stall_since
+
+                if stall_duration >= _SA_STALL_THRESHOLD_S:
+                    if in_initial_sync:
+                        # Log but don't restart — GRANDPA is still catching
+                        # up after snap sync.
+                        if stall_duration < _SA_STALL_THRESHOLD_S + 60:
+                            log.info(
+                                "Space Acres finalization at block %s "
+                                "(gap %s) — initial GRANDPA catch-up, "
+                                "skipping restart",
+                                fin_block, fin_gap,
+                            )
+                    else:
+                        stats["status"] = "stalled"
+                        result["status"] = "stalled"
+                        log.warning(
+                            "Space Acres finalization stalled at block %s for %.0fs",
+                            fin_block, stall_duration,
+                        )
+                        if (now - _sa_last_restart_at) >= _SA_RESTART_COOLDOWN_S:
+                            # Count as failure if a prior restart didn't help
+                            if (_sa_finalized_at_last_restart is not None
+                                    and fin_block <= _sa_finalized_at_last_restart):
+                                _sa_consecutive_restart_failures += 1
+                            _sa_last_restart_at = now
+                            _sa_finalized_stall_since = None
+                            _sa_finalized_at_last_restart = fin_block
+                            _auto_restart_spaceacres_node("finalization_stalled")
+            else:
+                # Finalization progressed -> reset stall tracking + restart counter
+                _sa_finalized_stall_since = None
+                _sa_consecutive_restart_failures = 0
+                _sa_finalized_at_last_restart = None
+
+            _sa_last_finalized_block = fin_block
+        else:
+            # Not in a stall-detectable state -> reset tracking
+            if poll_status == "running":
+                _sa_finalized_stall_since = None
+                _sa_last_finalized_block = fin_block
+
+        # Write sync status file for GUI consumption
+        _write_spaceacres_sync_status(result)
     except Exception as e:
         stats["error"] = str(e)
     return stats
 
 
-def _collect_spaceacres_stats(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Collect Space Acres statistics."""
-    stats = {"status": "unknown"}
-    
+def _auto_restart_spaceacres_node(reason: str = "finalization_stalled") -> None:
+    """Restart Space Acres node + farmer processes to unstick sync/finalization.
+
+    Stops farmer (depends on node), restarts node, waits for RPC health,
+    restarts farmer.  Respects ``_SA_MAX_RESTART_ATTEMPTS`` to avoid
+    infinite restart loops when the issue is persistent.
+    """
+    global _sa_node_process, _sa_farmer_process
+    global _sa_node_log_fh, _sa_farmer_log_fh
+    global _sa_consecutive_restart_failures
+
+    if _sa_consecutive_restart_failures >= _SA_MAX_RESTART_ATTEMPTS:
+        log.warning(
+            "Skipping auto-restart (%s): reached max %d consecutive failures",
+            reason, _SA_MAX_RESTART_ATTEMPTS,
+        )
+        return
+
+    log_step("spaceacres_auto_restart", {"reason": reason, "method": "native"})
+
     try:
-        # TODO: Implement Space Acres stats collection
-        # This would query the RPC endpoint
-        stats["status"] = "not_implemented"
+        # Gather config for restart
+        gui_cfg = read_encrypted_gui_config()
+        sa_cfg = gui_cfg.get("spaceacres_config", {})
+        farm_path = sa_cfg.get("farm_path", "")
+        farm_size = sa_cfg.get("farm_size", "")
+        creds = _get_tool_credentials()
+        reward_address = creds.get("spaceacres_reward_address", "")
+        node_name = read_miner_key() or "sdn-node"
+
+        installed_version = _get_installed_autonomys_version()
+        if not installed_version:
+            log.warning("Cannot auto-restart: no installed Autonomys version")
+            _sa_consecutive_restart_failures += 1
+            return
+
+        node_exe = os.path.join(
+            _autonomys_bin_dir(),
+            _AUTONOMYS_NODE_TEMPLATE.format(version=installed_version),
+        )
+        if not os.path.isfile(node_exe):
+            log.warning("Cannot auto-restart: node binary not found at %s", node_exe)
+            _sa_consecutive_restart_failures += 1
+            return
+
+        # Stop farmer + node
+        with _sa_process_lock:
+            _terminate_process(_sa_farmer_process, "farmer")
+            _sa_farmer_process = None
+            _terminate_process(_sa_node_process, "node")
+            _sa_node_process = None
+
+            # Escalation: if a plain restart already failed once, wipe the
+            # node DB so GRANDPA can re-bootstrap cleanly.
+            node_base_path = os.path.join(_spaceacres_dir(), "node-data")
+            if _sa_consecutive_restart_failures >= 1 and reason == "finalization_stalled":
+                import shutil
+                if os.path.isdir(node_base_path):
+                    log.warning("Purging node DB at %s after %d failed restarts",
+                                node_base_path, _sa_consecutive_restart_failures)
+                    shutil.rmtree(node_base_path, ignore_errors=True)
+
+            # Restart node
+            log_dir = os.path.join(_spaceacres_dir(), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            node_log = os.path.join(log_dir, "node.log")
+            _rotate_log_if_needed(node_log)
+            _sa_node_log_fh = open(node_log, "a", encoding="utf-8", errors="replace")
+
+            node_cmd = _build_node_command(node_exe, node_base_path, node_name)
+            _cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+            _cflags |= 0x00004000  # BELOW_NORMAL_PRIORITY_CLASS
+            _sa_node_process = subprocess.Popen(
+                node_cmd,
+                stdout=_sa_node_log_fh,
+                stderr=subprocess.STDOUT,
+                creationflags=_cflags,
+            )
+            _write_sa_pid_file(_SA_NODE_PID_FILE, _sa_node_process.pid)
+
+        # Wait for node RPC
+        from measurements.tools import _port_reachable
+        start_wait = time.monotonic()
+        node_healthy = False
+        while (time.monotonic() - start_wait) < _SA_NODE_HEALTH_TIMEOUT:
+            if _sa_node_process.poll() is not None:
+                log.warning("Node exited during auto-restart with code %d",
+                            _sa_node_process.returncode)
+                _sa_consecutive_restart_failures += 1
+                return
+            if _port_reachable(DEFAULT_RPC_PORT, timeout=2.0):
+                node_healthy = True
+                break
+            time.sleep(5)
+
+        if not node_healthy:
+            log.warning("Node RPC not reachable after auto-restart")
+            _sa_consecutive_restart_failures += 1
+            return
+
+        # Restart farmer
+        if farm_path and farm_size and reward_address:
+            with _sa_process_lock:
+                farmer_exe = os.path.join(
+                    _autonomys_bin_dir(),
+                    _AUTONOMYS_FARMER_TEMPLATE.format(version=installed_version),
+                )
+                farmer_log = os.path.join(log_dir, "farmer.log")
+                _rotate_log_if_needed(farmer_log)
+                _sa_farmer_log_fh = open(farmer_log, "a", encoding="utf-8", errors="replace")
+
+                farmer_cmd = _build_farmer_command(
+                    farmer_exe, reward_address, farm_path, farm_size,
+                )
+                _sa_farmer_process = subprocess.Popen(
+                    farmer_cmd,
+                    stdout=_sa_farmer_log_fh,
+                    stderr=subprocess.STDOUT,
+                    creationflags=_cflags,
+                )
+                _write_sa_pid_file(_SA_FARMER_PID_FILE, _sa_farmer_process.pid)
+
+        log.info("Auto-restarted Space Acres node + farmer (%s)", reason)
+        # Don't reset _sa_consecutive_restart_failures here — reset only
+        # when finalization actually progresses (in _collect_spaceacres_stats).
+
     except Exception as e:
-        stats["error"] = str(e)
-    
-    return stats
+        log.warning("Failed to auto-restart Space Acres: %s", e)
+        _sa_consecutive_restart_failures += 1
+
+
+def _write_spaceacres_sync_status(poll_result: Dict[str, Any]) -> None:
+    """Write Space Acres sync status to a plain JSON file for GUI polling.
+
+    Written to space-acres/sync.json every measurement cycle (~60s).
+    """
+    try:
+        # The tool contributes to rewards when status == "running"
+        # (both processes up and block imports at chain head).  In --farmer
+        # mode GRANDPA finalization may lag permanently — this is expected
+        # and the farmer is fully functional without it.
+        is_running = poll_result.get("status") == "running"
+
+        # Determine sync phase hint for the GUI to decide what message to show.
+        # - "dsn_download":  Initial DSN snap sync download (currentBlock == 0)
+        # - "block_sync":    Importing blocks from peers/DSN (currentBlock > 0)
+        # - "finalization":  Blocks imported, GRANDPA finalizing
+        # - null:            Not syncing (running, stopped, etc.)
+        is_syncing = poll_result.get("isSyncing")
+        cur_block = poll_result.get("currentBlock")
+        fin_gap = poll_result.get("finalizationGap")
+        sync_phase = None
+        if is_syncing:
+            sync_phase = "dsn_download" if (cur_block is None or cur_block == 0) else "block_sync"
+        elif fin_gap is not None and fin_gap > 100:
+            sync_phase = "finalization"
+
+        status_payload = {
+            "status": poll_result.get("status", "unknown"),
+            "earning_rewards": is_running,
+            "syncPhase": sync_phase,
+            "node_healthy": poll_result.get("node_healthy", False),
+            "farmer_running": poll_result.get("farmer_running", False),
+            "isSyncing": is_syncing,
+            "currentBlock": cur_block,
+            "highestBlock": poll_result.get("highestBlock"),
+            "syncPercent": poll_result.get("syncPercent"),
+            "finalizedBlock": poll_result.get("finalizedBlock"),
+            "finalizationGap": fin_gap,
+            "peers": poll_result.get("peers"),
+            "error": poll_result.get("error"),
+            "updated_at": dt.datetime.now(UTC).isoformat(),
+        }
+        sync_path = os.path.join(_spaceacres_dir(), "sync.json")
+        atomic_write_json(sync_path, status_payload)
+    except Exception:
+        log.debug("Failed to write spaceacres sync status", exc_info=True)
 
 
 def _collect_bright_stats(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -5519,6 +6847,8 @@ def _measurement_collection_loop() -> None:
             elif MINER_CODE == "RDN":
                 from measurements.collector import collect_and_write_tool_stats
                 live_collectors["tools"] = (lambda: collect_and_write_tool_stats(MINER_CODE, presearch_api_key=presearch_api_key), intervals["tools"])
+            elif MINER_CODE == "SDN":
+                live_collectors["tools"] = (lambda: _collect_spaceacres_stats(_load_service_config()), intervals.get("tools", 60))
 
             # Run due live collectors
             for sensor_type, (collector_fn, interval) in live_collectors.items():
@@ -5586,7 +6916,7 @@ def _start_measurement_daemon() -> None:
             "IRM": ("radiation",),
             "IDM": ("decibel",), "ODM": ("decibel",),
             "AEM": ("aem",),
-            "RDN": ("tools",), "SVN": ("tools",),
+            "RDN": ("tools",), "SVN": ("tools",), "SDN": ("tools",),
         }
         relevant = {k: v for k, v in intervals.items() if k in _relevant_keys.get(MINER_CODE, ())}
         if relevant:
@@ -5692,6 +7022,24 @@ def main() -> None:
         docker_available = _is_docker_available()
         log.info("Docker availability at startup: %s", "available" if docker_available else "not available")
 
+    # SDN: detect available SSDs and write to gui_config.enc for the GUI
+    if MINER_CODE == "SDN":
+        try:
+            ssds = _detect_available_ssds()
+            payload = read_encrypted_gui_config()
+            payload["available_ssds"] = ssds
+            _write_encrypted_gui_config(payload)
+            log.info("SSD detection at startup: %d SSD(s) found", len(ssds))
+        except Exception:
+            log.debug("SSD detection at startup failed", exc_info=True)
+
+    # SDN: kill any orphaned Autonomys processes from a previous service run
+    if MINER_CODE == "SDN":
+        try:
+            _kill_orphan_autonomys_processes()
+        except Exception:
+            log.debug("Orphan Autonomys process cleanup failed", exc_info=True)
+
     client: Optional[MongoProxyClient] = None
     coll = None
 
@@ -5699,6 +7047,10 @@ def main() -> None:
 
     # Track last Docker check time for periodic polling (RDN/SVN/SDN only)
     last_docker_check_ts: float = time.time() if MINER_CODE in ("RDN", "SVN", "SDN") else 0.0
+
+    # Track last SSD scan time for periodic refresh (SDN only, every 30 seconds)
+    _SSD_SCAN_INTERVAL: float = 30.0
+    last_ssd_scan_ts: float = time.time() if MINER_CODE == "SDN" else 0.0
 
     # miner_mac will be detected in the main loop once we're fully initialized
     # At startup, leave it as None to avoid incorrect comparisons
@@ -5792,7 +7144,7 @@ def main() -> None:
                 multiplier_base = float(required_versions.get("multiplier_base", 1.0))
                 multiplier_per_tool = float(required_versions.get("multiplier_per_tool", 0.1))
                 # Only update GUI config for miner types that use parametric rewards
-                if MINER_CODE in ("BM", "RDN"):
+                if MINER_CODE in ("BM", "RDN", "SDN"):
                     try:
                         _update_sdk_rewards_params(multiplier_base, multiplier_per_tool)
                     except Exception:
@@ -6158,6 +7510,11 @@ def main() -> None:
     _DOCKER_PERIODIC_CHECK_INTERVAL: float = 5.0
     last_loop_status: str = "online"  # last known slot status for on-change writes
 
+    # Heartbeat interval for weekly JSON — ensures lastUpdated stays fresh
+    # even when slot work (API calls) is slow due to network saturation.
+    _WEEKLY_HEARTBEAT_INTERVAL: float = 60.0
+    last_weekly_heartbeat_ts: float = 0.0
+
     while True:
         refresh_software_version()
         now_loop = now_utc()
@@ -6180,7 +7537,47 @@ def main() -> None:
             except Exception as e:
                 log.debug("Docker periodic check failed: %s", e)
             last_docker_check_ts = now_ts
-        
+
+        # Periodic SSD scan (SDN only) — refresh available_ssds in gui_config.enc
+        # Only update when drives are added/removed or free space changes by >100 GB.
+        if MINER_CODE == "SDN" and (now_ts - last_ssd_scan_ts) >= _SSD_SCAN_INTERVAL:
+            try:
+                ssds = _detect_available_ssds()
+                payload = read_encrypted_gui_config()
+                prev_ssds = payload.get("available_ssds", [])
+                # Significant change = different drive set OR free space delta > 100 GB
+                prev_paths = {d.get("path") for d in prev_ssds if isinstance(d, dict)}
+                new_paths = {d.get("path") for d in ssds if isinstance(d, dict)}
+                significant = prev_paths != new_paths
+                if not significant:
+                    for new_d in ssds:
+                        for old_d in prev_ssds:
+                            if new_d.get("path") == old_d.get("path"):
+                                if abs(new_d.get("free_gb", 0) - old_d.get("free_gb", 0)) > 100:
+                                    significant = True
+                                    break
+                        if significant:
+                            break
+                if significant:
+                    payload["available_ssds"] = ssds
+                    _write_encrypted_gui_config(payload)
+                    log.info("SSD list refreshed: %d SSD(s) found", len(ssds))
+            except Exception:
+                log.debug("Periodic SSD scan failed", exc_info=True)
+            last_ssd_scan_ts = now_ts
+
+        # Periodic heartbeat: keep weekly JSON lastUpdated fresh so the GUI
+        # doesn't show "service may be stale" during slow API calls or Docker pulls.
+        if (now_ts - last_weekly_heartbeat_ts) >= _WEEKLY_HEARTBEAT_INTERVAL:
+            try:
+                write_week_local(
+                    miner_key, now_utc(), last_loop_status, interval,
+                    skip_slot=True,
+                )
+            except Exception:
+                pass
+            last_weekly_heartbeat_ts = now_ts
+
         if next_slot_time is None:
             next_slot_time = next_boundary(now_loop, interval)
         if now_loop + dt.timedelta(seconds=1) < next_slot_time:
@@ -6254,6 +7651,14 @@ def main() -> None:
                 except Exception:
                     pass
 
+            # SDN tool states for this slot
+            sdn_spaceacres_active = False
+            if MINER_CODE == "SDN":
+                try:
+                    sdn_spaceacres_active = _sdn_tool_states_for_slot()
+                except Exception:
+                    pass
+
             # ----------------------------
             # Local weekly cache (ALWAYS)
             # ----------------------------
@@ -6294,6 +7699,7 @@ def main() -> None:
                     multiplier_per_tool=multiplier_per_tool,
                     presearch_active=rdn_presearch_active,
                     diiisco_active=rdn_diiisco_active,
+                    spaceacres_active=sdn_spaceacres_active,
                     api_available=True,  # Will be updated in DB work block if API fails
                 )
             except Exception:
@@ -6361,7 +7767,7 @@ def main() -> None:
                 multiplier_base = float(required_versions.get("multiplier_base", 1.0))
                 multiplier_per_tool = float(required_versions.get("multiplier_per_tool", 0.1))
                 # Only update GUI config for miner types that use parametric rewards
-                if MINER_CODE in ("BM", "RDN"):
+                if MINER_CODE in ("BM", "RDN", "SDN"):
                     try:
                         _update_sdk_rewards_params(multiplier_base, multiplier_per_tool)
                     except Exception:
@@ -6474,6 +7880,7 @@ def main() -> None:
                     multiplier_per_tool=multiplier_per_tool,
                     presearch_active=rdn_presearch_active,
                     diiisco_active=rdn_diiisco_active,
+                    spaceacres_active=sdn_spaceacres_active,
                 )
                 pending_pol_update = None
 

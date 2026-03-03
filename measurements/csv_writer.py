@@ -25,8 +25,8 @@ SCHEMAS = {
     "honeygain": ["timestamp", "enabled", "earnings_usd", "status"],
     "bright": ["timestamp", "enabled", "status"],
     "presearch": ["timestamp", "online", "earnings_usd", "status"],
-    "space_acres": ["timestamp", "online", "earnings_usd", "status"],
-    "diiisco": ["timestamp", "online", "ollama_healthy", "uptime", "model", "status"],
+    "space_acres": ["timestamp", "node_healthy", "farmer_running", "status"],
+    "diiisco": ["timestamp", "online", "ollama_healthy", "cpu_percent", "mem_usage_mb", "model", "status"],
 }
 
 

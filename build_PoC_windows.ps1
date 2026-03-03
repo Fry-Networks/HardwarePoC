@@ -2,24 +2,15 @@ param(
   [Parameter(Mandatory=$true)][string]$Code,
   [Parameter(Mandatory=$true)][string]$Version,
   [int]$VersionCheckSec = 600,
-  [switch]$Use1Password = $true,
-  [switch]$UseGithub = $true,
   [string]$OPRefBearerToken = "op://HardwareAPI/Hardware_API/API_BEARER_TOKEN",
   [string]$OPRefSigningKey = "op://VSCode/hardware_exe/local_signing_key_hex",
-  [string]$OPRefUpdateRepo = "op://VSCode/hardware_exe/Github_repo_test",
-  [string]$OPRefGithubToken = "op://VSCode/hardware_exe/Github_token",
-  [string]$BearerToken = "",  # Direct bearer token value (bypasses 1Password)
-  [string]$SigningKey = "",   # Direct signing key value (bypasses 1Password)
-  [string]$GithubToken = "",
-  [bool]$SoftwareUptodate = $true,
   [SecureString]$OPRefPfxPassword = $null,
   # Tool Credentials (embedded at build time from 1Password)
-  [string]$OPRefPresearchRegCode = "op://Storage Validator Nodes/Presearch/registration_code",
-  [string]$OPRefPresearchApiKey = "op://Storage Validator Nodes/Presearch/api_key",
-  [string]$OPRefDiiiscoAlgoAdd = "op://Hardware/Diiisco/algo_address",
-  [string]$OPRefDiiiscoAlgoPP = "op://Hardware/Diiisco/algo_mnemonic",
-  [string]$OPRefSpaceAcresFarmerKey = "op://Hardware/SpaceAcres/farmer_key",
-  [string]$OPRefSpaceAcresRewardAddr = "op://Hardware/SpaceAcres/reward_address",
+  [string]$OPRefPresearchRegCode = "op://RDN/Presearch/registration_code",
+  [string]$OPRefPresearchApiKey = "op://RDN/Presearch/api_key",
+  # Diiisco: encrypted .enc file from 1Password (never store raw mnemonic)
+  [string]$OPRefDiiiscoCredsEnc = "op://RDN/Diiisco/diiisco_creds.enc",
+  [string]$OPRefSpaceAcresRewardAddr = "op://SDN/SpaceAcres/wallet",
   [string]$OPRefBrightApiToken = "op://Bandwidth Miners/Bright Data SDK Login/APP_ID",
   [string]$OPRefHoneygainApiKey = "op://Bandwidth Miners/Honeygain SDK API/credential",
 
@@ -29,9 +20,7 @@ param(
 
   # Autonomys Auto Drive
   [string]$OPRefAutonomysApiKey = "op://DataStorage/AutoDrive/AUTONOMYS_API_KEY",
-  [string]$AutonomysApiKey = "",           # Direct Autonomys API key value (bypasses 1Password)
-  [bool]$AutonomysUploadEnabled = $true,  # Enable Autonomys upload at runtime
-  [hashtable]$ToolCredentials = @{},      # Direct tool credentials hashtable (bypasses 1Password, used by batch builds)
+  [bool]$AutonomysUploadEnabled = $true,
 
   [int]$IntervalSeconds = 600,
   [string]$TlsCAFile = "",
@@ -291,9 +280,8 @@ if (-not $toolsDir) { Write-Warning "tools/ directory not found in repo root or 
 
 $patched = $false
 
-# Determine if we need to check 1Password CLI (only if using references and not direct values)
-$needsOP = ($Use1Password -and (-not $BearerToken -or -not $SigningKey) -and ($OPRefBearerToken -or $OPRefSigningKey))
-if ($needsOP -and -not (Get-Command op -ErrorAction SilentlyContinue)) {
+# 1Password CLI is always required
+if (-not (Get-Command op -ErrorAction SilentlyContinue)) {
   Write-Error "1Password CLI 'op' not found on PATH."; exit 1
 }
 
@@ -301,228 +289,111 @@ try {
   # Fixed API base URL per product policy
   $apiBaseUrl = 'https://hardwareapi.frynetworks.com'
   
-  # Resolve bearer token: direct value > 1Password reference > null
+  # Resolve bearer token from 1Password
   $bearerTokenValue = $null
-  if ($BearerToken) {
-    $bearerTokenValue = $BearerToken.Trim()
-  } elseif ($Use1Password -and $OPRefBearerToken) {
+  if ($OPRefBearerToken) {
     $bearerTokenValue = (& op read $OPRefBearerToken).Trim()
   }
-  
+
   $tmpCfg = Join-Path $PWD "_tmp_config.json"
-  $cfg = @{ 
-    external_api = @{ 
-      base_url = $apiBaseUrl; 
-      timeout = 10.0 
-    }; 
-    interval_seconds = $IntervalSeconds; 
-    use_github = [bool]$UseGithub 
+  $cfg = @{
+    external_api = @{
+      base_url = $apiBaseUrl;
+      timeout = 10.0
+    };
+    interval_seconds = $IntervalSeconds
   }
-  if ($bearerTokenValue) { 
+  if ($bearerTokenValue) {
     $cfg.external_api.bearer_token = $bearerTokenValue
     Write-Host "Bearer token configured for API authentication"
   }
-  if ($UseGithub) { $cfg.github_token = '' }
-  $cfg.software_uptodate = [bool]$SoftwareUptodate
   if ($TlsCAFile) { $cfg.tlsCAFile = [IO.Path]::GetFileName($TlsCAFile) }
-  
-  # Resolve signing key: direct value > 1Password reference > null
+
+  # Resolve signing key from 1Password
   $signKeyValue = $null
-  if ($SigningKey) {
-    $signKeyValue = $SigningKey.Trim()
-  } elseif ($Use1Password -and $OPRefSigningKey) {
+  if ($OPRefSigningKey) {
     $signKeyValue = (& op read $OPRefSigningKey).Trim()
   }
-  
+
   if ($signKeyValue) {
-    if (-not $signKeyValue) { throw "Empty signing key" }
     if (-not (Test-HexKey $signKeyValue)) { throw "Signing key must be 64 hex chars (32 bytes)" }
     $cfg.local_signing_key_hex = $signKeyValue
     Write-Host ("Signing key OK (fingerprint {0})" -f (Convert-SecretKeyToMasked $signKeyValue))
   }
   
-  if ($Use1Password -and $OPRefUpdateRepo) {
-    $repo = (& op read $OPRefUpdateRepo).Trim()
-    if (-not $repo -or ($repo -notmatch '/')) { throw "Update repo must be 'owner/repo'" }
-    $cfg.update_repo = $repo
-  }
-  
-  if ($UseGithub) {
-    $githubTok = ''
-    if ($GithubToken) {
-      $githubTok = $GithubToken.Trim()
-    } elseif ($Use1Password -and $OPRefGithubToken) {
-      $githubTok = (& op read $OPRefGithubToken).Trim()
-    }
-    if (-not $githubTok) { throw "Provide GitHub token via -OPRefGithubToken or -GithubToken when -UseGithub is set" }
-    $cfg.github_token = $githubTok
-  }
-  
   # Tool Credentials (embedded from 1Password)
-  if ($Use1Password) {
-    $toolCreds = @{}
-    
-    # Mysterium
-    try {
-      if ($OPRefMysteriumApiKey) {
-        $val = (& op read $OPRefMysteriumApiKey 2>$null).Trim()
-        if ($val) {
-          $toolCreds.mysterium_api_key = $val
-          Write-Host "Mysterium API key configured"
-        } else {
-          Write-Warning "Mysterium API key not found at $OPRefMysteriumApiKey"
-        }
-      }
-      if ($OPRefMysteriumIdentity) {
-        $val = (& op read $OPRefMysteriumIdentity 2>$null).Trim()
-        if ($val) {
-          $toolCreds.mysterium_identity = $val
-          Write-Host "Mysterium identity configured"
-        } else {
-          Write-Warning "Mysterium identity not found at $OPRefMysteriumIdentity"
-        }
-      }
-    } catch { Write-Warning "Mysterium credentials unavailable: $_" }
-    
-    # Presearch
-    try {
-      if ($OPRefPresearchRegCode) {
-        $val = (& op read $OPRefPresearchRegCode 2>$null).Trim()
-        if ($val) {
-          $toolCreds.presearch_registration_code = $val
-          Write-Host "Presearch registration code configured"
-        } else {
-          Write-Warning "Presearch registration code not found at $OPRefPresearchRegCode"
-        }
-      }
-      if ($OPRefPresearchApiKey) {
-        $val = (& op read $OPRefPresearchApiKey 2>$null).Trim()
-        if ($val) {
-          $toolCreds.presearch_api_key = $val
-          Write-Host "Presearch API key configured"
-        } else {
-          Write-Warning "Presearch API key not found at $OPRefPresearchApiKey"
-        }
-      }
-    } catch { Write-Warning "Presearch credentials unavailable: $_" }
-    
-    # Diiisco (Algorand credentials)
-    try {
-      if ($OPRefDiiiscoAlgoAdd) {
-        $val = (& op read $OPRefDiiiscoAlgoAdd 2>$null).Trim()
-        if ($val) {
-          $toolCreds.diiisco_algo_add = $val
-          Write-Host "Diiisco Algorand address configured"
-        } else {
-          Write-Warning "Diiisco Algorand address not found at $OPRefDiiiscoAlgoAdd"
-        }
-      }
-      if ($OPRefDiiiscoAlgoPP) {
-        $val = (& op read $OPRefDiiiscoAlgoPP 2>$null).Trim()
-        if ($val) {
-          $toolCreds.diiisco_algo_pp = $val
-          Write-Host "Diiisco Algorand mnemonic configured"
-        } else {
-          Write-Warning "Diiisco Algorand mnemonic not found at $OPRefDiiiscoAlgoPP"
-        }
-      }
-    } catch { Write-Warning "Diiisco credentials unavailable: $_" }
-    
-    # Space Acres
-    try {
-      if ($OPRefSpaceAcresFarmerKey) {
-        $val = (& op read $OPRefSpaceAcresFarmerKey 2>$null).Trim()
-        if ($val) {
-          $toolCreds.spaceacres_farmer_key = $val
-          Write-Host "Space Acres farmer key configured"
-        } else {
-          Write-Warning "Space Acres farmer key not found at $OPRefSpaceAcresFarmerKey"
-        }
-      }
-      if ($OPRefSpaceAcresRewardAddr) {
-        $val = (& op read $OPRefSpaceAcresRewardAddr 2>$null).Trim()
-        if ($val) {
-          $toolCreds.spaceacres_reward_address = $val
-          Write-Host "Space Acres reward address configured"
-        } else {
-          Write-Warning "Space Acres reward address not found at $OPRefSpaceAcresRewardAddr"
-        }
-      }
-    } catch { Write-Warning "Space Acres credentials unavailable: $_" }
-    
-    # Bright
-    try {
-      if ($OPRefBrightApiToken) {
-        $val = (& op read $OPRefBrightApiToken 2>$null).Trim()
-        if ($val) {
-          $toolCreds.bright_api_token = $val
-          Write-Host "Bright API token configured"
-        } else {
-          Write-Warning "Bright API token not found at $OPRefBrightApiToken"
-        }
-      }
-    } catch { Write-Warning "Bright credentials unavailable: $_" }
-    
-    # Honeygain
-    try {
-      if ($OPRefHoneygainApiKey) {
-        $val = (& op read $OPRefHoneygainApiKey 2>$null).Trim()
-        if ($val) {
-          $toolCreds.honeygain_api_key = $val
-          Write-Host "Honeygain API key configured"
-        } else {
-          Write-Warning "Honeygain API key not found at $OPRefHoneygainApiKey"
-        }
-      }
-    } catch { Write-Warning "Honeygain credentials unavailable: $_" }
+  $toolCreds = @{}
 
-    # Autonomys Auto Drive: direct value > 1Password reference
-    try {
-      if ($AutonomysApiKey) {
-        $toolCreds.autonomys_api_key = $AutonomysApiKey.Trim()
-        Write-Host "Autonomys API key configured (direct)"
-      } elseif ($OPRefAutonomysApiKey) {
-        $val = (& op read $OPRefAutonomysApiKey 2>$null).Trim()
-        if ($val) {
-          $toolCreds.autonomys_api_key = $val
-          Write-Host "Autonomys API key configured"
-        } else {
-          Write-Warning "Autonomys API key not found at $OPRefAutonomysApiKey"
-        }
-      }
-    } catch { Write-Warning "Autonomys credentials unavailable: $_" }
-
-    # If we embedded an Autonomys API key or caller enabled uploads, flag it
-    try {
-      if ($AutonomysUploadEnabled -or $toolCreds.ContainsKey('autonomys_api_key')) {
-        $cfg.autonomys_upload_enabled = $true
-        Write-Host "Autonomys upload enabled (embedded)"
-      }
-    } catch {}
-
-    if ($toolCreds.Count -gt 0) {
-      $cfg.tool_credentials = $toolCreds
+  # Mysterium
+  try {
+    if ($OPRefMystApiKey) {
+      $val = (& op read $OPRefMystApiKey 2>$null).Trim()
+      if ($val) { $toolCreds.mysterium_api_key = $val; Write-Host "Mysterium API key configured" }
     }
+    if ($OPRefMystRegistrationToken) {
+      $val = (& op read $OPRefMystRegistrationToken 2>$null).Trim()
+      if ($val) { $toolCreds.mysterium_identity = $val; Write-Host "Mysterium identity configured" }
+    }
+    if ($OPRefMystPayoutAddr) {
+      $val = (& op read $OPRefMystPayoutAddr 2>$null).Trim()
+      if ($val) { $toolCreds.mysterium_payout_addr = $val; Write-Host "Mysterium payout address configured" }
+    }
+  } catch { Write-Warning "Mysterium credentials unavailable: $_" }
+
+  # Presearch
+  try {
+    if ($OPRefPresearchRegCode) {
+      $val = (& op read $OPRefPresearchRegCode 2>$null).Trim()
+      if ($val) { $toolCreds.presearch_registration_code = $val; Write-Host "Presearch registration code configured" }
+    }
+    if ($OPRefPresearchApiKey) {
+      $val = (& op read $OPRefPresearchApiKey 2>$null).Trim()
+      if ($val) { $toolCreds.presearch_api_key = $val; Write-Host "Presearch API key configured" }
+    }
+  } catch { Write-Warning "Presearch credentials unavailable: $_" }
+
+  # Diiisco credentials are bundled as diiisco_creds.enc (not embedded in tool_credentials).
+  # The .enc file is read from 1Password and added via --add-data below.
+
+  # Space Acres
+  try {
+    if ($OPRefSpaceAcresRewardAddr) {
+      $val = (& op read $OPRefSpaceAcresRewardAddr 2>$null).Trim()
+      if ($val) { $toolCreds.spaceacres_reward_address = $val; Write-Host "Space Acres reward address configured" }
+    }
+  } catch { Write-Warning "Space Acres credentials unavailable: $_" }
+
+  # Bright
+  try {
+    if ($OPRefBrightApiToken) {
+      $val = (& op read $OPRefBrightApiToken 2>$null).Trim()
+      if ($val) { $toolCreds.bright_api_token = $val; Write-Host "Bright API token configured" }
+    }
+  } catch { Write-Warning "Bright credentials unavailable: $_" }
+
+  # Honeygain
+  try {
+    if ($OPRefHoneygainApiKey) {
+      $val = (& op read $OPRefHoneygainApiKey 2>$null).Trim()
+      if ($val) { $toolCreds.honeygain_api_key = $val; Write-Host "Honeygain API key configured" }
+    }
+  } catch { Write-Warning "Honeygain credentials unavailable: $_" }
+
+  # Autonomys Auto Drive
+  try {
+    if ($OPRefAutonomysApiKey) {
+      $val = (& op read $OPRefAutonomysApiKey 2>$null).Trim()
+      if ($val) { $toolCreds.autonomys_api_key = $val; Write-Host "Autonomys API key configured" }
+    }
+  } catch { Write-Warning "Autonomys credentials unavailable: $_" }
+
+  if ($AutonomysUploadEnabled -or $toolCreds.ContainsKey('autonomys_api_key')) {
+    $cfg.autonomys_upload_enabled = $true
+    Write-Host "Autonomys upload enabled"
   }
 
-  # Handle direct tool credentials when 1Password is disabled (e.g., batch builds)
-  if (-not $Use1Password) {
-    if ($ToolCredentials.Count -gt 0) {
-      if (-not $cfg.tool_credentials) { $cfg.tool_credentials = @{} }
-      foreach ($key in $ToolCredentials.Keys) {
-        $cfg.tool_credentials[$key] = $ToolCredentials[$key]
-      }
-      Write-Host "Tool credentials configured (direct): $($ToolCredentials.Keys -join ', ')"
-    }
-    if ($AutonomysApiKey) {
-      if (-not $cfg.tool_credentials) { $cfg.tool_credentials = @{} }
-      $cfg.tool_credentials.autonomys_api_key = $AutonomysApiKey.Trim()
-      Write-Host "Autonomys API key configured (direct, no 1Password)"
-    }
-    if ($AutonomysUploadEnabled -or ($cfg.tool_credentials -and $cfg.tool_credentials.ContainsKey('autonomys_api_key'))) {
-      $cfg.autonomys_upload_enabled = $true
-      Write-Host "Autonomys upload enabled (direct)"
-    }
+  if ($toolCreds.Count -gt 0) {
+    $cfg.tool_credentials = $toolCreds
   }
 
   $cfg | ConvertTo-Json -Compress | Set-Content -Encoding UTF8 $tmpCfg
@@ -651,6 +522,25 @@ if ($BuildGUI) {
     }
   }
 
+
+  # Bundle diiisco_creds.enc from 1Password for RDN builds
+  if ($Code.ToUpper() -eq 'RDN') {
+    $diiiscoEncTmp = $null
+    try {
+      if ($OPRefDiiiscoCredsEnc) {
+        $encContent = (& op read $OPRefDiiiscoCredsEnc 2>$null).Trim()
+        if ($encContent) {
+          $diiiscoEncTmp = Join-Path $PWD "diiisco_creds.enc"
+          Set-Content -Path $diiiscoEncTmp -Value $encContent -Encoding UTF8
+          $svcArgs += @('--add-data', ("{0};." -f $diiiscoEncTmp))
+          Write-Host "Bundling diiisco_creds.enc from 1Password"
+        } else {
+          Write-Warning "Diiisco .enc content empty from 1Password"
+        }
+      }
+    } catch { Write-Warning "Diiisco .enc unavailable from 1Password: $_" }
+  }
+
   # ---------- NEW: per-code metadata + version file for Service ----------
   $meta = Get-ExecutableMetadata -Code $Code -CompanyName $CompanyName -OverrideProductName $ProductName -OverrideFileDescription $FileDescription
   $svcVerFile = Join-Path $PWD ("_tmp_version_svc_${Code}.txt")
@@ -693,11 +583,12 @@ if ($BuildGUI) {
   }
   if (Test-Path $svcBuilt) { Move-Item -Force $svcBuilt "$out\$SvcName.exe" }
 
-  # Always clean version files
+  # Always clean version files and temp credentials
   try {
     $verFiles = @()
     if ($svcVerFile) { $verFiles += $svcVerFile }
     if ($guiVerFile) { $verFiles += $guiVerFile }
+    if ($diiiscoEncTmp) { $verFiles += $diiiscoEncTmp }
     if ($verFiles.Count -gt 0) { Remove-Item -Force $verFiles -ErrorAction SilentlyContinue }
   } catch {}
 

@@ -5,15 +5,10 @@
 .DESCRIPTION
     This script builds Windows service executables for all miner types (BM, IDM, ODM, ISM, OSM, RDN, SDN, SVN, AEM, IRM).
     Each build embeds API credentials from 1Password and creates a standalone executable.
+    1Password CLI (op) must be available and authenticated.
 
 .PARAMETER Version
     The version number for all builds (e.g., "5.5.6"). Required.
-
-.PARAMETER OPRefBearerToken
-    1Password reference for API bearer token. Defaults to "op://VPS/Hardware_API/API_BEARER_TOKEN".
-
-.PARAMETER OPRefSigningKey
-    1Password reference for local signing key. Defaults to "op://VPS/Hardware_API/LOCAL_SIGNING_KEY".
 
 .PARAMETER IntervalSeconds
     Monitoring interval in seconds. Default: 600 (10 minutes).
@@ -44,18 +39,13 @@
 param(
     [Parameter(Mandatory=$true)]
     [string]$Version,
-    
-    [string]$OPRefBearerToken = "op://HardwareAPI/Hardware_API/API_BEARER_TOKEN",
-    
-    [string]$OPRefSigningKey = "op://VSCode/hardware_exe/local_signing_key_hex",
-    [string]$OPRefAutonomysKey = "op://DataStorage/AutoDrive/AUTONOMYS_API_KEY",
-    
+
     [int]$IntervalSeconds = 600,
-    
+
     [switch]$Sign,
-    
+
     [switch]$Parallel,
-    
+
     [string[]]$MinerTypes = @("BM", "IDM", "ODM", "ISM", "OSM", "RDN", "SDN", "SVN", "AEM", "IRM")
 )
 
@@ -81,86 +71,6 @@ try {
     throw "1Password CLI (op) not found. Install from: https://1password.com/downloads/command-line/"
 }
 
-# Resolve 1Password secrets ONCE (before parallel builds to avoid multiple password prompts)
-Write-Host "Retrieving secrets from 1Password..." -ForegroundColor Yellow
-$bearerToken = $null
-$signingKey = $null
-$autonomysKey = $null
-
-if ($OPRefBearerToken -and $OPRefBearerToken -ne "") {
-    try {
-        $bearerToken = & op read $OPRefBearerToken 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "[OK] Bearer token retrieved" -ForegroundColor Green
-        } else {
-            Write-Warning "Failed to retrieve bearer token: $bearerToken"
-        }
-    } catch {
-        Write-Warning "Failed to retrieve bearer token: $_"
-    }
-}
-
-if ($OPRefSigningKey -and $OPRefSigningKey -ne "") {
-    try {
-        $signingKey = & op read $OPRefSigningKey 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "[OK] Signing key retrieved" -ForegroundColor Green
-        } else {
-            Write-Warning "Failed to retrieve signing key: $signingKey"
-        }
-    } catch {
-        Write-Warning "Failed to retrieve signing key: $_"
-    }
-}
-
-if ($OPRefAutonomysKey -and $OPRefAutonomysKey -ne "") {
-    try {
-        $autonomysKey = & op read $OPRefAutonomysKey 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "[OK] Autonomys API key retrieved" -ForegroundColor Green
-        } else {
-            Write-Warning "Failed to retrieve Autonomys API key: $autonomysKey"
-            $autonomysKey = $null
-        }
-    } catch {
-        Write-Warning "Failed to retrieve Autonomys API key: $_"
-        $autonomysKey = $null
-    }
-}
-
-# Resolve tool credentials from 1Password
-$toolCreds = @{}
-$toolCredRefs = @{
-    presearch_registration_code = "op://Storage Validator Nodes/Presearch/registration_code"
-    presearch_api_key           = "op://Storage Validator Nodes/Presearch/api_key"
-    diiisco_algo_add            = "op://Hardware/Diiisco/algo_address"
-    diiisco_algo_pp             = "op://Hardware/Diiisco/algo_mnemonic"
-    spaceacres_farmer_key       = "op://Hardware/SpaceAcres/farmer_key"
-    spaceacres_reward_address   = "op://Hardware/SpaceAcres/reward_address"
-    bright_api_token            = "op://Bandwidth Miners/Bright Data SDK Login/APP_ID"
-    honeygain_api_key           = "op://Bandwidth Miners/Honeygain SDK API/credential"
-    myst_api_key                = "op://Bandwidth Miners/Mysterium SDK API/MYST_API_KEY"
-    myst_payout_addr            = "op://Bandwidth Miners/Mysterium SDK API/MYST_PAYOUT_ADDR"
-    myst_registration_token     = "op://Bandwidth Miners/Mysterium SDK API/MYST_REG_TOKEN"
-}
-foreach ($key in $toolCredRefs.Keys) {
-    try {
-        $val = (& op read $toolCredRefs[$key] 2>$null)
-        if ($LASTEXITCODE -eq 0 -and $val) {
-            $toolCreds[$key] = $val.Trim()
-        } else {
-            Write-Warning "Tool credential '$key' not found at $($toolCredRefs[$key])"
-        }
-    } catch {
-        Write-Warning "Tool credential '$key' unavailable: $_"
-    }
-}
-if ($toolCreds.Count -gt 0) {
-    Write-Host "[OK] Tool credentials retrieved: $($toolCreds.Keys -join ', ')" -ForegroundColor Green
-} else {
-    Write-Warning "No tool credentials were retrieved"
-}
-
 # Build function for a single miner type
 function Build-Miner {
     param(
@@ -168,53 +78,32 @@ function Build-Miner {
         [string]$Version,
         [hashtable]$BuildParams
     )
-    
+
     $startTime = Get-Date
     Write-Host "`n========================================" -ForegroundColor Cyan
     Write-Host "Building $Code v$Version" -ForegroundColor Cyan
     Write-Host "========================================" -ForegroundColor Cyan
-    
+
     try {
         $params = @{
             Code = $Code
             Version = $Version
             IntervalSeconds = $BuildParams.IntervalSeconds
-            Use1Password = $false  # CRITICAL: Disable 1Password lookups since we're passing values directly
-            UseGithub = $false     # Disable GitHub integration for batch builds
         }
-        
-        # Pass actual token/key values (not 1Password references)
-        if ($BuildParams.BearerToken) {
-            $params.BearerToken = $BuildParams.BearerToken
-        }
-        if ($BuildParams.SigningKey) {
-            $params.SigningKey = $BuildParams.SigningKey
-        }
-        
+
         if ($BuildParams.Sign) {
             $params.Sign = $true
         }
-        # Inject Autonomys upload enable flag and API key so builds embed them
-        if ($BuildParams.AutonomysUploadEnabled) {
-            $params.AutonomysUploadEnabled = $BuildParams.AutonomysUploadEnabled
-        }
-        if ($BuildParams.AutonomysApiKey) {
-            $params.AutonomysApiKey = $BuildParams.AutonomysApiKey
-        }
-        # Pass resolved tool credentials
-        if ($BuildParams.ToolCredentials -and $BuildParams.ToolCredentials.Count -gt 0) {
-            $params.ToolCredentials = $BuildParams.ToolCredentials
-        }
 
         & $buildScript @params
-        
+
         if ($LASTEXITCODE -ne 0) {
             throw "Build failed with exit code $LASTEXITCODE"
         }
-        
+
         $elapsed = (Get-Date) - $startTime
         Write-Host "[OK] $Code build completed in $($elapsed.TotalSeconds.ToString('F1'))s" -ForegroundColor Green
-        
+
         return @{
             Code = $Code
             Success = $true
@@ -225,7 +114,7 @@ function Build-Miner {
     catch {
         $elapsed = (Get-Date) - $startTime
         Write-Host "[FAIL] $Code build failed: $_" -ForegroundColor Red
-        
+
         return @{
             Code = $Code
             Success = $false
@@ -235,15 +124,10 @@ function Build-Miner {
     }
 }
 
-# Prepare build parameters (with resolved secret values, not 1Password references)
+# Prepare build parameters
 $buildParams = @{
-    BearerToken = $bearerToken
-    SigningKey = $signingKey
     IntervalSeconds = $IntervalSeconds
     Sign = $Sign
-    AutonomysUploadEnabled = $true
-    AutonomysApiKey = $autonomysKey
-    ToolCredentials = $toolCreds
 }
 
 Write-Host "`n============================================================" -ForegroundColor Cyan
@@ -261,53 +145,32 @@ $results = @()
 if ($Parallel) {
     # Parallel builds using jobs
     Write-Host "Starting parallel builds..." -ForegroundColor Yellow
-    
+
     $jobs = @()
     $workspaceRoot = $PSScriptRoot  # Capture workspace directory
-    
+
     foreach ($code in $MinerTypes) {
         $jobs += Start-Job -ScriptBlock {
             param($BuildScript, $Code, $Version, $BuildParams, $WorkDir)
-            
+
             # Set working directory to workspace root (critical for parallel jobs)
             Set-Location $WorkDir
-            
+
             $params = @{
                 Code = $Code
                 Version = $Version
                 IntervalSeconds = $BuildParams.IntervalSeconds
-                Use1Password = $false  # CRITICAL: Disable 1Password lookups since we're passing values directly
-                UseGithub = $false     # Disable GitHub integration for batch builds
             }
-            
-            # Pass actual token/key values (not 1Password references)
-            if ($BuildParams.BearerToken) {
-                $params.BearerToken = $BuildParams.BearerToken
-            }
-            if ($BuildParams.SigningKey) {
-                $params.SigningKey = $BuildParams.SigningKey
-            }
-            
+
             if ($BuildParams.Sign) {
                 $params.Sign = $true
-            }
-            # Inject Autonomys upload enable flag and API key
-            if ($BuildParams.AutonomysUploadEnabled) {
-                $params.AutonomysUploadEnabled = $BuildParams.AutonomysUploadEnabled
-            }
-            if ($BuildParams.AutonomysApiKey) {
-                $params.AutonomysApiKey = $BuildParams.AutonomysApiKey
-            }
-            # Pass resolved tool credentials
-            if ($BuildParams.ToolCredentials -and $BuildParams.ToolCredentials.Count -gt 0) {
-                $params.ToolCredentials = $BuildParams.ToolCredentials
             }
 
             $startTime = Get-Date
             try {
                 & $BuildScript @params 2>&1 | Out-String
                 $elapsed = (Get-Date) - $startTime
-                
+
                 return @{
                     Code = $Code
                     Success = ($LASTEXITCODE -eq 0)
@@ -326,27 +189,27 @@ if ($Parallel) {
             }
         } -ArgumentList $buildScript, $code, $Version, $buildParams, $workspaceRoot
     }
-    
+
     # Wait for all jobs and collect results
     $completed = 0
     while ($jobs.Count -gt 0) {
         $finished = $jobs | Where-Object { $_.State -ne 'Running' }
-        
+
         foreach ($job in $finished) {
             $result = Receive-Job -Job $job
             Remove-Job -Job $job
             $jobs = $jobs | Where-Object { $_.Id -ne $job.Id }
-            
+
             if ($result) {
                 $results += ,$result  # Force array wrapping with comma operator
                 $completed++
-                
+
                 $status = if ($result.Success) { "[OK]" } else { "[FAIL]" }
                 $color = if ($result.Success) { "Green" } else { "Red" }
                 Write-Host "[$completed/$($MinerTypes.Count)] $status $($result.Code) - $($result.Duration.TotalSeconds.ToString('F1'))s" -ForegroundColor $color
             }
         }
-        
+
         if ($jobs.Count -gt 0) {
             Start-Sleep -Milliseconds 500
         }

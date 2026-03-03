@@ -1,6 +1,6 @@
 ###############################################################################
 # Diiisco Node - Production Docker Compose
-#
+# 
 # Deploys a real Diiisco node (https://github.com/Diiisco-Inc/diiisco-node)
 # with Ollama as the LLM backend. Designed for automated deployment to
 # customer machines (Windows & Linux).
@@ -11,7 +11,7 @@
 
 services:
 
-  # --- Ollama: Local LLM Inference Engine ---------------------------------
+  # ─── Ollama: Local LLM Inference Engine ───────────────────────────────
   ollama:
     image: ollama/ollama:latest
     container_name: diiisco-ollama
@@ -21,7 +21,7 @@ services:
     volumes:
       - ollama_models:/root/.ollama
     ports:
-      - "127.0.0.1:11434:11434"
+      - "11434:11434"
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 10s
@@ -29,7 +29,7 @@ services:
       retries: 10
       start_period: 15s
 
-  # --- Model Bootstrapper: Pulls phi into Ollama on first run ------------
+  # ─── Model Bootstrapper: Pulls phi2 into Ollama on first run ─────────
   ollama-init:
     image: ollama/ollama:latest
     container_name: diiisco-ollama-init
@@ -39,26 +39,23 @@ services:
     restart: "no"
     entrypoint: >
       sh -c "
-        echo 'Checking if phi model is available...' &&
-        if ollama show phi --modelfile 2>/dev/null | grep -q 'FROM'; then
-          echo 'Model phi already exists. Skipping pull.';
+        echo 'Checking if phi2 model is available...' &&
+        if ollama show phi2 --modelfile 2>/dev/null | grep -q 'FROM'; then
+          echo 'Model phi2 already exists. Skipping pull.';
         else
-          echo 'Pulling phi model...' &&
-          ollama pull phi &&
-          echo 'Model phi ready.';
+          echo 'Pulling phi2 model...' &&
+          ollama pull phi2 &&
+          echo 'Model phi2 ready.';
         fi
       "
     environment:
       OLLAMA_HOST: "http://ollama:11434"
 
-  # --- Diiisco Node: The real deal ----------------------------------------
+  # ─── Diiisco Node: The real deal ─────────────────────────────────────
   diiisco:
     build:
       context: ./diiisco-node
       dockerfile: Dockerfile
-      args:
-        ALGO_ADDRESS: ${ALGO_ADDRESS}
-        ALGO_MNEMONIC: ${ALGO_MNEMONIC}
     image: diiisco-node:latest
     container_name: diiisco-node
     restart: unless-stopped
@@ -68,11 +65,11 @@ services:
       ollama-init:
         condition: service_completed_successfully
     ports:
-      - "127.0.0.1:8181:8181"
+      - "8181:8181"
     volumes:
       - diiisco_data:/app/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8181/v1/models || exit 1"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8181/v1/models", "||", "exit", "1"]
       interval: 30s
       timeout: 10s
       retries: 5

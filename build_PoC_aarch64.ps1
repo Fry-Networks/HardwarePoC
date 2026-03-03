@@ -12,8 +12,7 @@ param(
     [Parameter(Mandatory)][string]$Code,
     [Parameter(Mandatory)][string]$Version,
     [int]$VersionCheckSec = 600,
-    [string]$DockerImage = "python:3.11-slim",
-    [switch]$Skip1Password
+    [string]$DockerImage = "python:3.11-slim"
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,31 +21,19 @@ $Code = $Code.ToUpper()
 Write-Host "=== Building $Code v$Version for linux/aarch64 ===" -ForegroundColor Cyan
 
 # --- Resolve 1Password credentials on the host ---
-$bearer = ""
-$signingKey = ""
-$githubToken = ""
-$autonomysKey = ""
-$updateRepo = ""
-
-if (-not $Skip1Password) {
-    if (-not (Get-Command "op" -ErrorAction SilentlyContinue)) {
-        Write-Error "1Password CLI 'op' not found on PATH. Install it or use -Skip1Password."
-        exit 1
-    }
-
-    Write-Host "Resolving credentials from 1Password..."
-    $bearer       = (op read "op://HardwareAPI/Hardware_API/API_BEARER_TOKEN" 2>$null).Trim()
-    $signingKey   = (op read "op://VSCode/hardware_exe/local_signing_key_hex" 2>$null).Trim()
-    $githubToken  = (op read "op://VSCode/hardware_exe/Github_token" 2>$null).Trim()
-    $autonomysKey = (op read "op://DataStorage/AutoDrive/AUTONOMYS_API_KEY" 2>$null).Trim()
-    $updateRepo   = (op read "op://VSCode/hardware_exe/Github_repo_test" 2>$null).Trim()
-
-    if ($bearer)       { Write-Host "  Bearer token: OK" }
-    if ($signingKey)   { Write-Host "  Signing key: OK" }
-    if ($githubToken)  { Write-Host "  GitHub token: OK" }
-    if ($autonomysKey) { Write-Host "  Autonomys API key: OK" }
-    if ($updateRepo)   { Write-Host "  Update repo: OK" }
+if (-not (Get-Command "op" -ErrorAction SilentlyContinue)) {
+    Write-Error "1Password CLI 'op' not found on PATH."
+    exit 1
 }
+
+Write-Host "Resolving credentials from 1Password..."
+$bearer       = (op read "op://HardwareAPI/Hardware_API/API_BEARER_TOKEN" 2>$null).Trim()
+$signingKey   = (op read "op://VSCode/hardware_exe/local_signing_key_hex" 2>$null).Trim()
+$autonomysKey = (op read "op://DataStorage/AutoDrive/AUTONOMYS_API_KEY" 2>$null).Trim()
+
+if ($bearer)       { Write-Host "  Bearer token: OK" }
+if ($signingKey)   { Write-Host "  Signing key: OK" }
+if ($autonomysKey) { Write-Host "  Autonomys API key: OK" }
 
 # --- Verify Docker ---
 if (-not (Get-Command "docker" -ErrorAction SilentlyContinue)) {
@@ -131,9 +118,7 @@ python3 - <<PYEOF > _tmp_config.json
 import json
 cfg = {
     "external_api": {"base_url": "$api_base_url", "timeout": 10.0},
-    "interval_seconds": 600,
-    "use_github": True,
-    "software_uptodate": True
+    "interval_seconds": 600
 }
 bearer = "$BEARER_TOKEN"
 if bearer:
@@ -141,12 +126,6 @@ if bearer:
 sign = "$SIGNING_KEY"
 if sign:
     cfg["local_signing_key_hex"] = sign
-repo = "$UPDATE_REPO"
-if repo:
-    cfg["update_repo"] = repo
-gh = "$GITHUB_TOKEN"
-if gh:
-    cfg["github_token"] = gh
 ak = "$AUTONOMYS_API_KEY"
 if ak:
     cfg.setdefault("tool_credentials", {})["autonomys_api_key"] = ak
@@ -187,6 +166,14 @@ with open(sp, 'w') as f: f.writelines(lines)
 # PyInstaller build
 svc_dist_dir="dist/svc/$CODE"
 mkdir -p "$svc_dist_dir"
+
+# Build extra --add-data flags based on miner code
+extra_data=()
+if [ "$CODE" = "RDN" ] && [ -d "docker/diiisco" ]; then
+  extra_data+=(--add-data "docker/diiisco:docker/diiisco")
+  echo "Bundling DIIISCO Docker Compose stack"
+fi
+
 python3 -m PyInstaller \
   --clean --onefile --noconsole --noconfirm \
   --name "$SVC_NAME" \
@@ -197,6 +184,7 @@ python3 -m PyInstaller \
   --exclude-module portaudio --exclude-module pyside6 \
   --exclude-module numba \
   --exclude-module pyarrow.tests \
+  "${extra_data[@]}" \
   miner_online_simple.py
 
 # Move to release
@@ -228,9 +216,7 @@ docker run --rm --platform linux/arm64 `
     -e "SVC_NAME=$svcName" `
     -e "BEARER_TOKEN=$bearer" `
     -e "SIGNING_KEY=$signingKey" `
-    -e "GITHUB_TOKEN=$githubToken" `
     -e "AUTONOMYS_API_KEY=$autonomysKey" `
-    -e "UPDATE_REPO=$updateRepo" `
     $DockerImage bash /build/.docker_build.sh
 
 # Clean up temp build script
