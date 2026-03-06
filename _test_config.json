@@ -1,5 +1,0 @@
-﻿{
-    "api_token":  "op://VPS/Hardware_API/API_BEARER_TOKEN",
-    "local_signing_key_hex":  "op://VPS/Hardware_API/LOCAL_SIGNING_KEY",
-    "api_base_url":  "op://VPS/Hardware_API/API_BASE_URL"
-}

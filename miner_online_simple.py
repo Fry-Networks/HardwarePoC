@@ -878,18 +878,23 @@ DOCKER_TOOLS: frozenset = frozenset({"presearch", "diiisco"})
 _docker_available: Optional[bool] = None
 _docker_available_ts: float = 0.0
 _DOCKER_CACHE_TTL: float = 10.0  # seconds
+_docker_fail_streak: int = 0
+_DOCKER_FAIL_THRESHOLD: int = 3  # consecutive failures before declaring unavailable
 
 
 def _is_docker_available() -> bool:
     """Return True if Docker CLI is on PATH and the daemon is responding.
 
     Used to gate Presearch and other Docker-based tools.
-    Result is cached for 60 seconds to avoid repeated subprocess calls.
+    Result is cached for ``_DOCKER_CACHE_TTL`` seconds.  Transient failures
+    are debounced: Docker must fail ``_DOCKER_FAIL_THRESHOLD`` consecutive
+    checks before being declared unavailable (a single success restores it).
     """
-    global _docker_available, _docker_available_ts
+    global _docker_available, _docker_available_ts, _docker_fail_streak
     now = time.time()
     if _docker_available is not None and (now - _docker_available_ts) < _DOCKER_CACHE_TTL:
         return _docker_available
+    ok = False
     try:
         result = subprocess.run(
             ["docker", "info"],
@@ -898,11 +903,21 @@ def _is_docker_available() -> bool:
             creationflags=(subprocess.CREATE_NO_WINDOW
                            if hasattr(subprocess, "CREATE_NO_WINDOW") else 0),
         )
-        _docker_available = result.returncode == 0
+        ok = result.returncode == 0
     except FileNotFoundError:
-        _docker_available = False
+        pass
     except Exception:
-        _docker_available = False
+        pass
+    if ok:
+        _docker_fail_streak = 0
+        _docker_available = True
+    else:
+        _docker_fail_streak += 1
+        if _docker_fail_streak >= _DOCKER_FAIL_THRESHOLD:
+            _docker_available = False
+        # else: keep previous state (None → False on first run)
+        elif _docker_available is None:
+            _docker_available = False
     _docker_available_ts = now
     return _docker_available
 
@@ -5851,14 +5866,6 @@ def _process_ops_queue_request(request_path: str) -> None:
     request_id = None
     op: Optional[str] = None
     
-    # DEBUG: Write marker file to confirm function is called
-    debug_marker = os.path.join(data_dir(), "ops_processed", "DEBUG_handler_called.txt")
-    try:
-        with open(debug_marker, "a", encoding="utf-8") as f:
-            f.write(f"{dt.datetime.now(UTC).isoformat()} handler called with path={request_path}\n")
-    except Exception:
-        pass
-    
     try:
         # Read request (try UTF-8 first, fall back to utf-8-sig if BOM present)
         try:
@@ -5881,13 +5888,6 @@ def _process_ops_queue_request(request_path: str) -> None:
         
         if not request_id or not op:
             raise ValueError("Missing required fields: id, op")
-        
-        # DEBUG: Log that we received a valid request
-        log_step("ops_daemon_request_received", {
-            "request_id": request_id,
-            "op": op,
-            "request_path": request_path
-        })
         
         # Process operation
         success = False
@@ -6705,33 +6705,6 @@ def _write_spaceacres_sync_status(poll_result: Dict[str, Any]) -> None:
         atomic_write_json(sync_path, status_payload)
     except Exception:
         log.debug("Failed to write spaceacres sync status", exc_info=True)
-
-
-def _collect_bright_stats(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Collect Bright Data statistics."""
-    stats = {"status": "unknown"}
-    
-    try:
-        # TODO: Implement Bright Data stats collection
-        stats["status"] = "not_implemented"
-    except Exception as e:
-        stats["error"] = str(e)
-    
-    return stats
-
-
-def _collect_honeygain_stats(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Collect Honeygain statistics."""
-    stats = {"status": "unknown"}
-    
-    try:
-        # TODO: Implement Honeygain stats collection
-        stats["status"] = "not_implemented"
-    except Exception as e:
-        stats["error"] = str(e)
-    
-    return stats
-
 
 
 
@@ -7718,40 +7691,57 @@ def main() -> None:
                             or (slot_ts - last_presearch_ip_update).total_seconds() >= 600
                         )
                         if due_presearch:
-                            enabled_tools = _get_enabled_tools()
-                            if "presearch" in enabled_tools:
-                                api_key = _get_presearch_api_key()
-                                if api_key:
-                                    from measurements.tools import fetch_presearch_nodes, get_public_ip
-                                    nodes = fetch_presearch_nodes(api_key)
-                                    if nodes:
-                                        local_ip = get_public_ip()
-                                        ip_value = local_ip
+                            api_key = _get_presearch_api_key()
+                            if api_key:
+                                from measurements.tools import fetch_presearch_nodes, get_public_ip
+                                nodes = fetch_presearch_nodes(api_key)
+                                if nodes:
+                                    local_ip = get_public_ip()
+                                    if not local_ip:
+                                        log.info("Presearch IP update: get_public_ip() returned empty")
+                                    else:
                                         nodes_for_ip = [n for n in nodes if n.get("remote_addr") == local_ip]
-                                        if ip_value and nodes_for_ip:
-                                            from external_api import get_global_api_client
-                                            payload_nodes = []
-                                            for node in nodes_for_ip:
-                                                payload_nodes.append(
-                                                    {
-                                                        "miner_key": miner_key,
-                                                        "node_key": node.get("node_key", ""),
-                                                        "connected": bool(node.get("connected")),
-                                                        "blocked": bool(node.get("blocked")),
-                                                        "description": node.get("description", ""),
-                                                    }
-                                                )
-                                            payload = {
-                                                "ip": ip_value,
-                                                "timestamp": now_utc().isoformat(),
-                                                "nodes": payload_nodes,
-                                            }
-                                            client_api = get_global_api_client()
-                                            if hasattr(client_api, "upsert_presearch_ip"):
-                                                client_api.upsert_presearch_ip(ip_value, payload)
-                                    last_presearch_ip_update = slot_ts
+                                        if not nodes_for_ip:
+                                            all_addrs = [n.get("remote_addr", "") for n in nodes]
+                                            log.info(
+                                                "Presearch IP update: no nodes match local IP %s "
+                                                "(node remote_addrs: %s); sending all %d node(s)",
+                                                local_ip, all_addrs, len(nodes),
+                                            )
+                                            nodes_for_ip = nodes
+                                        from external_api import get_global_api_client
+                                        payload_nodes = []
+                                        for node in nodes_for_ip:
+                                            payload_nodes.append(
+                                                {
+                                                    "miner_key": miner_key,
+                                                    "node_key": node.get("node_key", ""),
+                                                    "connected": bool(node.get("connected")),
+                                                    "blocked": bool(node.get("blocked")),
+                                                    "description": node.get("description", ""),
+                                                }
+                                            )
+                                        payload = {
+                                            "ip": local_ip,
+                                            "timestamp": now_utc().isoformat(),
+                                            "nodes": payload_nodes,
+                                        }
+                                        client_api = get_global_api_client()
+                                        if hasattr(client_api, "upsert_presearch_ip"):
+                                            client_api.upsert_presearch_ip(local_ip, payload)
+                                            last_presearch_ip_update = slot_ts
+                                            log.info(
+                                                "Presearch IP update: uploaded %d node(s) for %s",
+                                                len(payload_nodes), local_ip,
+                                            )
+                                        else:
+                                            log.warning("Presearch IP update: API client missing upsert_presearch_ip method")
+                                else:
+                                    log.info("Presearch IP update: fetch_presearch_nodes returned empty")
+                            else:
+                                log.debug("Presearch IP update skipped: no API key configured")
                     except Exception as e:
-                        log.debug("Presearch IP status update failed: %s", e)
+                        log.warning("Presearch IP status update failed: %s", e)
 
                 # Refresh required versions once per UTC hour
                 try:

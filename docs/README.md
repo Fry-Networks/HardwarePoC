@@ -382,22 +382,29 @@ FRY_PoC_ISM_v5.5.4.exe --lease-dump ISM-ABC123DEFG456HIJK789LMNOP012QRST
 
 ```
 HardwarePoC/
-├── miner_online_simple.py          # Main service code
-├── config_profile.py               # Miner code and version constants
-├── external_api.py                 # HTTP API client
+├── miner_online_simple.py          # Main service (measurement loop, IPC, tool management)
+├── config_profile.py               # Miner code/version constants (auto-generated at build)
+├── external_api.py                 # Backend HTTP client
 ├── mongo_api_proxy.py              # MongoDB proxy client
 ├── cache_integrity.py              # Local cache signing/verification
-├── build_windows.ps1               # Windows build script
-├── build_with_embedded_config.py   # Alternative Python build script
-├── create_miner_config.py          # Miner config encryption utility
+├── poi_monitor_aem.py              # Olostep Browser metrics for AEM
+├── measurements/                   # Measurement pipeline
+│   ├── collector.py                #   CSV collection + backend upload
+│   ├── csv_writer.py               #   CSV schemas per miner type
+│   ├── tools.py                    #   Tool polling (presearch, diiisco, space acres)
+│   ├── autonomys_*.py              #   Autonomys data pipeline
+│   └── secrets_manager.py          #   1Password credential retrieval
+├── docker/Diiisco_V2/              # Diiisco Docker build (Ollama + node)
 ├── tools/
-│   ├── make_encrypted_config.py    # API credential encryption
-│   ├── make_profile.py             # Profile generation
-│   └── GeoLite2-Country.mmdb       # GeoIP database (optional)
+│   └── make_encrypted_config.py    # API credential encryption
+├── build_PoC_windows.ps1           # Windows build script
+├── build_PoC_linux.sh              # Linux build script
+├── build_with_embedded_config.py   # Python build helper
+├── create_miner_config.py          # Miner config encryption utility
+├── create_install_config.py        # Install ID encryption utility
 ├── images/                         # Icons for different miner types
-└── docs/
-    ├── BUILD_GUIDE.md              # Detailed build instructions
-    └── ENCRYPTED_MINER_CONFIG_SOLUTION.md  # Security architecture
+├── tests/                          # Unit and integration tests
+└── docs/                           # Architecture and integration guides
 ```
 
 ### Key Dependencies
@@ -553,6 +560,11 @@ Proprietary - Fry Networks LLC
 ## Support
 
 For build issues or installer integration questions, refer to:
-- `docs/BUILD_GUIDE.md` - Comprehensive build instructions
-- `docs/ENCRYPTED_MINER_CONFIG_SOLUTION.md` - Security architecture details
-- `docs/ISM_DropWireless_Runbook.md` - DropWireless ISM deployment guide (Linux aarch64)
+- `docs/ENCRYPTED_MEASUREMENTS.md` - Encryption architecture
+- `docs/GUI_DEVELOPER_GUIDE.md` - GUI integration reference
+- `docs/IPC_API_QUICK_REFERENCE.md` - IPC operations
+- `docs/ISM_DropWireless_Runbook.md` - DropWireless ISM deployment (Linux aarch64)
+- `docs/DIIISCO_INTEGRATION.md` - Diiisco Docker setup (RDN)
+- `docs/GUI_SPACE_ACRES.md` - Space Acres integration (SDN)
+- `docs/AUTONOMYS_INTEGRATION.md` - Autonomys data pipeline
+- `docs/1PASSWORD_SETUP.md` - Credential management

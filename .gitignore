@@ -208,5 +208,11 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-autonomys/node_modules/
+# Project-specific
+_test_config.json
+_tmp_test_config.json
+drop/
+drop.tar.xz
+*.mmdb
+node_modules/
 .docker_build.sh

@@ -2,10 +2,8 @@
 
 Collects runtime stats from enabled tools:
 - Mysterium: TequilAPI (/healthcheck, /traffic, /services)
-- Bright: pythonnet SDK with BrightData.Api
-- Honeygain: Native SDK (ctypes) with identify/traffic
-- Presearch: Docker container + API
-- Diiisco: Docker container + API  
+- Presearch: Docker container + cloud API
+- Diiisco: Docker container + API
 - Space Acres: RPC endpoint polling
 
 Tool stats are written to measurements/latest.json alongside hardware measurements.
@@ -126,66 +124,6 @@ def poll_mysterium() -> Dict[str, Any]:
         result["sessions"] = sessions
         # Rough estimate: $0.10 per session (adjust based on actual Mysterium rates)
         result["earnings_usd"] = round(sessions * 0.10, 2)
-    
-    return result
-
-
-# ============================================================================
-# BRIGHT
-# ============================================================================
-
-def poll_bright() -> Dict[str, Any]:
-    """Poll Bright SDK status via pythonnet.
-    
-    Note: Requires pythonnet and BrightData.Api managed DLL.
-    Returns dict with keys:
-    - enabled: bool
-    - running: bool
-    - supported: bool | None
-    - consent: bool | None
-    - error: str | None
-    """
-    result = {
-        "enabled": False,
-        "running": False,
-        "supported": None,
-        "consent": None,
-        "error": "Bright SDK polling not implemented in service",
-    }
-    
-    # TODO: Import pythonnet and call BrightData.Api SDK
-    # For now, return stub indicating GUI-only support
-    
-    return result
-
-
-# ============================================================================
-# HONEYGAIN
-# ============================================================================
-
-def poll_honeygain() -> Dict[str, Any]:
-    """Poll Honeygain SDK status via ctypes.
-    
-    Note: Requires native SDK library (hgsdk.dll/so).
-    Returns dict with keys:
-    - enabled: bool
-    - running: bool
-    - device_id: str | None
-    - traffic_total_bytes: int | None
-    - traffic_24h_bytes: int | None
-    - error: str | None
-    """
-    result = {
-        "enabled": False,
-        "running": False,
-        "device_id": None,
-        "traffic_total_bytes": None,
-        "traffic_24h_bytes": None,
-        "error": "Honeygain SDK polling not implemented in service",
-    }
-    
-    # TODO: Load hgsdk via ctypes and call identify/traffic functions
-    # For now, return stub indicating GUI-only support
     
     return result
 
@@ -768,16 +706,6 @@ def collect_all_tool_stats(presearch_api_key: str = "", miner_code: str = "") ->
     mysterium_stats = poll_mysterium()
     if mysterium_stats.get("enabled"):
         stats["mysterium"] = mysterium_stats
-
-    # Bright: Skip for now (requires pythonnet + managed DLL)
-    # bright_stats = poll_bright()
-    # if bright_stats.get("enabled"):
-    #     stats["bright"] = bright_stats
-
-    # Honeygain: Skip for now (requires native SDK)
-    # honeygain_stats = poll_honeygain()
-    # if honeygain_stats.get("enabled"):
-    #     stats["honeygain"] = honeygain_stats
 
     # Docker-based tools: only poll for miner types that use them (RDN, SVN)
     if miner_code in ("RDN", "SVN", "SDN"):
