@@ -10,7 +10,7 @@ import json, os, sys, time, tempfile, logging, re, hashlib, argparse, uuid, plat
 # second copy.  Alias the module so both names share the same object.
 if __name__ == "__main__":
     sys.modules["miner_online_simple"] = sys.modules[__name__]
-from poi_monitor_aem import monitor_poi_for_aem
+from poi_monitor_aem import monitor_poi_for_aem, _process_running
 from typing import Dict, Any, Optional, Tuple, List, Callable, Iterable, cast
 
 # Use timezone-aware UTC. `datetime.UTC` exists on Python 3.11+; fall back otherwise.
@@ -2423,12 +2423,33 @@ def write_status(
         xmrig_active=xmrig_active,
     )
 
+    # --- Proof of Activity (poa) per miner type ---
+    poa_status: bool = True  # default: pure-sensor miners, sensor collection IS the activity
+    if miner_type_val == "AEM":
+        try:
+            poa_status = _process_running("Olostep")
+        except Exception:
+            poa_status = False
+    elif miner_type_val == "BM":
+        try:
+            poa_status = _process_running("myst")
+        except Exception:
+            poa_status = False
+    elif miner_type_val in ("RDN", "SVN"):
+        poa_status = bool(presearch_active or diiisco_active)
+    elif miner_type_val == "SDN":
+        poa_status = bool(spaceacres_active)
+    # else: ISM, OSM, IDM, ODM, IRM — sensor miners, poa stays True
+
     # --- unified slot snapshot for the graph ---
     slot_obj: dict[str, Any] = {
         "gates": {
             "data": bool(pod_slot_ok),
             "online": (status == "online"),
             "mac_match": mac_match,
+            "pol": bool(pol_status),
+            "poi": mac_match,
+            "poa": poa_status,
         },
         "tools_active": selected_tools,
         "tools_count": len(selected_tools),
