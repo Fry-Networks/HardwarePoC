@@ -440,6 +440,7 @@ def _get_tool_credentials() -> Dict[str, Any]:
     - spaceacres_reward_address
     - bright_api_token
     - honeygain_api_key
+    - xmrig_wallet_address, xmrig_pool_url, xmrig_pool_password, xmrig_api_port, xmrig_worker_name
 
     Note: diiisco credentials (algo_add, algo_pp) are now in a separate
     diiisco_creds.enc file; see _read_diiisco_creds().
@@ -608,7 +609,7 @@ def _get_enabled_tools() -> List[str]:
             'BM': ['mysterium', 'bright', 'honeygain'],     # Bandwidth Miner
             'RDN': ['presearch', 'diiisco'],                 # Reward Decentralization Node
             'SDN': ['spaceacres'],                           # Storage/Data Node
-            'SVN': [],                                        # Storage Verification Node (under construction)
+            'SVN': ['xmrig'],                                    # Storage Validator Node — XMRig Monero mining
             'AEM': [],                                       # Agent/Edge Miner (if any)
         }
         
@@ -623,6 +624,7 @@ def _get_enabled_tools() -> List[str]:
             'spaceacres': ['spaceacres_enabled', 'enable_spaceacres'],
             'bright': ['bright_enabled', 'enable_bright'],
             'honeygain': ['honeygain_enabled', 'enable_honeygain'],
+            'xmrig': ['xmrig_enabled', 'enable_xmrig'],
         }
         
         for poc_type, config_keys in poc_types.items():
@@ -1661,6 +1663,7 @@ def _compute_rewards_multiplier(
     presearch_active: bool = False,
     diiisco_active: bool = False,
     spaceacres_active: bool = False,
+    xmrig_active: bool = False,
 ) -> float:
     """Compute per-slot rewards multiplier based on gating and active tools.
 
@@ -1668,12 +1671,15 @@ def _compute_rewards_multiplier(
     - BM: PoD (Proof of Data) - data upload succeeded
     - AEM: PoI (Proof of Installation) - Olostep running and enabled
 
-    RDN, SDN, and BM use the same parametric formula:
+    RDN, SDN, SVN, and BM use the same parametric formula:
         multiplier_base + multiplier_per_tool * tool_count
     """
-    # SVN: only check mac_match and poc_ok (no pod_ok or tools required)
+    # SVN: parametric — gates on mac_match + poc_ok, tool = xmrig
     if miner_type == "SVN":
-        return 1.0 if (mac_match and poc_ok) else 0.0
+        if not (mac_match and poc_ok):
+            return 0.0
+        tool_count = int(bool(xmrig_active))
+        return multiplier_base + multiplier_per_tool * tool_count
 
     # SDN: parametric — gates on mac_match + poc_ok, tool = spaceacres
     if miner_type == "SDN":
@@ -2094,6 +2100,7 @@ def write_status(
     presearch_active: bool = False,
     diiisco_active: bool = False,
     spaceacres_active: bool = False,
+    xmrig_active: bool = False,
 ) -> None:
     # --- time / slot basics ---
     day = day_iso(ts)  # "YYYY-MM-DD"
@@ -2387,11 +2394,10 @@ def write_status(
             ("mysterium", mysterium_active),
         ) if active]
 
-    # --- SVN Docker-based tools ---
+    # --- SVN XMRig mining ---
     elif miner_type_val == "SVN":
         selected_tools = [name for name, active in (
-            ("presearch", presearch_active),
-            ("diiisco", diiisco_active),
+            ("xmrig", xmrig_active),
         ) if active]
 
     # --- SDN Docker-based tools ---
@@ -2414,6 +2420,7 @@ def write_status(
         presearch_active=presearch_active,
         diiisco_active=diiisco_active,
         spaceacres_active=spaceacres_active,
+        xmrig_active=xmrig_active,
     )
 
     # --- unified slot snapshot for the graph ---
@@ -3268,6 +3275,28 @@ def _sdn_tool_states_for_slot() -> bool:
         return False
 
 
+def _svn_tool_states_for_slot() -> bool:
+    """Return xmrig_active for SVN reward calculation.
+
+    Checks whether XMRig (fry-validator) is enabled in config and the
+    process is running with the API responding.
+    """
+    try:
+        enabled_tools = _get_enabled_tools()
+    except Exception:
+        return False
+
+    if "xmrig" not in enabled_tools:
+        return False
+
+    try:
+        from measurements.tools import poll_xmrig
+        stats = poll_xmrig()
+        return bool(stats.get("running", False))
+    except Exception:
+        return False
+
+
 def _compute_day_aggregates(day_doc: Dict[str, Any]) -> None:
     """
     Fill/refresh:
@@ -3422,6 +3451,7 @@ def write_week_local(
     presearch_active: bool = False,
     diiisco_active: bool = False,
     spaceacres_active: bool = False,
+    xmrig_active: bool = False,
     api_available: Optional[bool] = None,  # Hardware API availability
 ) -> None:
     """
@@ -3578,11 +3608,14 @@ def write_week_local(
     elif MINER_CODE == "SDN":
         if spaceacres_active:
             tools_active.append("spaceacres")
+    elif MINER_CODE == "SVN":
+        if xmrig_active:
+            tools_active.append("xmrig")
 
-    # Tools gate policy (BM / RDN / SDN):
-    # - If BM, RDN, or SDN and zero tools selected => fail tools gate
+    # Tools gate policy (BM / RDN / SDN / SVN):
+    # - If BM, RDN, SDN, or SVN and zero tools selected => fail tools gate
     tools_ok: Optional[bool]
-    if MINER_CODE in ("BM", "RDN", "SDN"):
+    if MINER_CODE in ("BM", "RDN", "SDN", "SVN"):
         tools_ok = (len(tools_active) > 0)
     else:
         tools_ok = None
@@ -3602,6 +3635,7 @@ def write_week_local(
             presearch_active=presearch_active,
             diiisco_active=diiisco_active,
             spaceacres_active=spaceacres_active,
+            xmrig_active=xmrig_active,
         )
     except Exception:
         multiplier = None
@@ -4999,6 +5033,19 @@ _SA_FARMER_PID_FILE = "farmer.pid"
 _SA_MAX_RESTART_ATTEMPTS = 5
 _sa_consecutive_restart_failures: int = 0
 
+# ── XMRig (fry-validator) native process management ──
+_xmrig_process: Optional[subprocess.Popen] = None
+_xmrig_log_fh: Optional[Any] = None
+_xmrig_process_lock = threading.Lock()
+_xmrig_startup_thread: Optional[threading.Thread] = None
+_XMRIG_MAX_RESTART_ATTEMPTS = 5
+_xmrig_restart_count: int = 0
+_xmrig_initial_start_done: bool = False  # measurement-loop one-shot flag
+_XMRIG_PID_FILE = "xmrig.pid"
+_XMRIG_HEALTH_TIMEOUT = 60   # seconds to wait for HTTP API after launch
+_XMRIG_HEALTH_POLL_S = 3
+_XMRIG_BINARY_NAME = "fry-validator.exe" if sys.platform.startswith("win") else "fry-validator"
+
 
 def _spaceacres_dir() -> str:
     """Base directory for all Space Acres files under data_dir()."""
@@ -5007,6 +5054,36 @@ def _spaceacres_dir() -> str:
 
 def _autonomys_bin_dir() -> str:
     return os.path.join(_spaceacres_dir(), "bin")
+
+
+# ── XMRig path helpers ──
+
+def _xmrig_base_dir() -> str:
+    """Base directory for XMRig runtime data: {data_dir}/xmrig/"""
+    d = os.path.join(data_dir(), "xmrig")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _xmrig_bin_dir() -> str:
+    """Directory for the persistent fry-validator binary."""
+    d = os.path.join(_xmrig_base_dir(), "bin")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _xmrig_log_dir() -> str:
+    """Directory for XMRig log files."""
+    d = os.path.join(_xmrig_base_dir(), "logs")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _xmrig_run_dir() -> str:
+    """Directory for XMRig PID file (matches SA `run/` convention)."""
+    d = os.path.join(_xmrig_base_dir(), "run")
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 def _get_installed_autonomys_version() -> Optional[str]:
@@ -5243,6 +5320,314 @@ def _get_sa_process_state() -> Tuple[bool, bool]:
     node_alive = _sa_node_process is not None and _sa_node_process.poll() is None
     farmer_alive = _sa_farmer_process is not None and _sa_farmer_process.poll() is None
     return node_alive, farmer_alive
+
+
+# ── XMRig (fry-validator) native process management ──
+
+def _write_xmrig_pid_file(pid: int) -> None:
+    """Write XMRig PID to disk for external monitoring (under _xmrig_run_dir())."""
+    try:
+        with open(os.path.join(_xmrig_run_dir(), _XMRIG_PID_FILE), "w") as f:
+            f.write(str(pid))
+    except Exception as e:
+        log.debug("Failed to write XMRig PID file: %s", e)
+
+
+def _get_xmrig_process_state() -> bool:
+    """Return True if our XMRig Popen handle is still alive."""
+    return _xmrig_process is not None and _xmrig_process.poll() is None
+
+
+def _ensure_xmrig_binary() -> Tuple[bool, str]:
+    """Ensure fry-validator binary exists in the persistent bin directory.
+
+    On first run after install, copies from PyInstaller bundle (sys._MEIPASS/SDK/xmrig/)
+    to {data_dir}/xmrig/bin/.  On subsequent runs, uses the persistent copy.
+
+    Fallbacks (in order):
+      1. sys._MEIPASS/SDK/xmrig/<binary>   (PyInstaller bundle)
+      2. XMRIG_BIN environment variable    (local testing)
+      3. <script_dir>/SDK/xmrig/<binary>   (dev mode)
+
+    Returns:
+        (success, binary_path_or_error_message)
+    """
+    bin_dir = _xmrig_bin_dir()
+    persistent_path = os.path.join(bin_dir, _XMRIG_BINARY_NAME)
+
+    # If persistent copy already exists, use it.
+    if os.path.isfile(persistent_path) and os.path.getsize(persistent_path) > 0:
+        return True, persistent_path
+
+    # Try PyInstaller bundle first.
+    bundle_base = getattr(sys, "_MEIPASS", None)
+    if bundle_base:
+        bundle_path = os.path.join(bundle_base, "SDK", "xmrig", _XMRIG_BINARY_NAME)
+        if os.path.isfile(bundle_path):
+            try:
+                import shutil
+                shutil.copy2(bundle_path, persistent_path)
+                log.info("Extracted %s from bundle to %s", _XMRIG_BINARY_NAME, persistent_path)
+                return True, persistent_path
+            except Exception as e:
+                return False, f"Failed to extract {_XMRIG_BINARY_NAME}: {e}"
+        else:
+            log.debug("XMRig bundle path not found: %s", bundle_path)
+
+    # Env-var fallback.
+    env_path = os.environ.get("XMRIG_BIN")
+    if env_path and os.path.isfile(env_path):
+        return True, env_path
+
+    # Dev fallback.
+    dev_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "SDK", "xmrig", _XMRIG_BINARY_NAME,
+    )
+    if os.path.isfile(dev_path):
+        return True, dev_path
+
+    return False, (f"{_XMRIG_BINARY_NAME} not found in PyInstaller bundle, "
+                   f"XMRIG_BIN env var, or SDK/xmrig/ dev path")
+
+
+def _generate_xmrig_runtime_config() -> Tuple[bool, str]:
+    """Generate xmrig-runtime.json from embedded tool credentials.
+
+    Reads wallet_address, pool_url, pool_password, api_port, worker_name from
+    _get_tool_credentials() and writes the XMRig JSON config to
+    {data_dir}/xmrig/xmrig-runtime.json via temp-file + atomic rename.
+
+    Returns:
+        (success, config_path_or_error_message)
+    """
+    import socket as _socket
+
+    creds = _get_tool_credentials()
+    wallet = creds.get("xmrig_wallet_address", "")
+    pool_url = creds.get("xmrig_pool_url", "")
+    pool_pass = creds.get("xmrig_pool_password", "x")
+    api_port_str = creds.get("xmrig_api_port", "18080")
+    worker_template = creds.get("xmrig_worker_name", "{hostname}")
+
+    if not wallet or not pool_url:
+        return False, "Missing xmrig_wallet_address or xmrig_pool_url in embedded credentials"
+
+    try:
+        worker_name = str(worker_template).replace("{hostname}", _socket.gethostname())
+    except Exception:
+        worker_name = "fry-svn"
+
+    try:
+        api_port = int(api_port_str)
+    except (ValueError, TypeError):
+        api_port = 18080
+
+    config = {
+        "autosave": False,
+        "cpu": {"enabled": True, "max-threads-hint": 75},
+        "opencl": False,
+        "cuda": False,
+        "pools": [
+            {
+                "url": pool_url,
+                "user": wallet,
+                "pass": pool_pass,
+                "rig-id": worker_name,
+                "keepalive": True,
+                "tls": False,
+            }
+        ],
+        "http": {
+            "enabled": True,
+            "host": "127.0.0.1",
+            "port": api_port,
+            "access-token": None,
+            "restricted": True,
+        },
+        "donate-level": 0,
+        "log-file": None,
+        "print-time": 60,
+        "background": False,
+    }
+
+    config_path = os.path.join(_xmrig_base_dir(), "xmrig-runtime.json")
+    tmp_path = config_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+        if sys.platform.startswith("win") and os.path.exists(config_path):
+            os.remove(config_path)
+        os.rename(tmp_path, config_path)
+        return True, config_path
+    except Exception as e:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False, f"Failed to write xmrig-runtime.json: {e}"
+
+
+def _start_xmrig_native(request_id: str = "") -> Tuple[bool, str]:
+    """Start XMRig (fry-validator) as a native child process.
+
+    Phases:
+      1. Ensure binary (extract from bundle, env, or dev path)
+      2. Generate runtime config from embedded credentials
+      3. Launch with BELOW_NORMAL priority, no console window, log to file
+      4. Wait for HTTP API health check (port reachable)
+    """
+    global _xmrig_process, _xmrig_log_fh
+
+    with _xmrig_process_lock:
+        if _xmrig_process and _xmrig_process.poll() is None:
+            return True, "XMRig is already running"
+
+        ok, binary_path = _ensure_xmrig_binary()
+        if not ok:
+            return False, f"Binary not available: {binary_path}"
+
+        ok, config_path = _generate_xmrig_runtime_config()
+        if not ok:
+            return False, f"Config generation failed: {config_path}"
+
+        log_path = os.path.join(_xmrig_log_dir(), "xmrig.log")
+        try:
+            _xmrig_log_fh = open(log_path, "a", encoding="utf-8", errors="replace")
+        except Exception as e:
+            return False, f"Cannot open log file {log_path}: {e}"
+
+        cmd = [binary_path, f"--config={config_path}"]
+        _cflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+        _BELOW_NORMAL = 0x00004000  # BELOW_NORMAL_PRIORITY_CLASS
+        _cflags |= _BELOW_NORMAL
+
+        try:
+            _xmrig_process = subprocess.Popen(
+                cmd,
+                stdout=_xmrig_log_fh,
+                stderr=subprocess.STDOUT,
+                cwd=os.path.dirname(binary_path),
+                creationflags=_cflags,
+            )
+            _write_xmrig_pid_file(_xmrig_process.pid)
+            log_step("xmrig_started", {
+                "pid": _xmrig_process.pid,
+                "binary": binary_path,
+            })
+        except Exception as e:
+            if _xmrig_log_fh:
+                try:
+                    _xmrig_log_fh.close()
+                except Exception:
+                    pass
+                _xmrig_log_fh = None
+            return False, f"Failed to launch XMRig: {e}"
+
+    # Health check OUTSIDE the lock (mirrors SA's _start_spaceacres_native).
+    from measurements.tools import _port_reachable
+    api_port = 18080
+    try:
+        api_port = int(_get_tool_credentials().get("xmrig_api_port", "18080"))
+    except Exception:
+        pass
+
+    deadline = time.monotonic() + _XMRIG_HEALTH_TIMEOUT
+    while time.monotonic() < deadline:
+        if _xmrig_process.poll() is not None:
+            rc = _xmrig_process.returncode
+            return False, f"XMRig exited during startup with code {rc}"
+        if _port_reachable(api_port, timeout=2.0):
+            return True, f"XMRig running and healthy (PID {_xmrig_process.pid})"
+        time.sleep(_XMRIG_HEALTH_POLL_S)
+
+    # API not reachable but process still alive — RandomX dataset init can take >60s.
+    log.warning("XMRig API not reachable within %ds; process still alive (PID %d)",
+                _XMRIG_HEALTH_TIMEOUT, _xmrig_process.pid)
+    return True, f"XMRig launched (PID {_xmrig_process.pid}); API not yet ready"
+
+
+def _async_native_xmrig_start(request_id: str, op: str) -> None:
+    """Run XMRig native start in a background thread."""
+    global _xmrig_startup_thread
+
+    if _xmrig_startup_thread is not None and _xmrig_startup_thread.is_alive():
+        _write_ops_result(request_id, op, False,
+                          "Another XMRig start operation is already in progress")
+        return
+
+    def _run() -> None:
+        try:
+            success, msg = _start_xmrig_native(request_id=request_id)
+            error_msg = msg if not success else None
+            _write_ops_result(request_id, op, success, error_msg)
+        except Exception as exc:
+            _write_ops_result(request_id, op, False, str(exc))
+
+    _xmrig_startup_thread = threading.Thread(
+        target=_run, name="xmrig-native-start", daemon=True,
+    )
+    _xmrig_startup_thread.start()
+
+
+def _auto_restart_xmrig() -> None:
+    """Restart XMRig if it has crashed.  Called once per measurement cycle for SVN."""
+    global _xmrig_restart_count
+
+    if MINER_CODE != "SVN":
+        return
+
+    if _get_xmrig_process_state():
+        _xmrig_restart_count = 0  # alive — reset failure counter
+        return
+
+    if _xmrig_process is not None and _xmrig_process.poll() is not None:
+        log.warning("XMRig process exited with code %d", _xmrig_process.returncode)
+
+    if _xmrig_restart_count >= _XMRIG_MAX_RESTART_ATTEMPTS:
+        if _xmrig_restart_count == _XMRIG_MAX_RESTART_ATTEMPTS:
+            log.error("XMRig reached max restart attempts (%d); will not retry until PoC restart",
+                      _XMRIG_MAX_RESTART_ATTEMPTS)
+            _xmrig_restart_count += 1  # bump once more so the error logs only once
+        return
+
+    _xmrig_restart_count += 1
+    log.info("Auto-restarting XMRig (attempt %d/%d)",
+             _xmrig_restart_count, _XMRIG_MAX_RESTART_ATTEMPTS)
+    try:
+        ok, msg = _start_xmrig_native()
+        if ok:
+            log.info("XMRig auto-restart succeeded: %s", msg)
+        else:
+            log.warning("XMRig auto-restart failed: %s", msg)
+    except Exception as e:
+        log.warning("XMRig auto-restart exception: %s", e)
+
+
+def _xmrig_lifecycle_tick() -> None:
+    """Per-measurement-cycle XMRig lifecycle tick for SVN (forced-on).
+
+    First call: start XMRig.
+    Subsequent calls: restart-if-crashed (delegates to _auto_restart_xmrig).
+    """
+    global _xmrig_initial_start_done
+
+    if MINER_CODE != "SVN":
+        return
+
+    try:
+        if not _xmrig_initial_start_done:
+            _xmrig_initial_start_done = True
+            ok, msg = _start_xmrig_native()
+            if ok:
+                log.info("XMRig auto-started: %s", msg)
+            else:
+                log.warning("XMRig auto-start failed: %s", msg)
+        else:
+            _auto_restart_xmrig()
+    except Exception as e:
+        log.warning("XMRig lifecycle exception: %s", e)
 
 
 def _start_spaceacres_native(request_id: str = "") -> Tuple[bool, str]:
@@ -6020,6 +6405,22 @@ def _process_ops_queue_request(request_path: str) -> None:
             # Space Acres: native binary path (no Docker)
             if container_name == "spaceacres-node":
                 _async_native_spaceacres_start(request_id, op)
+                try:
+                    processed_path = os.path.join(
+                        data_dir(), "ops_processed",
+                        f"{os.path.basename(request_path)}.processed",
+                    )
+                    os.replace(request_path, processed_path)
+                except Exception:
+                    try:
+                        os.remove(request_path)
+                    except Exception:
+                        pass
+                return  # done.json written by the background thread
+
+            # XMRig (fry-validator): native binary path (no Docker)
+            if container_name == "xmrig":
+                _async_native_xmrig_start(request_id, op)
                 try:
                     processed_path = os.path.join(
                         data_dir(), "ops_processed",
@@ -7632,6 +8033,18 @@ def main() -> None:
                 except Exception:
                     pass
 
+            # SVN tool states for this slot
+            svn_xmrig_active = False
+            if MINER_CODE == "SVN":
+                # Forced-on lifecycle: first cycle starts XMRig, later cycles
+                # restart it if it has crashed.  Runs before the tool-state
+                # check so a freshly-restarted process can be polled this slot.
+                _xmrig_lifecycle_tick()
+                try:
+                    svn_xmrig_active = _svn_tool_states_for_slot()
+                except Exception:
+                    pass
+
             # ----------------------------
             # Local weekly cache (ALWAYS)
             # ----------------------------
@@ -7673,6 +8086,7 @@ def main() -> None:
                     presearch_active=rdn_presearch_active,
                     diiisco_active=rdn_diiisco_active,
                     spaceacres_active=sdn_spaceacres_active,
+                    xmrig_active=svn_xmrig_active,
                     api_available=True,  # Will be updated in DB work block if API fails
                 )
             except Exception:
@@ -7871,6 +8285,7 @@ def main() -> None:
                     presearch_active=rdn_presearch_active,
                     diiisco_active=rdn_diiisco_active,
                     spaceacres_active=sdn_spaceacres_active,
+                    xmrig_active=svn_xmrig_active,
                 )
                 pending_pol_update = None
 
@@ -7996,6 +8411,7 @@ def main() -> None:
                             multiplier_per_tool=multiplier_per_tool,
                             presearch_active=rdn_presearch_active,
                             diiisco_active=rdn_diiisco_active,
+                            xmrig_active=svn_xmrig_active,
                             api_available=False,
                         )
                     except Exception:
@@ -8024,6 +8440,7 @@ def main() -> None:
                         multiplier_per_tool=multiplier_per_tool,
                         presearch_active=rdn_presearch_active,
                         diiisco_active=rdn_diiisco_active,
+                        xmrig_active=svn_xmrig_active,
                         api_available=False,
                     )
                 except Exception:

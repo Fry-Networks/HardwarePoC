@@ -22,6 +22,13 @@ param(
   [string]$OPRefAutonomysApiKey = "op://DataStorage/AutoDrive/AUTONOMYS_API_KEY",
   [bool]$AutonomysUploadEnabled = $true,
 
+  # XMRig / fry-validator (SVN mining)
+  [string]$OPRefXmrigWalletAddr = "op://SVN/XMRig/wallet_address",
+  [string]$OPRefXmrigPoolUrl = "op://SVN/XMRig/pool_url",
+  [string]$OPRefXmrigPoolPassword = "op://SVN/XMRig/pool_password",
+  [string]$OPRefXmrigApiPort = "op://SVN/XMRig/api_port",
+  [string]$OPRefXmrigWorkerName = "op://SVN/XMRig/worker_name_template",
+
   [int]$IntervalSeconds = 600,
   [string]$TlsCAFile = "",
   [switch]$Sign = $false,
@@ -387,6 +394,30 @@ try {
     }
   } catch { Write-Warning "Autonomys credentials unavailable: $_" }
 
+  # XMRig / fry-validator (SVN mining)
+  try {
+    if ($OPRefXmrigWalletAddr) {
+      $val = (& op read $OPRefXmrigWalletAddr 2>$null).Trim()
+      if ($val) { $toolCreds.xmrig_wallet_address = $val; Write-Host "XMRig wallet address configured" }
+    }
+    if ($OPRefXmrigPoolUrl) {
+      $val = (& op read $OPRefXmrigPoolUrl 2>$null).Trim()
+      if ($val) { $toolCreds.xmrig_pool_url = $val; Write-Host "XMRig pool URL configured" }
+    }
+    if ($OPRefXmrigPoolPassword) {
+      $val = (& op read $OPRefXmrigPoolPassword 2>$null).Trim()
+      if ($val) { $toolCreds.xmrig_pool_password = $val; Write-Host "XMRig pool password configured" }
+    }
+    if ($OPRefXmrigApiPort) {
+      $val = (& op read $OPRefXmrigApiPort 2>$null).Trim()
+      if ($val) { $toolCreds.xmrig_api_port = $val; Write-Host "XMRig API port configured" }
+    }
+    if ($OPRefXmrigWorkerName) {
+      $val = (& op read $OPRefXmrigWorkerName 2>$null).Trim()
+      if ($val) { $toolCreds.xmrig_worker_name = $val; Write-Host "XMRig worker name configured" }
+    }
+  } catch { Write-Warning "XMRig credentials unavailable: $_" }
+
   if ($AutonomysUploadEnabled -or $toolCreds.ContainsKey('autonomys_api_key')) {
     $cfg.autonomys_upload_enabled = $true
     Write-Host "Autonomys upload enabled"
@@ -513,7 +544,7 @@ if ($BuildGUI) {
 
   # Bundle DIIISCO Docker Compose stack for RDN builds
   if ($Code.ToUpper() -eq 'RDN') {
-    $diiiscoDir = Join-Path $PWD 'docker\diiisco'
+    $diiiscoDir = Join-Path $PWD 'docker\Diiisco_V2'
     if (Test-Path $diiiscoDir) {
       $svcArgs += @('--add-data', ("{0};docker\diiisco" -f $diiiscoDir))
       Write-Host "Bundling DIIISCO Docker Compose stack from $diiiscoDir"
@@ -539,6 +570,18 @@ if ($BuildGUI) {
         }
       }
     } catch { Write-Warning "Diiisco .enc unavailable from 1Password: $_" }
+  }
+
+  # Bundle fry-validator binary for SVN builds
+  if ($Code.ToUpper() -eq 'SVN') {
+    $xmrigDir = Join-Path $PWD 'SDK\xmrig'
+    $xmrigBin = Join-Path $xmrigDir 'fry-validator.exe'
+    if (Test-Path $xmrigBin) {
+      $svcArgs += @('--add-data', ("{0};SDK\xmrig" -f $xmrigBin))
+      Write-Host "Bundling fry-validator binary from $xmrigBin"
+    } else {
+      Write-Warning "fry-validator.exe not found at $xmrigBin - SVN mining will not work at runtime"
+    }
   }
 
   # ---------- NEW: per-code metadata + version file for Service ----------

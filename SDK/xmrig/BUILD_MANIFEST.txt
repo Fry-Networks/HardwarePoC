@@ -1,0 +1,38 @@
+=== fry-validator.exe Build Manifest ===
+Built: 2026-04-10
+Binary: fry-validator.exe (5,885,952 bytes)
+
+XMRig source:
+  Tag: v6.26.0
+  Commit: b2ca72480c58d197e18c885d9fc1a0c8d517e60a
+  Repo: https://github.com/xmrig/xmrig.git
+
+xmrig-deps (libuv + OpenSSL):
+  Commit: ddfb65ec8bf4803a6c1c2037969546d018c76b54
+  Subtree: msvc2019/x64
+  Repo: https://github.com/xmrig/xmrig-deps.git
+
+hwloc: vendored in-source (src/3rdparty/hwloc/ v2.12.1)
+
+Toolchain:
+  MSVC 2022 BuildTools
+  cl.exe v19.44.35225.0
+  Windows SDK 10.0.26100.0
+  CMake 3.31 (bundled with VS)
+
+CMake flags:
+  -G "Visual Studio 17 2022" -A x64
+  -DCMAKE_BUILD_TYPE=Release
+  -DBUILD_STATIC=ON
+  -DXMRIG_DEPS=<xmrig-deps/msvc2019/x64>
+  -DWITH_HWLOC=ON -DWITH_TLS=ON -DWITH_HTTP=ON
+  -DWITH_RANDOMX=ON -DWITH_CUDA=OFF -DWITH_OPENCL=OFF
+
+Patches applied:
+  donate-zero.patch (kDefaultDonateLevel=0, kMinimumDonateLevel=0)
+
+Verification:
+  DONATE 0% confirmed in --dry-run output
+  dumpbin: system DLLs only (fully static)
+  --help: --url, --user, --pass, --http-port all present
+  Phase 8 bundling: verified-by-construction (Test-Path confirmed)
