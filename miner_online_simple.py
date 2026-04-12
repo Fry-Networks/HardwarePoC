@@ -2435,8 +2435,10 @@ def write_status(
             poa_status = _process_running("myst")
         except Exception:
             poa_status = False
-    elif miner_type_val in ("RDN", "SVN"):
+    elif miner_type_val == "RDN":
         poa_status = bool(presearch_active or diiisco_active)
+    elif miner_type_val == "SVN":
+        poa_status = bool(xmrig_active)
     elif miner_type_val == "SDN":
         poa_status = bool(spaceacres_active)
     # else: ISM, OSM, IDM, ODM, IRM — sensor miners, poa stays True
