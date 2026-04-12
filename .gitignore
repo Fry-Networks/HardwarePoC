@@ -216,3 +216,6 @@ drop.tar.xz
 *.mmdb
 node_modules/
 .docker_build.sh
+
+# Binary builds ship via GitHub Release, not git
+SDK/xmrig/*.exe
