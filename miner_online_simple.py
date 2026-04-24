@@ -2443,6 +2443,14 @@ def write_status(
         poa_status = bool(spaceacres_active)
     # else: ISM, OSM, IDM, ODM, IRM — sensor miners, poa stays True
 
+    # --- Proof of Mysterium (myst) — BM only; other miners pass ---
+    myst_gate_status: bool = True  # default: gate not applicable for non-BM
+    if miner_type_val == "BM":
+        try:
+            myst_gate_status = _process_running("myst")
+        except Exception:
+            myst_gate_status = False
+
     # --- unified slot snapshot for the graph ---
     slot_obj: dict[str, Any] = {
         "gates": {
@@ -2452,6 +2460,7 @@ def write_status(
             "pol": bool(pol_status),
             "poi": mac_match,
             "poa": poa_status,
+            "myst": myst_gate_status,
         },
         "tools_active": selected_tools,
         "tools_count": len(selected_tools),
@@ -3412,7 +3421,7 @@ def _hour_summary_from_slots(hour_slots: List[Any]) -> Dict[str, Any]:
       - multiplier: avg across slots with numeric multiplier
     Keeps it robust with partial/missing slots.
     """
-    gates_all = {"online": True, "mac": True, "data": True, "tools": True}
+    gates_all = {"online": True, "mac": True, "data": True, "tools": True, "myst": True}
     tools_union: set[str] = set()
     total = 0.0
     count = 0
@@ -3425,7 +3434,7 @@ def _hour_summary_from_slots(hour_slots: List[Any]) -> Dict[str, Any]:
 
         gates = s_any.get("gates")
         if isinstance(gates, dict):
-            for k in ("online", "mac", "data", "tools"):
+            for k in ("online", "mac", "data", "tools", "myst"):
                 v = gates.get(k)
                 if isinstance(v, bool):
                     gates_all[k] = gates_all[k] and v
@@ -3635,6 +3644,9 @@ def write_week_local(
         if xmrig_active:
             tools_active.append("xmrig")
 
+    # Proof of Mysterium for GUI cache — BM only, else None
+    myst_ok: "bool | None" = bool(mysterium_active) if MINER_CODE == "BM" else None
+
     # Tools gate policy (BM / RDN / SDN / SVN):
     # - If BM, RDN, SDN, or SVN and zero tools selected => fail tools gate
     tools_ok: Optional[bool]
@@ -3670,6 +3682,7 @@ def write_week_local(
             "mac": bool(mac_ok),
             "data": bool(data_ok),  # BM: PoD (upload), AEM: PoI (Olostep)
             "tools": (bool(tools_ok) if tools_ok is not None else None),  # BM only
+            "myst": (bool(myst_ok) if myst_ok is not None else None),  # BM only
         },
         "tools_active": tools_active,
         "number_of_tools": len(tools_active),
