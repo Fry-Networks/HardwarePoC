@@ -142,6 +142,9 @@ GUI_VERSION = _guess_gui_version_from_fs()
 SOFTWARE_VERSION = GUI_VERSION or getattr(_cfg, "SOFTWARE_VERSION", VERSION)
 POC_VERSION = getattr(_cfg, "POC_VERSION", VERSION)
 
+if MINER_CODE:
+    os.environ["MINER_CODE"] = MINER_CODE
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("miner-online")
 _CRIT_FAILURES: dict[str, int] = {}
@@ -1000,10 +1003,17 @@ def _extract_mac_fields(doc: dict[str, Any]) -> dict[str, Any]:
         info["mac_match"] = not doc.get("mac_mismatch")
     mac_obj = doc.get("mac")
     if isinstance(mac_obj, dict):
-        if isinstance(mac_obj.get("miner_mac"), str) and mac_obj.get("miner_mac"):
-            info["miner_mac"] = mac_obj["miner_mac"]
-        if isinstance(mac_obj.get("mac_registered"), str) and mac_obj.get("mac_registered"):
-            info["mac_registered"] = mac_obj["mac_registered"]
+        # Canonical nested evidence keys first, legacy direct keys fallback
+        _miner_mac = (mac_obj.get("evidence") or {}).get("miner_mac")
+        if not isinstance(_miner_mac, str) or not _miner_mac.strip():
+            _miner_mac = mac_obj.get("miner_mac")
+        if isinstance(_miner_mac, str) and _miner_mac.strip():
+            info["miner_mac"] = _miner_mac.strip()
+        _registered_mac = (mac_obj.get("evidence") or {}).get("registered_mac")
+        if not isinstance(_registered_mac, str) or not _registered_mac.strip():
+            _registered_mac = mac_obj.get("mac_registered")
+        if isinstance(_registered_mac, str) and _registered_mac.strip():
+            info["mac_registered"] = _registered_mac.strip()
         if isinstance(mac_obj.get("mac_match"), bool):
             info["mac_match"] = mac_obj["mac_match"]
         elif isinstance(mac_obj.get("mac_mismatch"), bool):

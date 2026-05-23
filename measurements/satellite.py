@@ -59,19 +59,21 @@ def _get_gps_config() -> tuple[Optional[str], int]:
     """Get GPS serial port configuration from config file."""
     try:
         from pathlib import Path
-        
+
         # Read from device_config.json (written by GUI)
-        config_path = Path(os.environ.get("PROGRAMDATA", "C:\\ProgramData")) / "FryNetworks" / "config" / "device_config.json"
-        
+        miner_code = os.environ.get("MINER_CODE", "BM")
+        base = Path(os.environ.get("PROGRAMDATA", "C:\\ProgramData"))
+        config_path = base / "FryNetworks" / f"miner-{miner_code}" / "config" / "device_config.json"
+
         if config_path.exists():
             with open(config_path, 'r') as f:
                 config = json.load(f)
-                port = config.get("gps_port")
-                baud = config.get("gps_baud", 9600)
+                port = config.get("gps_port") or config.get("serial_port_gps") or config.get("serial_port")
+                baud = int(config.get("gps_baud") or config.get("baud_rate") or 9600)
                 return port, baud
-        
+
         return None, 9600
-        
+
     except Exception as e:
         log.warning("Failed to read GPS config: %s", e)
         return None, 9600
