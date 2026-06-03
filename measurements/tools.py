@@ -573,6 +573,11 @@ def _is_pid_alive(pid: Optional[int]) -> bool:
     if pid is None:
         return False
     try:
+        import psutil
+        return psutil.pid_exists(pid)
+    except Exception:
+        pass
+    try:
         import ctypes
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -682,6 +687,51 @@ def poll_space_acres() -> Dict[str, Any]:
     else:
         result["status"] = "stopped"
 
+    return result
+
+
+def _read_xmrig_pid() -> Optional[int]:
+    """Read PID from ``{data_dir}/xmrig/run/xmrig.pid``."""
+    try:
+        import sys as _sys
+        if _sys.platform.startswith("win"):
+            base = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+        else:
+            base = "/var/lib"
+        try:
+            import config_profile as _cfg
+            miner_code = getattr(_cfg, "MINER_CODE", "")
+        except ImportError:
+            miner_code = ""
+        if _sys.platform.startswith("win"):
+            run_dir = os.path.join(base, "FryNetworks", f"miner-{miner_code}", "xmrig", "run")
+        else:
+            run_dir = os.path.join(base, "frynetworks", f"miner-{miner_code}", "xmrig", "run")
+        p = os.path.join(run_dir, "xmrig.pid")
+        if not os.path.isfile(p):
+            return None
+        with open(p, "r") as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def poll_xmrig() -> Dict[str, Any]:
+    """Poll XMRig (fry-validator) native process.
+
+    Returns dict with keys:
+    - running: bool (process alive according to PID file)
+    - error: str | None
+    """
+    result: Dict[str, Any] = {"running": False, "error": None}
+    pid = _read_xmrig_pid()
+    if pid is None:
+        result["error"] = "xmrig.pid not found"
+        return result
+    if _is_pid_alive(pid):
+        result["running"] = True
+    else:
+        result["error"] = f"PID {pid} not alive"
     return result
 
 
