@@ -595,6 +595,26 @@ def _is_pid_alive(pid: Optional[int]) -> bool:
             return False
 
 
+def _pid_matches_process(pid: Optional[int], expected_tokens: tuple[str, ...]) -> bool:
+    """Return True when a PID is alive and still belongs to the expected process."""
+    if pid is None:
+        return False
+    try:
+        import psutil
+        proc = psutil.Process(pid)
+        if not proc.is_running():
+            return False
+        expected = tuple(token.lower() for token in expected_tokens)
+        haystacks = [
+            (proc.name() or "").lower(),
+            (proc.exe() or "").lower(),
+            " ".join(proc.cmdline()).lower(),
+        ]
+        return any(token in text for token in expected for text in haystacks)
+    except Exception:
+        return _is_pid_alive(pid)
+
+
 def poll_space_acres() -> Dict[str, Any]:
     """Poll Space Acres native processes (node + farmer).
 
@@ -635,8 +655,8 @@ def poll_space_acres() -> Dict[str, Any]:
 
     # Step 1: Check process liveness via PID files (avoids double-import
     # issue when miner_online_simple runs as __main__ vs module).
-    node_alive = _is_pid_alive(_read_autonomys_pid("node.pid"))
-    farmer_alive = _is_pid_alive(_read_autonomys_pid("farmer.pid"))
+    node_alive = _pid_matches_process(_read_autonomys_pid("node.pid"), ("subspace-node",))
+    farmer_alive = _pid_matches_process(_read_autonomys_pid("farmer.pid"), ("subspace-farmer",))
 
     if not node_alive and not farmer_alive:
         result["status"] = "not_created"

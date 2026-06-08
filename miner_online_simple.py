@@ -2394,6 +2394,13 @@ def write_status(
             ("mysterium", mysterium_active),
         ) if active]
 
+    # --- RDN tool-based activity ---
+    elif miner_type_val == "RDN":
+        selected_tools = [name for name, active in (
+            ("presearch", presearch_active),
+            ("diiisco", diiisco_active),
+        ) if active]
+
     # --- SVN XMRig mining ---
     elif miner_type_val == "SVN":
         selected_tools = [name for name, active in (
@@ -5092,6 +5099,20 @@ def _autonomys_bin_dir() -> str:
     return os.path.join(_spaceacres_dir(), "bin")
 
 
+def _spaceacres_enabled_and_configured() -> bool:
+    """Return True when SDN should be keeping Space Acres alive."""
+    if MINER_CODE != "SDN":
+        return False
+    try:
+        if "spaceacres" not in _get_enabled_tools():
+            return False
+        sa_cfg = read_encrypted_gui_config().get("spaceacres_config", {})
+        return bool(sa_cfg.get("farm_path")) and bool(sa_cfg.get("farm_size"))
+    except Exception:
+        log.debug("Failed to determine Space Acres desired state", exc_info=True)
+        return False
+
+
 # ── XMRig path helpers ──
 
 def _xmrig_base_dir() -> str:
@@ -5841,6 +5862,27 @@ def _async_native_spaceacres_start(request_id: str, op: str) -> None:
         target=_run, name="spaceacres-native-start", daemon=True,
     )
     _sa_startup_thread.start()
+
+
+def _schedule_spaceacres_recovery(reason: str) -> bool:
+    """Schedule a single in-process Space Acres recovery attempt."""
+    global _sa_startup_thread
+
+    if _sa_startup_thread is not None and _sa_startup_thread.is_alive():
+        log.info("Space Acres recovery already in progress, skipping (%s)", reason)
+        return False
+
+    def _run() -> None:
+        try:
+            _auto_restart_spaceacres_node(reason)
+        except Exception:
+            log.exception("Space Acres recovery thread failed (%s)", reason)
+
+    _sa_startup_thread = threading.Thread(
+        target=_run, name=f"spaceacres-recover-{reason}", daemon=True,
+    )
+    _sa_startup_thread.start()
+    return True
 
 
 def _kill_orphan_autonomys_processes() -> None:
@@ -6847,6 +6889,15 @@ def _collect_spaceacres_stats(config: Dict[str, Any]) -> Dict[str, Any]:
         now = time.monotonic()
         poll_status = result.get("status", "")
 
+        if _spaceacres_enabled_and_configured() and poll_status in ("not_created", "stopped", "degraded"):
+            if (now - _sa_last_restart_at) >= _SA_RESTART_COOLDOWN_S:
+                log.warning(
+                    "Space Acres is enabled but status=%s; scheduling recovery",
+                    poll_status,
+                )
+                _sa_last_restart_at = now
+                _schedule_spaceacres_recovery(f"{poll_status}_detected")
+
         # --- Sync stall detection (currentBlock stuck during syncing) ---
         # Skip when currentBlock == 0 (initial DSN download phase — blocks
         # will jump from 0 to millions suddenly, not a stall).
@@ -7502,6 +7553,14 @@ def main() -> None:
         _start_measurement_daemon()
     except Exception as e:
         log.warning("Failed to start measurement daemon: %s", e)
+
+    if MINER_CODE == "SDN":
+        try:
+            if _spaceacres_enabled_and_configured():
+                if _schedule_spaceacres_recovery("service_startup_resume"):
+                    log.info("Scheduled Space Acres recovery from saved service state")
+        except Exception:
+            log.debug("Space Acres startup recovery scheduling failed", exc_info=True)
 
     # ----------------------------
     # RDN: One-time Presearch status poll to log remote_addr
